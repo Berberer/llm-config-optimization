@@ -141,6 +141,7 @@ def _run(config: ContainerConfig, client: PodmanClient) -> ContainerResult:
         container = client.containers.create(
             config.image,
             command=list(config.command) or None,
+            entrypoint=list(config.entrypoint) if config.entrypoint is not None else None,
             environment=dict(config.env),
             volumes=_volume_specs(config.volumes),
             devices=list(config.devices),

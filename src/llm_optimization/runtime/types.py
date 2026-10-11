@@ -25,10 +25,18 @@ class Mount:
 
 @dataclass(frozen=True, slots=True)
 class ContainerConfig:
-    """Declarative description of a container run."""
+    """Declarative description of a container run.
+
+    ``entrypoint`` overrides the image's own ``ENTRYPOINT`` when set; ``None``
+    keeps it, so the image decides how its command is invoked. It is separate
+    from ``command`` because a container runtime applies the two independently:
+    ``command`` replaces the image's ``CMD`` while the entrypoint still
+    prefixes it.
+    """
 
     image: str
     command: tuple[str, ...] = ()
+    entrypoint: tuple[str, ...] | None = None
     env: Mapping[str, str] = field(default_factory=dict)
     volumes: tuple[Mount, ...] = ()
     devices: tuple[str, ...] = ()
@@ -47,6 +55,7 @@ class ContainerConfig:
             (
                 self.image,
                 self.command,
+                self.entrypoint,
                 tuple(sorted(self.env.items())),
                 self.volumes,
                 self.devices,
