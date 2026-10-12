@@ -6,14 +6,17 @@ backend) imports them; they import no engine and no container backend, so the
 experiment surface stays free of engine-shaped details.
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ..runtime.types import ContainerConfig, ContainerResult, Mount, PullPolicy
+
+if TYPE_CHECKING:
+    from ..search_space.types import ExperimentSpace
 
 
 class HardwareTarget(StrEnum):
@@ -295,6 +298,7 @@ class ExperimentError(RuntimeError):
         self.raw_result = raw_result
 
 
+@runtime_checkable
 class InferenceBackend(Protocol):
     """The engine seam: how an experiment becomes a run and a result is read.
 
@@ -302,6 +306,10 @@ class InferenceBackend(Protocol):
     lives behind this protocol. The orchestrator resolves the host hardware once
     and passes it to :meth:`plan`, so a backend never probes the host itself and
     can be unit-tested with injected hardware.
+
+    Before a series runs, :meth:`validate` checks a search-space definition
+    against the backend, so a parameter or value the engine does not support is
+    rejected up front rather than midway through an expensive sweep.
 
     An output directory is optional because not every engine writes a result
     file. A backend that does not need one ignores the argument; a backend that
@@ -311,6 +319,22 @@ class InferenceBackend(Protocol):
     a backend can record what actually ran (resolved image, devices, and so on)
     without retaining state between the two calls.
     """
+
+    def validate(self, space: ExperimentSpace) -> Sequence[str]:
+        """Report every way this backend cannot support ``space``.
+
+        The space is assumed to have already passed engine-agnostic validation;
+        this is the engine-specific half, asking whether the backend can forward
+        each declared parameter and value. Problems are returned as
+        human-readable strings rather than raised, so the caller can aggregate
+        them across the whole space and report them at once. An empty sequence
+        means the backend supports every dimension.
+
+        A :class:`~llm_optimization.search_space.types.Default` dimension carries
+        no value to support-check and is accepted as long as the backend knows
+        the parameter itself.
+        """
+        ...
 
     def plan(
         self,

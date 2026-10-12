@@ -11,6 +11,7 @@ These tests inject a fake hardware detector, a fake backend, and the shared fake
 Podman client, so no daemon, inference engine, or specific hardware is required.
 """
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -25,10 +26,12 @@ from llm_optimization.inference import (
     ExperimentError,
     ExperimentResult,
     HardwareTarget,
+    InferenceBackend,
     LLMConfig,
     run_experiment,
 )
 from llm_optimization.runtime import ContainerConfig, ContainerResult, ContainerRunError
+from llm_optimization.search_space import ExperimentSpace
 
 HUB_MODEL = "meta-llama/Llama-3.1-8B"
 _PLAN = ContainerConfig(
@@ -92,6 +95,10 @@ class FakeBackend:
         self.parse_error = parse_error
         self.plan_calls: list[tuple[ExperimentConfig, DetectedHardware, Path | None]] = []
         self.parse_calls: list[tuple[ContainerResult, ContainerConfig, Path | None]] = []
+
+    def validate(self, space: ExperimentSpace) -> Sequence[str]:
+        self.events.append("validate")
+        return ()
 
     def plan(
         self,
@@ -323,3 +330,16 @@ def test_backend_defaults_to_vllm(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
 
     assert result is backend.result
     assert events == ["detect", "plan", "create", "parse_result"]
+
+
+@pytest.mark.parametrize("backend_cls", [FakeBackend, DirectoryAwareBackend])
+def test_backend_doubles_conform_to_the_inference_protocol(
+    backend_cls: type[FakeBackend],
+) -> None:
+    """Every backend double passed to ``run_experiment`` satisfies the protocol.
+
+    ``run_experiment`` accepts any object with the ``InferenceBackend`` shape, so
+    the doubles must track the protocol as it grows; a missing method would
+    otherwise surface only when a test happened to call it.
+    """
+    assert isinstance(backend_cls(_PLAN, _result(), []), InferenceBackend)

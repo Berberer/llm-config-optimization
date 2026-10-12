@@ -17,6 +17,17 @@ from pathlib import Path
 from types import MappingProxyType
 
 from ..runtime.types import ContainerConfig, ContainerResult, Mount
+from ..search_space.registry import TUNABLE_PARAMETERS
+from ..search_space.types import (
+    Categorical,
+    Default,
+    Dimension,
+    ExperimentSpace,
+    Fixed,
+    Interval,
+    ParameterValue,
+    Spec,
+)
 from .types import (
     AttentionBackend,
     DetectedHardware,
@@ -384,6 +395,94 @@ def _resolve_model(model: str) -> tuple[str, tuple[Mount, ...]]:
     return _MODEL_MOUNT_PATH, (mount,)
 
 
+_ENGINE_BOUNDS: tuple[tuple[str, str], ...] = (("max_num_batched_tokens", "max_num_seqs"),)
+"""Numeric constraints vLLM imposes between two tunable parameters.
+
+Each pair ``(upper, lower)`` records that ``upper`` must be at least ``lower``.
+The engine-agnostic ``>= 1`` floor is already enforced by the loader; these are
+the extra limits vLLM's own configuration validation adds.
+``SchedulerConfig.verify_max_model_len`` rejects
+``max_num_batched_tokens < max_num_seqs`` unconditionally, so a space that
+allows a violating pair would fail partway through a series. vLLM's other
+scheduler rule, ``max_num_batched_tokens >= max_model_len``, applies only when
+chunked prefill is disabled, which the default vLLM v1 scheduler does not do,
+so it is deliberately not enforced here.
+"""
+
+
+def _declared_values(dimension: Dimension) -> list[tuple[str, ParameterValue]]:
+    """Pair each value a dimension declares with the problem path naming it."""
+    spec = dimension.spec
+    if isinstance(spec, Fixed):
+        return [(f"space.{dimension.name}.fixed", spec.value)]
+    if isinstance(spec, Categorical):
+        return [
+            (f"space.{dimension.name}.categorical[{index}]", value)
+            for index, value in enumerate(spec.values)
+        ]
+    return []
+
+
+def _validate_spec_values(dimension: Dimension, field: str) -> list[str]:
+    """Report every declared value vLLM has no spelling for.
+
+    Only enum values are checked: a numeric parameter is forwarded verbatim, so
+    it has nothing to look up in :data:`VALUE_MAPS`. A categorical field with no
+    value map at all cannot translate any member and rejects every enum value.
+    """
+    mapping = VALUE_MAPS.get(field)
+    problems: list[str] = []
+    for path, value in _declared_values(dimension):
+        if isinstance(value, Enum) and (mapping is None or value not in mapping):
+            problems.append(f"{path}: vLLM does not support {field}={value.value!r}")
+    return problems
+
+
+def _numeric_range(spec: Spec) -> tuple[int, int] | None:
+    """Return the smallest and largest integer a spec allows.
+
+    ``None`` when the spec defers to the engine, or when it describes a
+    categorical parameter rather than an integer one, so the caller skips the
+    engine-bound check instead of comparing incomparable values.
+    """
+    if isinstance(spec, Fixed):
+        values = (spec.value,)
+    elif isinstance(spec, Categorical):
+        values = spec.values
+    elif isinstance(spec, Interval):
+        values = (spec.minimum, spec.maximum)
+    else:
+        return None
+    if any(isinstance(value, Enum) for value in values):
+        return None
+    return min(values), max(values)
+
+
+def _validate_engine_bounds(space: ExperimentSpace) -> list[str]:
+    """Report every engine-specific numeric bound the space could violate.
+
+    A bound is only checked when both parameters are pinned or bounded by a
+    value the optimizer will draw from; a ``Default`` parameter is unknown, so
+    the check is skipped and the engine enforces the bound at run time instead.
+    The comparison uses the most permissive pair the space allows — the
+    smallest ``upper`` against the largest ``lower`` — so a space is accepted
+    only when every point it can produce satisfies the bound.
+    """
+    specs = {dimension.name: dimension.spec for dimension in space.dimensions}
+    problems: list[str] = []
+    for upper, lower in _ENGINE_BOUNDS:
+        upper_range = _numeric_range(specs[upper]) if upper in specs else None
+        lower_range = _numeric_range(specs[lower]) if lower in specs else None
+        if upper_range is None or lower_range is None:
+            continue
+        if upper_range[0] < lower_range[1]:
+            problems.append(
+                f"space.{upper}: vLLM requires {upper} >= {lower}, but the space "
+                f"allows {upper}={upper_range[0]} with {lower}={lower_range[1]}"
+            )
+    return problems
+
+
 @dataclass(frozen=True, slots=True)
 class VLLMBackend:
     """The vLLM implementation of the inference backend seam.
@@ -407,6 +506,30 @@ class VLLMBackend:
 
     extra_args: tuple[str, ...] = ()
     cpu_image: str = "docker.io/vllm/vllm-openai-cpu:latest"
+
+    def validate(self, space: ExperimentSpace) -> Sequence[str]:
+        """Report every way vLLM cannot support ``space``.
+
+        The space is assumed to have passed engine-agnostic validation. Every
+        dimension's parameter must be one the backend forwards, and every fixed
+        or categorical enum value must have a vLLM spelling. ``Default``
+        dimensions carry no value to check and are accepted once their
+        parameter is known to the backend. The engine's own numeric constraints
+        between parameters are checked last. Problems are returned as strings
+        so the caller can aggregate them; an empty sequence means vLLM supports
+        every dimension.
+        """
+        problems: list[str] = []
+        for dimension in space.dimensions:
+            field = TUNABLE_PARAMETERS[dimension.name]
+            if field not in PARAMETER_TARGETS:
+                problems.append(f"space.{dimension.name}: vLLM does not forward {field!r}")
+                continue
+            if isinstance(dimension.spec, Default):
+                continue
+            problems.extend(_validate_spec_values(dimension, field))
+        problems.extend(_validate_engine_bounds(space))
+        return problems
 
     def plan(
         self,
