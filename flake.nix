@@ -35,6 +35,11 @@
               nodejs_24
               pi-coding-agent
             ];
+
+            # libstdc++ for Manylinux wheels (numpy, pulled in by optuna)
+            shellHook = ''
+              export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            '';
           };
         }
       );

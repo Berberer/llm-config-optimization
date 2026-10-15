@@ -11,13 +11,12 @@ These tests inject a fake hardware detector, a fake backend, and the shared fake
 Podman client, so no daemon, inference engine, or specific hardware is required.
 """
 
-from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 from podman.errors import APIError
 
-from fakes import FakeContainer, FakePodmanClient, _frame
+from fakes import FakeBackend, FakeContainer, FakePodmanClient, _frame
 from llm_optimization.inference import (
     BenchmarkConfig,
     ContainerRuntimeConfig,
@@ -31,7 +30,6 @@ from llm_optimization.inference import (
     run_experiment,
 )
 from llm_optimization.runtime import ContainerConfig, ContainerResult, ContainerRunError
-from llm_optimization.search_space import ExperimentSpace
 
 HUB_MODEL = "meta-llama/Llama-3.1-8B"
 _PLAN = ContainerConfig(
@@ -76,51 +74,6 @@ class FakeDetector:
         self.events.append("detect")
         self.overrides.append(override)
         return self.hardware
-
-
-class FakeBackend:
-    """A recording stand-in for an inference backend."""
-
-    def __init__(
-        self,
-        plan_config: ContainerConfig,
-        result: ExperimentResult,
-        events: list[str],
-        *,
-        parse_error: Exception | None = None,
-    ) -> None:
-        self.plan_config = plan_config
-        self.result = result
-        self.events = events
-        self.parse_error = parse_error
-        self.plan_calls: list[tuple[ExperimentConfig, DetectedHardware, Path | None]] = []
-        self.parse_calls: list[tuple[ContainerResult, ContainerConfig, Path | None]] = []
-
-    def validate(self, space: ExperimentSpace) -> Sequence[str]:
-        self.events.append("validate")
-        return ()
-
-    def plan(
-        self,
-        experiment: ExperimentConfig,
-        hardware: DetectedHardware,
-        output_dir: Path | None = None,
-    ) -> ContainerConfig:
-        self.events.append("plan")
-        self.plan_calls.append((experiment, hardware, output_dir))
-        return self.plan_config
-
-    def parse_result(
-        self,
-        result: ContainerResult,
-        plan: ContainerConfig,
-        output_dir: Path | None = None,
-    ) -> ExperimentResult:
-        self.events.append("parse_result")
-        self.parse_calls.append((result, plan, output_dir))
-        if self.parse_error is not None:
-            raise self.parse_error
-        return self.result
 
 
 class DirectoryAwareBackend(FakeBackend):

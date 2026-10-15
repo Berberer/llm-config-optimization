@@ -1,16 +1,24 @@
-"""Shared test doubles for the runtime and inference test packages.
+"""Shared test doubles for the runtime, inference, and optimization test packages.
 
 ``FakePodmanClient`` is a hand-written stand-in for the surface of
 ``podman.PodmanClient`` that :func:`llm_optimization.runtime.run_container` uses,
-so tests can drive the runner's observable behaviour without a daemon. The
-inference orchestration tests reuse it to observe the container run the
-orchestrator triggers. It lives beside the root ``conftest.py`` so both test
-packages can import it.
+so tests can drive the runner's observable behaviour without a daemon.
+``FakeBackend`` is a recording stand-in for an
+:class:`~llm_optimization.inference.types.InferenceBackend` that returns canned
+plans and results, so the inference and optimization layers can be driven
+without an engine or GPU. Both live beside the root ``conftest.py`` so every
+test package can import them.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from podman.errors import APIError
+
+from llm_optimization.inference import DetectedHardware, ExperimentConfig, ExperimentResult
+from llm_optimization.runtime import ContainerConfig, ContainerResult
+from llm_optimization.search_space import ExperimentSpace
 
 
 def _frame(stream_type: int, payload: bytes) -> bytes:
@@ -147,3 +155,56 @@ class FakePodmanClient:
     def __exit__(self, *exc_info: object) -> bool:
         self.close()
         return False
+
+
+class FakeBackend:
+    """A recording stand-in for an inference backend.
+
+    It returns a canned container plan and a canned typed result, so an
+    experiment can be driven end to end without an engine: :meth:`plan` records
+    every experiment it is asked to plan and :meth:`parse_result` records the
+    captured container outcome, while ``parse_error`` makes every parse fail.
+    The inference orchestration tests and the optimization lifecycle tests share
+    it so neither needs a daemon or a GPU.
+    """
+
+    def __init__(
+        self,
+        plan_config: ContainerConfig,
+        result: ExperimentResult,
+        events: list[str],
+        *,
+        parse_error: Exception | None = None,
+    ) -> None:
+        self.plan_config = plan_config
+        self.result = result
+        self.events = events
+        self.parse_error = parse_error
+        self.plan_calls: list[tuple[ExperimentConfig, DetectedHardware, Path | None]] = []
+        self.parse_calls: list[tuple[ContainerResult, ContainerConfig, Path | None]] = []
+
+    def validate(self, space: ExperimentSpace) -> Sequence[str]:
+        self.events.append("validate")
+        return ()
+
+    def plan(
+        self,
+        experiment: ExperimentConfig,
+        hardware: DetectedHardware,
+        output_dir: Path | None = None,
+    ) -> ContainerConfig:
+        self.events.append("plan")
+        self.plan_calls.append((experiment, hardware, output_dir))
+        return self.plan_config
+
+    def parse_result(
+        self,
+        result: ContainerResult,
+        plan: ContainerConfig,
+        output_dir: Path | None = None,
+    ) -> ExperimentResult:
+        self.events.append("parse_result")
+        self.parse_calls.append((result, plan, output_dir))
+        if self.parse_error is not None:
+            raise self.parse_error
+        return self.result
