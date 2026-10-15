@@ -18,7 +18,86 @@ from llm_optimization.runtime import (
 )
 
 
-def test_create_maps_config_fields_to_podman_arguments() -> None:
+def _forwarded_security_opt(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    enforcing: bool,
+    devices: tuple[str, ...] = (),
+    selinux_opts: tuple[str, ...] | None = None,
+) -> object:
+    """Run a config with detection pinned and return its ``security_opt`` argument."""
+    monkeypatch.setattr("llm_optimization.runtime._podman.selinux_enforcing", lambda: enforcing)
+    client = FakePodmanClient()
+    run_container(
+        ContainerConfig(image="img", devices=devices, selinux_opts=selinux_opts),
+        client=client,
+    )
+    _, kwargs = client.create_calls[0]
+    return kwargs["security_opt"]
+
+
+@pytest.mark.parametrize(
+    ("enforcing", "devices", "expected"),
+    [
+        (True, ("/dev/kfd", "/dev/dri"), ["disable"]),
+        (True, (), []),
+        (False, ("/dev/kfd", "/dev/dri"), []),
+        (False, (), []),
+    ],
+)
+def test_automatic_selinux_default_follows_the_host_and_device_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+    enforcing: bool,
+    devices: tuple[str, ...],
+    expected: list[str],
+) -> None:
+    # With no explicit choice, labels are disabled only on an enforcing host
+    # that maps devices; every other combination keeps the container confined.
+    assert _forwarded_security_opt(monkeypatch, enforcing=enforcing, devices=devices) == expected
+
+
+def test_explicit_selinux_options_override_the_automatic_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _forwarded_security_opt(
+        monkeypatch,
+        enforcing=True,
+        devices=("/dev/kfd",),
+        selinux_opts=("z",),
+    ) == ["z"]
+
+
+def test_explicit_empty_options_override_the_automatic_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An empty tuple is a deliberate "no label options", distinct from None.
+    assert (
+        _forwarded_security_opt(
+            monkeypatch,
+            enforcing=True,
+            devices=("/dev/kfd",),
+            selinux_opts=(),
+        )
+        == []
+    )
+
+
+def test_explicit_disable_wins_on_a_non_enforcing_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _forwarded_security_opt(
+        monkeypatch,
+        enforcing=False,
+        devices=("/dev/kfd",),
+        selinux_opts=("disable",),
+    ) == ["disable"]
+
+
+def test_create_maps_config_fields_to_podman_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pin SELinux detection so the resolved security options do not depend on the host.
+    monkeypatch.setattr("llm_optimization.runtime._podman.selinux_enforcing", lambda: False)
     client = FakePodmanClient()
     config = ContainerConfig(
         image="example/runner:latest",
@@ -47,6 +126,7 @@ def test_create_maps_config_fields_to_podman_arguments() -> None:
         "/host/models": {"bind": "/models", "mode": "ro", "extended_mode": ["z"]},
     }
     assert kwargs["devices"] == ["nvidia.com/gpu=all"]
+    assert kwargs["security_opt"] == []
     assert kwargs["mem_limit"] == "4g"
     assert kwargs["shm_size"] == "2g"
     assert kwargs["tty"] is False

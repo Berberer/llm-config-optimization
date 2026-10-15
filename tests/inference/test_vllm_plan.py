@@ -288,6 +288,20 @@ def test_caller_volumes_precede_the_backend_mounts(tmp_path: Path) -> None:
     assert config.volumes[0] == caller_mount
 
 
+def test_selinux_options_are_copied_into_the_planned_container(tmp_path: Path) -> None:
+    experiment = _experiment(container=ContainerRuntimeConfig(selinux_opts=("disable",)))
+
+    config = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1), output_dir=tmp_path)
+
+    assert config.selinux_opts == ("disable",)
+
+
+def test_absent_selinux_options_stay_automatic_in_the_planned_container(tmp_path: Path) -> None:
+    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 1), output_dir=tmp_path)
+
+    assert config.selinux_opts is None
+
+
 def test_container_limits_environment_and_pull_policy_are_forwarded(tmp_path: Path) -> None:
     experiment = _experiment(
         container=ContainerRuntimeConfig(

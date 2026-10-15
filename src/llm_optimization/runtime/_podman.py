@@ -9,6 +9,7 @@ from podman import PodmanClient
 from podman.domain.containers import Container
 from podman.errors import APIError
 
+from ._selinux import selinux_enforcing
 from .types import ContainerConfig, ContainerResult, ContainerRunError, Mount
 
 
@@ -32,6 +33,21 @@ def _volume_specs(volumes: tuple[Mount, ...]) -> dict[str, dict[str, object]]:
             "extended_mode": list(mount.options),
         }
     return specs
+
+
+def _security_opt(config: ContainerConfig) -> list[str]:
+    """Resolve the SELinux label options to pass to Podman for ``config``.
+
+    ``None`` means "choose automatically": disable labeling when the host is
+    SELinux-enforcing *and* the run maps devices, and pass no options
+    otherwise, so CPU and device-less containers keep their confinement. An
+    explicit tuple always wins, so a caller can force confinement on, force it
+    off, or pin a specific label.
+    """
+    opts = config.selinux_opts
+    if opts is None:
+        opts = ("disable",) if selinux_enforcing() and config.devices else ()
+    return list(opts)
 
 
 def _demux_logs(data: bytes) -> tuple[bytes, bytes]:
@@ -145,6 +161,7 @@ def _run(config: ContainerConfig, client: PodmanClient) -> ContainerResult:
             environment=dict(config.env),
             volumes=_volume_specs(config.volumes),
             devices=list(config.devices),
+            security_opt=_security_opt(config),
             mem_limit=config.mem_limit,
             shm_size=config.shm_size,
             tty=False,

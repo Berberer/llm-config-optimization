@@ -601,6 +601,7 @@ class VLLMBackend:
             devices=_DEVICE_MAPPINGS[target],
             mem_limit=container.mem_limit,
             shm_size=container.shm_size,
+            selinux_opts=container.selinux_opts,
             pull_policy=container.pull_policy,
             timeout=experiment.benchmark.timeout,
         )

@@ -32,6 +32,11 @@ class ContainerConfig:
     from ``command`` because a container runtime applies the two independently:
     ``command`` replaces the image's ``CMD`` while the entrypoint still
     prefixes it.
+
+    ``selinux_opts`` carries Podman SELinux label options (for example
+    ``disable``, without the CLI's ``label=`` prefix). ``None`` leaves the
+    choice to the runtime's automatic default; an empty tuple asks for no label
+    options and a populated tuple asks for exactly those.
     """
 
     image: str
@@ -42,6 +47,7 @@ class ContainerConfig:
     devices: tuple[str, ...] = ()
     mem_limit: int | str | None = None
     shm_size: int | str | None = None
+    selinux_opts: tuple[str, ...] | None = None
     pull_policy: PullPolicy = "missing"
     timeout: float | None = None
 
@@ -61,6 +67,7 @@ class ContainerConfig:
                 self.devices,
                 self.mem_limit,
                 self.shm_size,
+                self.selinux_opts,
                 self.pull_policy,
                 self.timeout,
             )

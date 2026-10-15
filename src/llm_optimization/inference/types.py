@@ -115,12 +115,19 @@ class ContainerRuntimeConfig:
     ``target`` and ``image`` are overrides: ``None`` leaves the choice to
     hardware detection and the backend's default image. ``shm_size`` defaults to
     ``"8g"`` because vLLM needs a large ``/dev/shm`` to avoid crashes.
+
+    ``selinux_opts`` carries Podman SELinux label options (for example
+    ``disable``, without the CLI's ``label=`` prefix) that the backend copies
+    into the planned container. ``None`` leaves the choice to the runtime's
+    automatic default, an empty tuple asks for no label options, and a
+    populated tuple asks for exactly those.
     """
 
     target: HardwareTarget | None = None
     image: str | None = None
     mem_limit: int | str | None = None
     shm_size: int | str | None = "8g"
+    selinux_opts: tuple[str, ...] | None = None
     pull_policy: PullPolicy = "missing"
     env: Mapping[str, str] = field(default_factory=dict)
     volumes: tuple[Mount, ...] = ()
@@ -137,6 +144,7 @@ class ContainerRuntimeConfig:
                 self.image,
                 self.mem_limit,
                 self.shm_size,
+                self.selinux_opts,
                 self.pull_policy,
                 tuple(sorted(self.env.items())),
                 self.volumes,
