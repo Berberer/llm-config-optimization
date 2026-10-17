@@ -5,7 +5,10 @@ returns: it samples points of a space, runs each through the inference layer,
 records what ran on the trial, keeps going when a trial fails, and reports the
 winning point reconstructed into a complete experiment. A sweep that completes
 no trial raises ``OptimizationError`` carrying the study, and passing a storage
-URL persists the study so a later call resumes it by name.
+URL persists the study so a later call resumes it by name. An optional per-trial
+callback is invoked once at the end of every trial — failed ones included — and
+a Ctrl-C during the sweep raises ``OptimizationInterrupted`` carrying the
+best-so-far result, or the empty-sweep error when nothing completed.
 
 These tests drive the real orchestration with the shared fake inference backend
 and fake Podman client, so no daemon, GPU, or engine is involved. The base
@@ -21,7 +24,7 @@ import optuna
 import pytest
 
 from fakes import FakeBackend, FakePodmanClient
-from llm_optimization.inference import (
+from llm_config_optimization.inference import (
     BenchmarkConfig,
     ContainerRuntimeConfig,
     DType,
@@ -31,9 +34,14 @@ from llm_optimization.inference import (
     HardwareTarget,
     LLMConfig,
 )
-from llm_optimization.optimization import OptimizationError, OptimizationResult, optimize
-from llm_optimization.runtime import ContainerConfig, ContainerResult
-from llm_optimization.search_space import Categorical, Dimension, ExperimentSpace, Interval
+from llm_config_optimization.optimization import (
+    OptimizationError,
+    OptimizationInterrupted,
+    OptimizationResult,
+    optimize,
+)
+from llm_config_optimization.runtime import ContainerConfig, ContainerResult
+from llm_config_optimization.search_space import Categorical, Dimension, ExperimentSpace, Interval
 
 PLAN = ContainerConfig(image="fake/engine:latest", command=("bench",))
 """The canned container plan the fake backend returns."""
@@ -92,6 +100,33 @@ class FailsOnceBackend(FakeBackend):
         self.parses += 1
         if self.parses == 1:
             raise ExperimentError("simulated out-of-memory")
+        return super().parse_result(result, plan, output_dir)
+
+
+class InterruptingBackend(FakeBackend):
+    """A backend that completes ``completed`` trials and then interrupts.
+
+    Raising ``KeyboardInterrupt`` from a parse is how Ctrl-C reaches the study
+    mid-trial, so this drives the real interrupt path rather than mocking it.
+    ``completed=1`` lets the first trial finish and interrupts the second, so
+    there is a best point to report; ``completed=0`` interrupts the first trial,
+    leaving the study with no completed trial.
+    """
+
+    def __init__(self, completed: int) -> None:
+        super().__init__(PLAN, RESULT, [])
+        self.completed = completed
+        self.parses = 0
+
+    def parse_result(
+        self,
+        result: ContainerResult,
+        plan: ContainerConfig,
+        output_dir: Path | None = None,
+    ) -> ExperimentResult:
+        self.parses += 1
+        if self.parses > self.completed:
+            raise KeyboardInterrupt
         return super().parse_result(result, plan, output_dir)
 
 
@@ -243,3 +278,79 @@ def test_n_jobs_defaults_to_one_and_is_passed_through(
     optimize(SPACE, BASE, n_trials=1, backend=_backend(), client=FakePodmanClient(), **controls)
 
     assert recorded["n_jobs"] == expected
+
+
+def test_the_callback_fires_once_per_completed_trial() -> None:
+    calls: list[tuple[optuna.Study, optuna.trial.FrozenTrial]] = []
+
+    result = optimize(
+        SPACE,
+        BASE,
+        n_trials=3,
+        seed=0,
+        backend=_backend(),
+        client=FakePodmanClient(),
+        callback=lambda study, trial: calls.append((study, trial)),
+    )
+
+    assert [trial.number for _, trial in calls] == [0, 1, 2]
+    assert all(study is result.study for study, _ in calls)
+    assert all(trial.state is optuna.trial.TrialState.COMPLETE for _, trial in calls)
+
+
+def test_the_callback_fires_for_failed_trials_too() -> None:
+    calls: list[optuna.trial.FrozenTrial] = []
+
+    optimize(
+        SPACE,
+        BASE,
+        n_trials=2,
+        seed=0,
+        backend=FailsOnceBackend(PLAN, RESULT),
+        client=FakePodmanClient(),
+        callback=lambda study, trial: calls.append(trial),
+    )
+
+    assert [trial.state for trial in calls] == [
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.COMPLETE,
+    ]
+
+
+def test_an_interrupt_raises_the_dedicated_exception_with_the_best_result() -> None:
+    with pytest.raises(OptimizationInterrupted) as excinfo:
+        optimize(
+            SPACE,
+            BASE,
+            n_trials=2,
+            seed=0,
+            backend=InterruptingBackend(completed=1),
+            client=FakePodmanClient(),
+        )
+
+    error = excinfo.value
+    assert isinstance(error, OptimizationError)
+    assert error.result.best_value == RESULT.tokens_per_second
+    assert error.result.best_trial_number == 0
+    assert error.result.trial_count == 2
+    assert error.study is error.result.study
+    assert error.result.best_config.container is BASE.container
+    assert error.result.best_config.benchmark is BASE.benchmark
+    assert "interrupted" in str(error)
+
+
+def test_an_interrupted_sweep_with_no_completed_trial_raises_the_empty_sweep_error() -> None:
+    with pytest.raises(OptimizationError) as excinfo:
+        optimize(
+            SPACE,
+            BASE,
+            n_trials=2,
+            seed=0,
+            backend=InterruptingBackend(completed=0),
+            client=FakePodmanClient(),
+        )
+
+    error = excinfo.value
+    assert not isinstance(error, OptimizationInterrupted)
+    assert error.study is not None
+    assert all(trial.state is optuna.trial.TrialState.FAIL for trial in error.study.trials)

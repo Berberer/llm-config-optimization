@@ -2,17 +2,19 @@
 
 These types describe the outcome of a parameter sweep without committing to any
 particular optimizer. They are built by the Optuna-specific module and
-re-exported from :mod:`llm_optimization.optimization`; this module imports no
+re-exported from :mod:`llm_config_optimization.optimization`; this module imports no
 Optuna at runtime, so a second optimizer can be added behind the same result
 type without changing callers, mirroring how
-:mod:`llm_optimization.inference.types` keeps the engine-neutral experiment
+:mod:`llm_config_optimization.inference.types` keeps the engine-neutral experiment
 surface free of engine details.
 
 :class:`OptimizationResult` is the successful outcome of a sweep: the best
 configuration found, its objective value and trial number, how many trials the
 study holds, and the raw study for full inspection. :class:`OptimizationError`
 is raised when a sweep finishes without a single completed trial; it carries
-the study so the failed sweep remains inspectable.
+the study so the failed sweep remains inspectable. :class:`OptimizationInterrupted`
+is raised when the user interrupts a sweep that did complete trials; it carries
+the best-so-far result so the work is not discarded.
 """
 
 from dataclasses import dataclass
@@ -60,7 +62,7 @@ class OptimizationError(RuntimeError):
     inspectable.
 
     This is a standalone exception rather than an
-    :class:`~llm_optimization.inference.types.ExperimentError`: a sweep that
+    :class:`~llm_config_optimization.inference.types.ExperimentError`: a sweep that
     produced nothing is a distinct failure from one benchmark run that failed,
     and callers can tell them apart by type.
     """
@@ -68,3 +70,23 @@ class OptimizationError(RuntimeError):
     def __init__(self, message: str, *, study: optuna.Study | None = None) -> None:
         super().__init__(message)
         self.study = study
+
+
+class OptimizationInterrupted(OptimizationError):
+    """Raised when a sweep is stopped by the user before it reaches its budget.
+
+    Ctrl-C during a sweep is a distinct outcome from an empty one: at least one
+    trial may have completed, so there is a best configuration worth reporting.
+    This exception carries that outcome as ``result`` — the same
+    :class:`OptimizationResult` a finished sweep would return — so a caller can
+    report and act on the best point found so far instead of discarding the
+    work.
+
+    It subclasses :class:`OptimizationError`, so a caller that only handles the
+    optimization layer's failures still catches an interrupt; the study is
+    available through both ``result.study`` and the inherited ``study``.
+    """
+
+    def __init__(self, message: str, *, result: OptimizationResult) -> None:
+        super().__init__(message, study=result.study)
+        self.result = result

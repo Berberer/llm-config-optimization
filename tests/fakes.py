@@ -1,10 +1,10 @@
 """Shared test doubles for the runtime, inference, and optimization test packages.
 
 ``FakePodmanClient`` is a hand-written stand-in for the surface of
-``podman.PodmanClient`` that :func:`llm_optimization.runtime.run_container` uses,
+``podman.PodmanClient`` that :func:`llm_config_optimization.runtime.run_container` uses,
 so tests can drive the runner's observable behaviour without a daemon.
 ``FakeBackend`` is a recording stand-in for an
-:class:`~llm_optimization.inference.types.InferenceBackend` that returns canned
+:class:`~llm_config_optimization.inference.types.InferenceBackend` that returns canned
 plans and results, so the inference and optimization layers can be driven
 without an engine or GPU. Both live beside the root ``conftest.py`` so every
 test package can import them.
@@ -16,9 +16,14 @@ from pathlib import Path
 
 from podman.errors import APIError
 
-from llm_optimization.inference import DetectedHardware, ExperimentConfig, ExperimentResult
-from llm_optimization.runtime import ContainerConfig, ContainerResult
-from llm_optimization.search_space import ExperimentSpace
+from llm_config_optimization.inference import (
+    DetectedHardware,
+    ExperimentConfig,
+    ExperimentResult,
+    HardwareTarget,
+)
+from llm_config_optimization.runtime import ContainerConfig, ContainerResult
+from llm_config_optimization.search_space import ExperimentSpace
 
 
 def _frame(stream_type: int, payload: bytes) -> bytes:
@@ -183,9 +188,14 @@ class FakeBackend:
         self.plan_calls: list[tuple[ExperimentConfig, DetectedHardware, Path | None]] = []
         self.parse_calls: list[tuple[ContainerResult, ContainerConfig, Path | None]] = []
 
-    def validate(self, space: ExperimentSpace) -> Sequence[str]:
+    def validate(
+        self, space: ExperimentSpace, hardware: DetectedHardware | None = None
+    ) -> Sequence[str]:
         self.events.append("validate")
         return ()
+
+    def image_for(self, target: HardwareTarget) -> str:
+        return self.plan_config.image
 
     def plan(
         self,

@@ -10,7 +10,7 @@ from podman.domain.containers import Container
 from podman.errors import APIError
 
 from ._selinux import selinux_enforcing
-from .types import ContainerConfig, ContainerResult, ContainerRunError, Mount
+from .types import ContainerConfig, ContainerResult, ContainerRunError, Mount, PullPolicy
 
 
 def _volume_specs(volumes: tuple[Mount, ...]) -> dict[str, dict[str, object]]:
@@ -111,6 +111,48 @@ def _force_remove(container: Container) -> None:
         container.remove(force=True)
 
 
+def _pull(image: str, policy: PullPolicy, client: PodmanClient) -> None:
+    """Pull ``image`` against ``client``, which remains owned by the caller."""
+    try:
+        client.images.pull(image, policy=policy)
+    except APIError as exc:
+        raise ContainerRunError(
+            f"failed to pull image {image!r} with policy {policy!r}: {exc}"
+        ) from exc
+
+
+def pull_image(
+    image: str, policy: PullPolicy = "missing", *, client: PodmanClient | None = None
+) -> None:
+    """Pull ``image`` according to ``policy`` without running a container.
+
+    This is the explicit prefetch a caller performs before the first run, so
+    that a run measures its own work rather than an image download. Unlike
+    :func:`run_container`, which only pre-pulls for the ``"always"`` and
+    ``"newer"`` policies and otherwise lets ``create`` fetch a missing image,
+    this helper always issues the pull and passes ``policy`` through verbatim.
+
+    Args:
+        image: The container image reference to pull.
+        policy: When to fetch the image. ``"missing"`` (the default) pulls only
+            when no local copy exists, ``"always"`` re-fetches it, ``"newer"``
+            fetches only when the registry has a newer build, and ``"never"``
+            leaves any local image untouched.
+        client: An optional pre-configured :class:`PodmanClient`. When omitted, a
+            client is discovered from the environment and closed once the pull is
+            over; an injected client is left open for the caller to manage.
+
+    Raises:
+        ContainerRunError: If the pull fails (the original ``APIError`` is
+            preserved as ``__cause__``).
+    """
+    if client is not None:
+        _pull(image, policy, client)
+        return
+    with PodmanClient.from_env() as owned_client:
+        _pull(image, policy, owned_client)
+
+
 def run_container(
     config: ContainerConfig, *, client: PodmanClient | None = None
 ) -> ContainerResult:
@@ -147,12 +189,7 @@ def run_container(
 def _run(config: ContainerConfig, client: PodmanClient) -> ContainerResult:
     """Execute ``config`` against ``client``, which remains owned by the caller."""
     if config.pull_policy in ("always", "newer"):
-        try:
-            client.images.pull(config.image, policy=config.pull_policy)
-        except APIError as exc:
-            raise ContainerRunError(
-                f"failed to pull image {config.image!r} with policy {config.pull_policy!r}: {exc}"
-            ) from exc
+        _pull(config.image, config.pull_policy, client)
     try:
         container = client.containers.create(
             config.image,

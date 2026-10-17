@@ -2,7 +2,7 @@
 
 This subpackage is the public import path for running inference benchmarks::
 
-    from llm_optimization.inference import run_experiment
+    from llm_config_optimization.inference import run_experiment
 
 The shared types are engine-neutral. Engine-specific backends (starting with
 vLLM) live alongside them and are re-exported here so callers need not know the

@@ -1,0 +1,22 @@
+# Every tunable pinned to a single value: a reproducible baseline with nothing
+# for the optimizer to search. A sweep over this space runs exactly one
+# configuration, which is useful as a reference point before widening it.
+#
+# Quantization is not part of the space: it describes how the checkpoint was
+# produced and is set with `--quantization` on the command line.
+space:
+  dtype:
+    fixed: bfloat16
+  kv_cache_dtype:
+    fixed: auto
+  max_model_len:
+    fixed: 4096
+  max_num_seqs:
+    fixed: 64
+  max_num_batched_tokens:
+    fixed: 4096
+  tensor_parallel_size:
+    fixed: 1
+  # flash_attention is CUDA-only; on ROCm or CPU use `default: true` instead.
+  attention_backend:
+    default: flash_attention

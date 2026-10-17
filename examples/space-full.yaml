@@ -1,0 +1,31 @@
+# The complete tunable search space: every parameter is declared, each
+# categorical parameter lists its supported values, and each numeric parameter
+# is swept over a broad range. `max_num_batched_tokens` must stay >=
+# `max_num_seqs` at every point the space can produce, so its floor is well
+# above the `max_num_seqs` ceiling.
+#
+# `tensor_parallel_size` and `attention_backend` defer to the engine because
+# both depend on the host: a tensor-parallel size larger than the detected
+# device count is rejected, and the attention backends this backend models are
+# CUDA-only. Pin either one only when the target is known to support it.
+space:
+  dtype:
+    categorical: [auto, float16, bfloat16, float32]
+  kv_cache_dtype:
+    categorical: [auto, float16, bfloat16, fp8_e4m3, fp8_e5m2]
+  max_model_len:
+    interval:
+      min: 1024
+      max: 32768
+  max_num_seqs:
+    interval:
+      min: 1
+      max: 256
+  max_num_batched_tokens:
+    interval:
+      min: 2048
+      max: 8192
+  tensor_parallel_size:
+    default: true
+  attention_backend:
+    default: true

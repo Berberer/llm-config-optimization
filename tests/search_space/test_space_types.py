@@ -13,8 +13,8 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from llm_optimization.inference import DType, QuantizationMethod
-from llm_optimization.search_space import (
+from llm_config_optimization.inference import DType
+from llm_config_optimization.search_space import (
     TUNABLE_PARAMETERS,
     Categorical,
     Default,
@@ -28,7 +28,6 @@ from llm_optimization.search_space import (
 SPACE = ExperimentSpace(
     dimensions=(
         Dimension("dtype", Fixed(DType.FLOAT16)),
-        Dimension("quantization", Categorical((QuantizationMethod.AWQ, QuantizationMethod.GPTQ))),
         Dimension("max_model_len", Interval(1024, 8192)),
         Dimension("kv_cache_dtype", Default()),
     )

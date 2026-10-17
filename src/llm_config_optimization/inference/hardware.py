@@ -1,6 +1,6 @@
 """Host hardware detection for the inference experiment layer.
 
-Detection resolves the host to a :class:`~llm_optimization.inference.types.HardwareTarget`
+Detection resolves the host to a :class:`~llm_config_optimization.inference.types.HardwareTarget`
 and a usable device count. It is deliberately injectable: :func:`detect_hardware`
 takes the vendor probes as an argument, so callers and tests can supply fakes and
 no backend ever probes the host itself.

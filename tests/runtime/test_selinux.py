@@ -7,7 +7,7 @@ case is pinned on any host and the real host flag is never read.
 
 from pathlib import Path
 
-from llm_optimization.runtime._selinux import selinux_enforcing
+from llm_config_optimization.runtime._selinux import selinux_enforcing
 
 
 def test_flag_holding_one_reports_enforcing(tmp_path: Path) -> None:

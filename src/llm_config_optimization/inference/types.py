@@ -49,16 +49,16 @@ class DType(StrEnum):
 class QuantizationMethod(StrEnum):
     """Weight quantization method, named engine-neutrally.
 
-    The set is curated, not exhaustive: engines register quantization methods
-    dynamically, so a backend maps only the members it supports and the long
-    tail is reached through the backend's raw-argument escape hatch.
+    A checkpoint is produced with exactly one method, so this is a property of
+    the model rather than a value a sweep varies. The set is curated, not
+    exhaustive: a backend maps only the members it can load, and the long tail
+    of engine-specific methods is reached through the backend's raw-argument
+    escape hatch.
     """
 
     AWQ = "awq"
     GPTQ = "gptq"
     FP8 = "fp8"
-    BITS_AND_BYTES = "bitsandbytes"
-    GGUF = "gguf"
 
 
 class KVCacheDType(StrEnum):
@@ -297,7 +297,7 @@ class ExperimentError(RuntimeError):
     The raw container result is attached as ``raw_result`` whenever output was
     captured, so a failure can be debugged from what the engine actually
     printed. The originating exception, when there is one (a
-    :class:`~llm_optimization.runtime.ContainerRunError` for a failed run, or a
+    :class:`~llm_config_optimization.runtime.ContainerRunError` for a failed run, or a
     decoding/parsing error for bad output), is preserved as ``__cause__``.
     """
 
@@ -328,7 +328,9 @@ class InferenceBackend(Protocol):
     without retaining state between the two calls.
     """
 
-    def validate(self, space: ExperimentSpace) -> Sequence[str]:
+    def validate(
+        self, space: ExperimentSpace, hardware: DetectedHardware | None = None
+    ) -> Sequence[str]:
         """Report every way this backend cannot support ``space``.
 
         The space is assumed to have already passed engine-agnostic validation;
@@ -338,9 +340,27 @@ class InferenceBackend(Protocol):
         them across the whole space and report them at once. An empty sequence
         means the backend supports every dimension.
 
-        A :class:`~llm_optimization.search_space.types.Default` dimension carries
+        A :class:`~llm_config_optimization.search_space.types.Default` dimension carries
         no value to support-check and is accepted as long as the backend knows
         the parameter itself.
+
+        ``hardware``, when given, narrows the check to the host the run will
+        use: a value the engine supports in general but the accelerator class
+        does not (a CUDA-only attention backend on ROCm, for example), or one
+        the host cannot fit (a tensor-parallel size larger than its device
+        count), is rejected before the sweep starts. ``None`` asks the
+        host-agnostic question only.
+        """
+        ...
+
+    def image_for(self, target: HardwareTarget) -> str:
+        """Return the container image this backend uses for ``target``.
+
+        This is the public image-resolution seam: the image a run is planned
+        with is ``container.image`` when the caller set one, and this method's
+        result otherwise. Exposing it lets a caller resolve the same image a
+        plan will use — for example to prefetch it before planning — without
+        duplicating the backend's default-image mapping.
         """
         ...
 
@@ -353,7 +373,7 @@ class InferenceBackend(Protocol):
         """Turn an experiment and the detected hardware into a container run.
 
         Returns a concrete
-        :class:`~llm_optimization.runtime.ContainerConfig` — the resolved image,
+        :class:`~llm_config_optimization.runtime.ContainerConfig` — the resolved image,
         device mapping, mounts, and the engine's benchmark command — which the
         orchestrator executes through the runtime layer unchanged.
 

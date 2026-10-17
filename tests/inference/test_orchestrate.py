@@ -17,7 +17,7 @@ import pytest
 from podman.errors import APIError
 
 from fakes import FakeBackend, FakeContainer, FakePodmanClient, _frame
-from llm_optimization.inference import (
+from llm_config_optimization.inference import (
     BenchmarkConfig,
     ContainerRuntimeConfig,
     DetectedHardware,
@@ -29,7 +29,7 @@ from llm_optimization.inference import (
     LLMConfig,
     run_experiment,
 )
-from llm_optimization.runtime import ContainerConfig, ContainerResult, ContainerRunError
+from llm_config_optimization.runtime import ContainerConfig, ContainerResult, ContainerRunError
 
 HUB_MODEL = "meta-llama/Llama-3.1-8B"
 _PLAN = ContainerConfig(
@@ -124,7 +124,7 @@ def _detector(
         hardware if hardware is not None else DetectedHardware(HardwareTarget.ROCM, 1),
         events,
     )
-    monkeypatch.setattr("llm_optimization.inference._orchestrate.detect_hardware", detector)
+    monkeypatch.setattr("llm_config_optimization.inference._orchestrate.detect_hardware", detector)
     return detector
 
 
@@ -200,8 +200,43 @@ def test_container_failure_is_wrapped_with_cause_and_raw_result(
     assert error.raw_result.exit_code == 3
     assert error.raw_result.stdout == b"boom"
     assert HUB_MODEL in str(error)
+    assert "boom" in str(error)
     assert backend.parse_calls == []
     assert events == ["detect", "plan", "create"]
+
+
+def test_container_failure_message_includes_the_engine_stderr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The engine's own diagnostic is surfaced, not just the exit code."""
+    events: list[str] = []
+    message = b"AssertionError: FlashAttention version not detected."
+    client = RecordingPodmanClient(events, exit_code=1, logs=_frame(2, message))
+    backend = FakeBackend(_PLAN, _result(), events)
+    _detector(monkeypatch, events)
+
+    with pytest.raises(ExperimentError) as excinfo:
+        run_experiment(_experiment(), backend, client=client, output_dir=tmp_path)
+
+    assert "FlashAttention version not detected." in str(excinfo.value)
+    assert excinfo.value.raw_result is not None
+    assert excinfo.value.raw_result.stderr == message
+
+
+def test_container_failure_output_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A chatty engine cannot flood the error message with its whole log."""
+    events: list[str] = []
+    client = RecordingPodmanClient(events, exit_code=1, logs=_frame(2, b"x" * 10000))
+    backend = FakeBackend(_PLAN, _result(), events)
+    _detector(monkeypatch, events)
+
+    with pytest.raises(ExperimentError) as excinfo:
+        run_experiment(_experiment(), backend, client=client, output_dir=tmp_path)
+
+    assert "…" in str(excinfo.value)
+    assert len(str(excinfo.value)) < 10000
 
 
 def test_container_start_failure_is_wrapped_without_a_result(
@@ -277,7 +312,9 @@ def test_backend_defaults_to_vllm(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     client = RecordingPodmanClient(events)
     backend = FakeBackend(_PLAN, _result(), events)
     _detector(monkeypatch, events)
-    monkeypatch.setattr("llm_optimization.inference._orchestrate.VLLMBackend", lambda: backend)
+    monkeypatch.setattr(
+        "llm_config_optimization.inference._orchestrate.VLLMBackend", lambda: backend
+    )
 
     result = run_experiment(_experiment(), client=client, output_dir=tmp_path)
 

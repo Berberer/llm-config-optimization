@@ -24,7 +24,7 @@ import pytest
 from podman import PodmanClient
 from podman.errors import APIError
 
-from llm_optimization.inference import (
+from llm_config_optimization.inference import (
     BenchmarkConfig,
     ContainerRuntimeConfig,
     ExperimentConfig,

@@ -14,7 +14,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from llm_optimization.inference import (
+from llm_config_optimization.inference import (
     BenchmarkConfig,
     ContainerRuntimeConfig,
     DType,
@@ -23,7 +23,7 @@ from llm_optimization.inference import (
     HardwareTarget,
     LLMConfig,
 )
-from llm_optimization.runtime import ContainerResult
+from llm_config_optimization.runtime import ContainerResult
 
 HUB_MODEL = "meta-llama/Llama-3.1-8B"
 

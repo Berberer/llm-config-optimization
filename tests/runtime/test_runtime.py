@@ -9,11 +9,12 @@ import pytest
 from podman.errors import APIError
 
 from fakes import FakePodmanClient, _frame
-from llm_optimization.runtime import (
+from llm_config_optimization.runtime import (
     ContainerConfig,
     ContainerResult,
     ContainerRunError,
     Mount,
+    pull_image,
     run_container,
 )
 
@@ -26,7 +27,9 @@ def _forwarded_security_opt(
     selinux_opts: tuple[str, ...] | None = None,
 ) -> object:
     """Run a config with detection pinned and return its ``security_opt`` argument."""
-    monkeypatch.setattr("llm_optimization.runtime._podman.selinux_enforcing", lambda: enforcing)
+    monkeypatch.setattr(
+        "llm_config_optimization.runtime._podman.selinux_enforcing", lambda: enforcing
+    )
     client = FakePodmanClient()
     run_container(
         ContainerConfig(image="img", devices=devices, selinux_opts=selinux_opts),
@@ -97,7 +100,7 @@ def test_create_maps_config_fields_to_podman_arguments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Pin SELinux detection so the resolved security options do not depend on the host.
-    monkeypatch.setattr("llm_optimization.runtime._podman.selinux_enforcing", lambda: False)
+    monkeypatch.setattr("llm_config_optimization.runtime._podman.selinux_enforcing", lambda: False)
     client = FakePodmanClient()
     config = ContainerConfig(
         image="example/runner:latest",
@@ -335,9 +338,65 @@ def test_self_created_client_is_closed(monkeypatch: pytest.MonkeyPatch) -> None:
             created.append(instance)
             return instance
 
-    monkeypatch.setattr("llm_optimization.runtime._podman.PodmanClient", FromEnvClient)
+    monkeypatch.setattr("llm_config_optimization.runtime._podman.PodmanClient", FromEnvClient)
 
     run_container(ContainerConfig(image="img"))
 
     assert len(created) == 1
+    assert created[0].closed is True
+
+
+@pytest.mark.parametrize("policy", ["missing", "always", "never", "newer"])
+def test_pull_image_forwards_the_policy_and_pulls_nothing_else(policy: str) -> None:
+    client = FakePodmanClient()
+
+    pull_image("example/runner:latest", policy, client=client)
+
+    assert client.pull_calls == [("example/runner:latest", policy)]
+    assert client.create_calls == []
+
+
+def test_pull_image_defaults_to_the_missing_policy() -> None:
+    client = FakePodmanClient()
+
+    pull_image("example/runner:latest", client=client)
+
+    assert client.pull_calls == [("example/runner:latest", "missing")]
+
+
+def test_pull_image_failure_is_wrapped_with_original_cause() -> None:
+    pull_error = APIError("pull access denied")
+    client = FakePodmanClient(pull_error=pull_error)
+
+    with pytest.raises(ContainerRunError) as excinfo:
+        pull_image("img", "always", client=client)
+
+    assert excinfo.value.__cause__ is pull_error
+    assert excinfo.value.result is None
+
+
+def test_pull_image_injected_client_is_left_open() -> None:
+    client = FakePodmanClient()
+
+    pull_image("img", client=client)
+
+    assert client.closed is False
+
+
+def test_pull_image_self_created_client_is_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    created: list[FakePodmanClient] = []
+
+    class FromEnvClient(FakePodmanClient):
+        @classmethod
+        def from_env(cls):
+            instance = cls()
+            created.append(instance)
+            return instance
+
+    monkeypatch.setattr("llm_config_optimization.runtime._podman.PodmanClient", FromEnvClient)
+
+    pull_image("img")
+
+    assert len(created) == 1
+    assert created[0].pull_calls == [("img", "missing")]
     assert created[0].closed is True

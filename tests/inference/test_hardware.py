@@ -7,8 +7,8 @@ is required — and assert the resolved result, including the fallback to CPU an
 the explicit-override path.
 """
 
-from llm_optimization.inference import DetectedHardware, HardwareTarget, detect_hardware
-from llm_optimization.inference.hardware import HardwareProbe
+from llm_config_optimization.inference import DetectedHardware, HardwareTarget, detect_hardware
+from llm_config_optimization.inference.hardware import HardwareProbe
 
 
 def _probe(target: HardwareTarget, count: int | None) -> HardwareProbe:

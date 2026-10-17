@@ -14,7 +14,7 @@ import pytest
 from podman import PodmanClient
 from podman.errors import APIError
 
-from llm_optimization.runtime import ContainerConfig, ContainerRunError, run_container
+from llm_config_optimization.runtime import ContainerConfig, ContainerRunError, run_container
 
 pytestmark = pytest.mark.integration
 

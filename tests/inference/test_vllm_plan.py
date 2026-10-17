@@ -1,7 +1,7 @@
 """Unit tests for the vLLM container plan.
 
 ``VLLMBackend.plan``'s observable contract is the
-:class:`~llm_optimization.runtime.types.ContainerConfig` it returns: the image
+:class:`~llm_config_optimization.runtime.types.ContainerConfig` it returns: the image
 and device mapping resolved for a target, the container defaults, the mounts the
 run needs, and the exact ``vllm bench throughput`` command assembled. These
 tests assert that returned plan directly — no Podman daemon and no inference
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_optimization.inference import (
+from llm_config_optimization.inference import (
     BenchmarkConfig,
     ContainerRuntimeConfig,
     DetectedHardware,
@@ -23,7 +23,7 @@ from llm_optimization.inference import (
     LLMConfig,
     VLLMBackend,
 )
-from llm_optimization.runtime import ContainerConfig, Mount
+from llm_config_optimization.runtime import ContainerConfig, Mount
 
 HUB_MODEL = "meta-llama/Llama-3.1-8B"
 
@@ -31,6 +31,7 @@ _HF_CACHE_HOST = Path.home() / ".cache" / "huggingface"
 _HF_CACHE_TARGET = "/root/.cache/huggingface"
 _MODEL_TARGET = "/model"
 _OUTPUT_TARGET = "/output"
+_CACHE_TARGET = "/vllm-cache"
 _RESULT_PATH = "/output/result.json"
 
 
@@ -93,6 +94,27 @@ def test_cpu_image_is_configurable_for_pinning_a_build(tmp_path: Path) -> None:
     )
 
     assert config.image == "registry.example/vllm-cpu:2025.1"
+
+
+@pytest.mark.parametrize(
+    ("target", "image"),
+    [
+        (HardwareTarget.CUDA, "docker.io/vllm/vllm-openai:latest"),
+        (HardwareTarget.ROCM, "docker.io/vllm/vllm-openai-rocm:latest"),
+        (HardwareTarget.CPU, "docker.io/vllm/vllm-openai-cpu:latest"),
+    ],
+)
+def test_image_for_resolves_the_default_image_per_target(
+    target: HardwareTarget, image: str
+) -> None:
+    assert VLLMBackend().image_for(target) == image
+
+
+def test_image_for_honours_a_configured_cpu_image() -> None:
+    backend = VLLMBackend(cpu_image="registry.example/vllm-cpu:2025.1")
+
+    assert backend.image_for(HardwareTarget.CPU) == "registry.example/vllm-cpu:2025.1"
+    assert backend.image_for(HardwareTarget.CUDA) == "docker.io/vllm/vllm-openai:latest"
 
 
 def test_shared_memory_defaults_to_eight_gigabytes(tmp_path: Path) -> None:
@@ -189,6 +211,52 @@ def test_bench_command_assembles_workload_and_llm_arguments(tmp_path: Path) -> N
     )
 
 
+def test_random_dataset_uses_the_random_length_flags(tmp_path: Path) -> None:
+    """vLLM's random dataset reads --random-*-len and ignores the generic flags."""
+    experiment = _experiment(
+        benchmark=BenchmarkConfig(
+            model=HUB_MODEL,
+            dataset_name="random",
+            num_prompts=8,
+            input_len=32,
+            output_len=8,
+        ),
+    )
+
+    config = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
+
+    assert config.command == (
+        "bench",
+        "throughput",
+        "--model",
+        HUB_MODEL,
+        "--dataset-name",
+        "random",
+        "--num-prompts",
+        "8",
+        "--random-input-len",
+        "32",
+        "--random-output-len",
+        "8",
+        "--tensor-parallel-size",
+        "1",
+        "--output-json",
+        _RESULT_PATH,
+    )
+
+
+def test_omitted_dataset_name_uses_the_random_length_flags(tmp_path: Path) -> None:
+    """vLLM defaults to the random dataset when no dataset name is given."""
+    experiment = _experiment(benchmark=BenchmarkConfig(model=HUB_MODEL, input_len=32, output_len=8))
+
+    config = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
+
+    assert "--random-input-len" in config.command
+    assert "--random-output-len" in config.command
+    assert "--input-len" not in config.command
+    assert "--output-len" not in config.command
+
+
 def test_unset_workload_fields_are_omitted(tmp_path: Path) -> None:
     config = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
 
@@ -255,6 +323,42 @@ def test_hugging_face_cache_is_mounted_for_weight_reuse(tmp_path: Path) -> None:
     assert mount.source == str(_HF_CACHE_HOST)
     assert mount.read_only is False
     assert mount.options == ("z",)
+
+
+def test_a_cache_directory_is_mounted_and_redirected(tmp_path: Path) -> None:
+    """A supplied cache dir is mounted and the compile env points into it."""
+    cache = tmp_path / "cache"
+    backend = VLLMBackend(cache_dir=cache)
+
+    config = _plan(
+        _experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path, backend=backend
+    )
+
+    mount = _mount_for(config, _CACHE_TARGET)
+    assert mount.source == str(cache)
+    assert mount.options == ("z",)
+    assert cache.is_dir()
+    assert config.env["VLLM_CACHE_ROOT"] == "/vllm-cache/vllm"
+    assert config.env["TRITON_CACHE_DIR"] == "/vllm-cache/triton"
+
+
+def test_no_cache_directory_means_no_mount_or_cache_env(tmp_path: Path) -> None:
+    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
+
+    assert all(mount.target != _CACHE_TARGET for mount in config.volumes)
+    assert "VLLM_CACHE_ROOT" not in config.env
+
+
+def test_a_callers_cache_env_takes_precedence(tmp_path: Path) -> None:
+    backend = VLLMBackend(cache_dir=tmp_path / "cache")
+    experiment = _experiment(container=ContainerRuntimeConfig(env={"VLLM_CACHE_ROOT": "/custom"}))
+
+    config = _plan(
+        experiment, DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path, backend=backend
+    )
+
+    assert config.env["VLLM_CACHE_ROOT"] == "/custom"
+    assert config.env["TRITON_CACHE_DIR"] == "/vllm-cache/triton"
 
 
 def test_output_directory_is_created_and_mounted(tmp_path: Path) -> None:

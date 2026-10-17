@@ -2,16 +2,17 @@
 
 The search space has a vocabulary of its own: a YAML definition names
 parameters, and the registry says which of those names may be swept and which
-:class:`~llm_optimization.inference.types.LLMConfig` field each one fills. The
+:class:`~llm_config_optimization.inference.types.LLMConfig` field each one fills. The
 indirection is deliberate — the file's vocabulary can be renamed without
 touching the backend, and the backend keeps owning how a field reaches its
 engine — while the allow-list stays strict and code-only, so what a sweep may
 vary is a single, reviewable edit.
 
 Every other ``LLMConfig`` field is a non-tunable: ``seed`` and
-``gpu_memory_utilization`` are managed by the code driving a sweep rather than
-chosen per dimension, so declaring one is an error rather than a silent no-op.
-A name that is not an ``LLMConfig`` field at all is an unknown parameter.
+``gpu_memory_utilization`` are managed by the code driving a sweep, and
+``quantization`` describes how the checkpoint was produced rather than a
+runtime choice, so declaring one is an error rather than a silent no-op. A name
+that is not an ``LLMConfig`` field at all is an unknown parameter.
 
 The expected kind of a tunable is not stored here. It is read from the
 ``LLMConfig`` field's own type annotation by :func:`expected_kind`, so the
@@ -31,7 +32,7 @@ type ParameterKind = type[StrEnum] | type[int]
 
 A categorical parameter resolves to its engine-neutral enum class and a numeric
 parameter to :class:`int`. The validator uses this to reject a spec that cannot
-describe the field, such as an :class:`~llm_optimization.search_space.types.Interval`
+describe the field, such as an :class:`~llm_config_optimization.search_space.types.Interval`
 declared for an enum field.
 """
 
@@ -39,7 +40,6 @@ declared for an enum field.
 TUNABLE_PARAMETERS: Mapping[str, str] = MappingProxyType(
     {
         "dtype": "dtype",
-        "quantization": "quantization",
         "kv_cache_dtype": "kv_cache_dtype",
         "max_model_len": "max_model_len",
         "max_num_seqs": "max_num_seqs",

@@ -23,7 +23,7 @@ import pytest
 from podman import PodmanClient
 from podman.errors import APIError
 
-from llm_optimization.inference import (
+from llm_config_optimization.inference import (
     BenchmarkConfig,
     ContainerRuntimeConfig,
     DType,
@@ -33,8 +33,8 @@ from llm_optimization.inference import (
     LLMConfig,
     VLLMBackend,
 )
-from llm_optimization.optimization import OptimizationResult, optimize
-from llm_optimization.search_space import (
+from llm_config_optimization.optimization import OptimizationResult, optimize
+from llm_config_optimization.search_space import (
     Categorical,
     Default,
     Dimension,
@@ -86,7 +86,6 @@ BASE = ExperimentConfig(
 SPACE = ExperimentSpace(
     dimensions=(
         Dimension("dtype", Fixed(_CPU_DTYPE)),
-        Dimension("quantization", Default()),
         Dimension("kv_cache_dtype", Fixed(KVCacheDType.AUTO)),
         Dimension("max_model_len", Fixed(_MAX_MODEL_LEN)),
         Dimension("max_num_seqs", Categorical(_MAX_NUM_SEQS)),

@@ -2,9 +2,9 @@
 
 These types describe *which* serving parameters an experiment sweep may vary and
 *which* values each one is allowed to take. They are deliberately separate from
-the execution types in :mod:`llm_optimization.inference.types`: an
+the execution types in :mod:`llm_config_optimization.inference.types`: an
 :class:`ExperimentSpace` is the reviewable definition of a sweep, while an
-:class:`~llm_optimization.inference.types.LLMConfig` is one point the sweep
+:class:`~llm_config_optimization.inference.types.LLMConfig` is one point the sweep
 selects. Like the inference surface it feeds, this module imports no engine, so
 the same definition can target a different backend later.
 
@@ -25,9 +25,9 @@ compared, and cached.
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from ..inference.types import AttentionBackend, DType, KVCacheDType, QuantizationMethod
+from ..inference.types import AttentionBackend, DType, KVCacheDType
 
-type ParameterValue = DType | QuantizationMethod | KVCacheDType | AttentionBackend | int
+type ParameterValue = DType | KVCacheDType | AttentionBackend | int
 """A value a tunable parameter may take.
 
 Categorical parameters hold an engine-neutral enum member and numeric
@@ -125,7 +125,7 @@ class ExperimentDefinitionError(Exception):
     them all.
 
     This is a standalone exception rather than an
-    :class:`~llm_optimization.inference.types.ExperimentError`: a bad definition
+    :class:`~llm_config_optimization.inference.types.ExperimentError`: a bad definition
     is a distinct failure from a benchmark run that failed, and callers can tell
     them apart by type.
     """

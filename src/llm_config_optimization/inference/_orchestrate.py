@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..runtime import run_container
-from ..runtime.types import ContainerRunError
+from ..runtime.types import ContainerResult, ContainerRunError
 from ._vllm import VLLMBackend
 from .hardware import detect_hardware
 from .types import (
@@ -41,10 +41,10 @@ def run_experiment(
     The host hardware is detected once — honouring the container config's
     ``target`` override — and passed to the backend's ``plan``, so the backend
     never probes the host itself. The plan is then executed through
-    :func:`~llm_optimization.runtime.run_container` and the captured outcome is
+    :func:`~llm_config_optimization.runtime.run_container` and the captured outcome is
     handed back to the backend's ``parse_result``.
 
-    ``backend`` defaults to :class:`~llm_optimization.inference.VLLMBackend`.
+    ``backend`` defaults to :class:`~llm_config_optimization.inference.VLLMBackend`.
     ``client`` is forwarded to ``run_container`` so a caller (or a test) can
     supply a pre-configured Podman client; when it is omitted the runtime
     discovers one from the environment.
@@ -56,7 +56,7 @@ def run_experiment(
 
     Raises:
         ExperimentError: If the container run fails — the underlying
-            :class:`~llm_optimization.runtime.ContainerRunError` is preserved as
+            :class:`~llm_config_optimization.runtime.ContainerRunError` is preserved as
             ``__cause__`` and its partial result attached — or if the backend
             cannot parse the run's output.
     """
@@ -64,8 +64,36 @@ def run_experiment(
     hardware = detect_hardware(config.container.target)
     if output_dir is not None:
         return _run(config, resolved_backend, hardware, output_dir, client)
-    with tempfile.TemporaryDirectory(prefix="llm-optimization-") as directory:
+    with tempfile.TemporaryDirectory(prefix="llm-config-optimization-") as directory:
         return _run(config, resolved_backend, hardware, Path(directory), client)
+
+
+_FAILURE_OUTPUT_LIMIT = 2000
+"""How many trailing characters of a failed run's output to attach to the error.
+
+The engine's own diagnostics — a traceback, a missing-library message — live on
+its stderr, so the error message is nearly useless without them. The tail is
+kept because the root cause usually sits just above the final exception, and it
+is bounded so a chatty engine cannot flood a log line.
+"""
+
+
+def _failure_output(result: ContainerResult | None) -> str:
+    """Return a bounded excerpt of a failed run's output, or an empty string.
+
+    stderr is preferred because that is where an engine reports a failure, with
+    stdout as the fallback for engines that log there. The excerpt keeps the
+    last :data:`_FAILURE_OUTPUT_LIMIT` characters, so the most specific part of
+    a traceback survives while the leading noise does not.
+    """
+    if result is None:
+        return ""
+    text = result.stderr_text.strip() or result.stdout_text.strip()
+    if not text:
+        return ""
+    if len(text) > _FAILURE_OUTPUT_LIMIT:
+        return "…" + text[-_FAILURE_OUTPUT_LIMIT:]
+    return text
 
 
 def _run(
@@ -80,8 +108,9 @@ def _run(
     try:
         result = run_container(plan, client=client)
     except ContainerRunError as exc:
-        raise ExperimentError(
-            f"benchmark container for model {config.benchmark.model!r} failed: {exc}",
-            raw_result=exc.result,
-        ) from exc
+        message = f"benchmark container for model {config.benchmark.model!r} failed: {exc}"
+        detail = _failure_output(exc.result)
+        if detail:
+            message = f"{message}\n{detail}"
+        raise ExperimentError(message, raw_result=exc.result) from exc
     return backend.parse_result(result, plan, output_dir)

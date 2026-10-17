@@ -4,7 +4,7 @@ A definition is a YAML document whose sole top-level key is ``space``, a mapping
 from a tunable parameter name to that parameter's spec. :func:`load_experiment_space`
 reads the YAML and hands the parsed document to :func:`parse_experiment_space`,
 which turns it into a canonical-order
-:class:`~llm_optimization.search_space.types.ExperimentSpace`.
+:class:`~llm_config_optimization.search_space.types.ExperimentSpace`.
 
 The parser validates the definition engine-agnostically. It checks the top-level
 shape, that every declared parameter is a known tunable, that each dimension
@@ -13,7 +13,7 @@ carries exactly one recognized spec tag, and that every value is of the kind its
 declared: a missing dimension is an error, so a value can never silently fall
 back to an engine default. Every problem found is collected and reported at
 once through
-:class:`~llm_optimization.search_space.types.ExperimentDefinitionError`, so a
+:class:`~llm_config_optimization.search_space.types.ExperimentDefinitionError`, so a
 broken definition is corrected in a single pass. Whether a backend actually
 supports the declared parameters and values is a separate, explicit check that
 needs a backend and is deliberately not done here.
@@ -58,7 +58,7 @@ def load_experiment_space(path: Path) -> ExperimentSpace:
 
     The file is decoded as UTF-8 and parsed with :func:`yaml.safe_load`, so no
     arbitrary YAML tags are constructed. Malformed YAML is reported through
-    :class:`~llm_optimization.search_space.types.ExperimentDefinitionError`, the
+    :class:`~llm_config_optimization.search_space.types.ExperimentDefinitionError`, the
     same error the structural checks raise, so a broken file fails uniformly.
     """
     try:

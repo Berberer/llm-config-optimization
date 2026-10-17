@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_optimization.inference import (
+from llm_config_optimization.inference import (
     AttentionBackend,
     DType,
     ExperimentError,
@@ -22,7 +22,7 @@ from llm_optimization.inference import (
     LLMConfig,
     QuantizationMethod,
 )
-from llm_optimization.inference._vllm import (
+from llm_config_optimization.inference._vllm import (
     PARAMETER_TARGETS,
     FlatFlag,
     JsonGroup,
@@ -65,7 +65,7 @@ def test_flat_flags_are_emitted_as_kebab_case_value_pairs() -> None:
 def test_categorical_fields_are_translated_to_vllm_spellings() -> None:
     config = LLMConfig(
         dtype=DType.BFLOAT16,
-        quantization=QuantizationMethod.BITS_AND_BYTES,
+        quantization=QuantizationMethod.AWQ,
         kv_cache_dtype=KVCacheDType.FP8_E4M3,
     )
 
@@ -73,7 +73,7 @@ def test_categorical_fields_are_translated_to_vllm_spellings() -> None:
         "--dtype",
         "bfloat16",
         "--quantization",
-        "bitsandbytes",
+        "awq",
         "--kv-cache-dtype",
         "fp8_e4m3",
     ]
@@ -97,7 +97,7 @@ def test_all_fields_assemble_in_the_declared_order() -> None:
         gpu_memory_utilization=0.85,
         tensor_parallel_size=1,
         seed=7,
-        attention_backend=AttentionBackend.XFORMERS,
+        attention_backend=AttentionBackend.FLASH_INFER,
     )
 
     assert build_arguments(config) == [
@@ -120,7 +120,7 @@ def test_all_fields_assemble_in_the_declared_order() -> None:
         "--seed",
         "7",
         "--attention-config",
-        '{"backend": "XFORMERS"}',
+        '{"backend": "FLASHINFER"}',
     ]
 
 
@@ -151,6 +151,14 @@ def test_unsupported_enum_member_is_rejected_rather_than_dropped() -> None:
     config = LLMConfig(dtype=_ExtendedDType.INT8)
 
     with pytest.raises(ExperimentError, match="dtype"):
+        build_arguments(config)
+
+
+def test_an_attention_backend_vllm_no_longer_ships_is_rejected() -> None:
+    """XFORMERS has no vLLM spelling in current releases, so it is refused."""
+    config = LLMConfig(attention_backend=AttentionBackend.XFORMERS)
+
+    with pytest.raises(ExperimentError, match="attention_backend"):
         build_arguments(config)
 
 

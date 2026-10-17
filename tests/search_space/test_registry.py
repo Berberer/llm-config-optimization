@@ -10,18 +10,16 @@ from dataclasses import fields
 
 import pytest
 
-from llm_optimization.inference import (
+from llm_config_optimization.inference import (
     AttentionBackend,
     DType,
     KVCacheDType,
     LLMConfig,
-    QuantizationMethod,
 )
-from llm_optimization.search_space.registry import TUNABLE_PARAMETERS, expected_kind
+from llm_config_optimization.search_space.registry import TUNABLE_PARAMETERS, expected_kind
 
 TUNABLES = (
     "dtype",
-    "quantization",
     "kv_cache_dtype",
     "max_model_len",
     "max_num_seqs",
@@ -41,13 +39,13 @@ def test_registry_maps_every_tunable_to_an_llm_config_field() -> None:
     assert set(TUNABLE_PARAMETERS.values()) <= config_fields
     assert "seed" not in TUNABLE_PARAMETERS
     assert "gpu_memory_utilization" not in TUNABLE_PARAMETERS
+    assert "quantization" not in TUNABLE_PARAMETERS
 
 
 @pytest.mark.parametrize(
     ("parameter", "kind"),
     [
         ("dtype", DType),
-        ("quantization", QuantizationMethod),
         ("kv_cache_dtype", KVCacheDType),
         ("max_model_len", int),
         ("max_num_seqs", int),

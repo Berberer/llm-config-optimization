@@ -1,8 +1,8 @@
 """Unit tests for loading and engine-agnostically validating a search space.
 
 A definition's observable contract is the
-:class:`~llm_optimization.search_space.types.ExperimentSpace` it parses into and
-the :class:`~llm_optimization.search_space.types.ExperimentDefinitionError` it
+:class:`~llm_config_optimization.search_space.types.ExperimentSpace` it parses into and
+the :class:`~llm_config_optimization.search_space.types.ExperimentDefinitionError` it
 raises, whose ``.problems`` tuple holds every problem found. These tests drive
 the public ``parse_experiment_space`` / ``load_experiment_space`` surface with
 in-memory mappings and temporary files, so no backend, no engine, and no Podman
@@ -15,12 +15,11 @@ from pathlib import Path
 import pytest
 import yaml
 
-from llm_optimization.inference import (
+from llm_config_optimization.inference import (
     AttentionBackend,
     DType,
-    QuantizationMethod,
 )
-from llm_optimization.search_space import (
+from llm_config_optimization.search_space import (
     TUNABLE_PARAMETERS,
     Categorical,
     Default,
@@ -34,7 +33,6 @@ from llm_optimization.search_space import (
 
 VALID_SPACE: dict[str, object] = {
     "dtype": {"fixed": "float16"},
-    "quantization": {"categorical": ["awq", "gptq"]},
     "kv_cache_dtype": {"default": True},
     "max_model_len": {"interval": {"min": 1024, "max": 8192}},
     "max_num_seqs": {"fixed": 256},
@@ -69,7 +67,6 @@ def test_a_complete_definition_parses_into_the_expected_dimensions() -> None:
 
     assert space.dimensions == (
         Dimension("dtype", Fixed(DType.FLOAT16)),
-        Dimension("quantization", Categorical((QuantizationMethod.AWQ, QuantizationMethod.GPTQ))),
         Dimension("kv_cache_dtype", Default()),
         Dimension("max_model_len", Interval(1024, 8192)),
         Dimension("max_num_seqs", Fixed(256)),
@@ -175,6 +172,10 @@ def test_top_level_shape_problems_are_reported(document: object, problem: str) -
     [
         ({"unknown": {"fixed": 1}}, "space.unknown: unknown parameter"),
         ({"seed": {"fixed": 1}}, "space.seed: 'seed' is a known parameter but is not tunable"),
+        (
+            {"quantization": {"fixed": "awq"}},
+            "space.quantization: 'quantization' is a known parameter but is not tunable",
+        ),
         ({"dtype": 5}, "space.dtype: spec must be a mapping"),
         ({"dtype": {"float": 1}}, "space.dtype: unknown spec key(s): 'float'"),
         ({"dtype": {}}, "space.dtype: spec must contain exactly one of"),

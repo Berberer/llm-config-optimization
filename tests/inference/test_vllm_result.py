@@ -1,8 +1,8 @@
 """Unit tests for vLLM result parsing and the failures around it.
 
 ``VLLMBackend.parse_result``'s observable contract is the typed
-:class:`~llm_optimization.inference.types.ExperimentResult` it builds from the
-engine's result JSON, and the :class:`~llm_optimization.inference.types.ExperimentError`
+:class:`~llm_config_optimization.inference.types.ExperimentResult` it builds from the
+engine's result JSON, and the :class:`~llm_config_optimization.inference.types.ExperimentError`
 it raises when that JSON is absent, unreadable, or malformed. These tests drive
 the backend with a planned container config and a captured container result —
 no Podman daemon and no inference engine is involved — and assert both the typed
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_optimization.inference import (
+from llm_config_optimization.inference import (
     BenchmarkConfig,
     ContainerRuntimeConfig,
     DetectedHardware,
@@ -24,7 +24,7 @@ from llm_optimization.inference import (
     LLMConfig,
     VLLMBackend,
 )
-from llm_optimization.runtime import ContainerConfig, ContainerResult
+from llm_config_optimization.runtime import ContainerConfig, ContainerResult
 
 HUB_MODEL = "meta-llama/Llama-3.1-8B"
 
@@ -105,7 +105,7 @@ def test_parse_result_falls_back_to_the_planned_default_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When no directory is given, parsing reads where the plan mounted."""
-    monkeypatch.setattr("llm_optimization.inference._vllm.DEFAULT_OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr("llm_config_optimization.inference._vllm.DEFAULT_OUTPUT_DIR", tmp_path)
     plan = _plan(HardwareTarget.CPU, tmp_path)
     _write_result(tmp_path, _WELL_FORMED)
 

@@ -1,10 +1,10 @@
 """vLLM backend for the inference experiment layer.
 
 This module is the only place that knows vLLM's benchmark CLI. It maps the
-engine-neutral :class:`~llm_optimization.inference.types.LLMConfig` fields onto
+engine-neutral :class:`~llm_config_optimization.inference.types.LLMConfig` fields onto
 ``vllm bench throughput`` arguments, plans a container run for an experiment,
 and parses the benchmark result back into a typed
-:class:`~llm_optimization.inference.types.ExperimentResult`.
+:class:`~llm_config_optimization.inference.types.ExperimentResult`.
 """
 
 import json
@@ -107,8 +107,6 @@ VALUE_MAPS: Mapping[str, Mapping[object, str]] = MappingProxyType(
             QuantizationMethod.AWQ: "awq",
             QuantizationMethod.GPTQ: "gptq",
             QuantizationMethod.FP8: "fp8",
-            QuantizationMethod.BITS_AND_BYTES: "bitsandbytes",
-            QuantizationMethod.GGUF: "gguf",
         },
         "kv_cache_dtype": {
             KVCacheDType.AUTO: "auto",
@@ -120,17 +118,34 @@ VALUE_MAPS: Mapping[str, Mapping[object, str]] = MappingProxyType(
         "attention_backend": {
             AttentionBackend.FLASH_ATTENTION: "FLASH_ATTN",
             AttentionBackend.FLASH_INFER: "FLASHINFER",
-            AttentionBackend.XFORMERS: "XFORMERS",
         },
     }
 )
 """How vLLM spells each engine-neutral categorical value.
 
-The enums in :mod:`llm_optimization.inference.types` carry no engine
+The enums in :mod:`llm_config_optimization.inference.types` carry no engine
 vocabulary; this table is the only place their vLLM spellings live. A member
 missing from its field's map is unsupported by this backend and is rejected
 rather than silently forwarded, while the long tail of engine-specific values
-is reached through :attr:`VLLMBackend.extra_args`.
+is reached through :attr:`VLLMBackend.extra_args`. ``XFORMERS`` is deliberately
+absent: current vLLM releases no longer ship an xFormers attention backend, so
+the member is rejected instead of being forwarded to a flag the engine will
+not accept.
+"""
+
+_ATTENTION_BACKEND_TARGETS: Mapping[AttentionBackend, frozenset[HardwareTarget]] = MappingProxyType(
+    {
+        AttentionBackend.FLASH_ATTENTION: frozenset({HardwareTarget.CUDA}),
+        AttentionBackend.FLASH_INFER: frozenset({HardwareTarget.CUDA}),
+    }
+)
+"""Which accelerator classes vLLM supports each attention backend on.
+
+vLLM's ROCm and CPU platforms select from their own backend sets
+(``ROCM_ATTN``, ``TRITON_ATTN``, and so on) that the engine-neutral enum does
+not model, so the modelled members are CUDA-only. A member with no entry here
+is either unsupported everywhere or has no vLLM spelling at all; the latter is
+already reported by :data:`VALUE_MAPS` before a target is consulted.
 """
 
 
@@ -271,7 +286,7 @@ def build_arguments(
     return [*encode_arguments(parameters), *extra_args]
 
 
-DEFAULT_OUTPUT_DIR = Path(tempfile.gettempdir()) / "llm-optimization"
+DEFAULT_OUTPUT_DIR = Path(tempfile.gettempdir()) / "llm-config-optimization"
 """Where a run writes its result when the caller supplies no output directory.
 
 :meth:`VLLMBackend.plan` and :meth:`VLLMBackend.parse_result` both fall back to
@@ -299,6 +314,26 @@ _SELINUX_OPTIONS = ("z",)
 The ``z`` option asks the container runtime to relabel the host path for
 SELinux, so runs work on enforcing hosts. Caller-supplied volumes keep whatever
 options they were given.
+"""
+_CACHE_MOUNT_PATH = "/vllm-cache"
+"""Where a caller-supplied compile cache is mounted inside the container."""
+
+_CACHE_ENV: Mapping[str, str] = MappingProxyType(
+    {
+        "VLLM_CACHE_ROOT": f"{_CACHE_MOUNT_PATH}/vllm",
+        "TRITON_CACHE_DIR": f"{_CACHE_MOUNT_PATH}/triton",
+        "MIOPEN_CACHE_DIR": f"{_CACHE_MOUNT_PATH}/miopen",
+        "MIOPEN_USER_DB_PATH": f"{_CACHE_MOUNT_PATH}/miopen/db",
+    }
+)
+"""Environment that redirects vLLM's compile caches onto the mounted cache.
+
+``VLLM_CACHE_ROOT`` covers vLLM's own caches (the Inductor/AOT compile cache and
+the model-info cache), ``TRITON_CACHE_DIR`` covers Triton's kernels, and the
+MIOpen variables cover the ROCm library's kernel cache. All four are needed
+because a fresh container otherwise rebuilds them from scratch on every trial.
+A caller's own ``container.env`` entries take precedence, so an explicit
+override still wins.
 """
 
 _DEFAULT_IMAGES: Mapping[HardwareTarget, str] = MappingProxyType(
@@ -358,9 +393,40 @@ _WORKLOAD_TARGETS: Mapping[str, ParameterTarget] = MappingProxyType(
         "num_prompts": FlatFlag(),
         "input_len": FlatFlag(),
         "output_len": FlatFlag(),
+        "random_input_len": FlatFlag(),
+        "random_output_len": FlatFlag(),
     }
 )
-"""Where each :class:`BenchmarkConfig` field is sent on the command line."""
+"""Where the benchmark workload is sent on the command line.
+
+Most keys mirror a :class:`BenchmarkConfig` field; the two ``random_*_len``
+keys carry the same configured lengths under vLLM's dataset-specific spelling
+(see :func:`_length_targets`), so the table lists both spellings and the caller
+sets only the one the dataset reads.
+"""
+
+_RANDOM_DATASETS = frozenset({"random", "random-mm", "random-rerank"})
+"""Datasets whose request lengths come from vLLM's ``--random-*-len`` flags.
+
+vLLM defines ``--random-input-len``/``--random-output-len`` with defaults of
+1024/128 and lets them take precedence over the generic
+``--input-len``/``--output-len``, which means the generic flags are silently
+ignored for the random dataset. The other datasets read the generic flags or
+take their input lengths from the dataset itself. An unset dataset name is
+included because vLLM then defaults to the random dataset.
+"""
+
+
+def _length_targets(dataset_name: str | None) -> tuple[str, str]:
+    """Return the workload keys the configured input and output lengths use.
+
+        The random dataset needs its own flags; every other dataset uses the
+    generic ones. Returning keys rather than flags keeps the choice in the
+    :data:`_WORKLOAD_TARGETS` table, which derives each flag from its key.
+    """
+    if dataset_name is None or dataset_name in _RANDOM_DATASETS:
+        return "random_input_len", "random_output_len"
+    return "input_len", "output_len"
 
 
 def _ensure_directory(path: Path) -> Path:
@@ -438,6 +504,55 @@ def _validate_spec_values(dimension: Dimension, field: str) -> list[str]:
     return problems
 
 
+def _validate_target_support(dimension: Dimension, field: str, target: HardwareTarget) -> list[str]:
+    """Report every declared value the target's platform does not support.
+
+    Only attention backends are platform-specific today, and only for values
+    that already have a vLLM spelling: a value with no spelling is reported by
+    :func:`_validate_spec_values` regardless of target, so checking it here too
+    would duplicate the problem.
+    """
+    if field != "attention_backend":
+        return []
+    problems: list[str] = []
+    for path, value in _declared_values(dimension):
+        if not isinstance(value, AttentionBackend):
+            continue
+        targets = _ATTENTION_BACKEND_TARGETS.get(value)
+        if targets is not None and target not in targets:
+            problems.append(
+                f"{path}: vLLM does not support {field}={value.value!r} "
+                f"on the {target.value} target"
+            )
+    return problems
+
+
+def _validate_device_count(dimension: Dimension, field: str, device_count: int) -> list[str]:
+    """Report every tensor-parallel size larger than the host has devices for.
+
+    ``tensor_parallel_size`` must fit the number of devices a run can see, so a
+    space that can produce a larger value is rejected rather than failing
+    partway through the sweep. An ``Interval`` is checked by its maximum because
+    the optimizer may draw any value in the range; a ``Default`` dimension
+    carries no value and is handled by the caller.
+    """
+    if field != "tensor_parallel_size":
+        return []
+    problems: list[str] = []
+    for path, value in _declared_values(dimension):
+        if isinstance(value, int) and value > device_count:
+            problems.append(
+                f"{path}: vLLM cannot run tensor_parallel_size={value} "
+                f"on a host with {device_count} device(s)"
+            )
+    if isinstance(dimension.spec, Interval) and dimension.spec.maximum > device_count:
+        problems.append(
+            f"space.{dimension.name}.interval: vLLM cannot run tensor_parallel_size "
+            f"up to {dimension.spec.maximum} on a host with {device_count} device(s)"
+        )
+    return problems
+
+
 def _numeric_range(spec: Spec) -> tuple[int, int] | None:
     """Return the smallest and largest integer a spec allows.
 
@@ -502,12 +617,25 @@ class VLLMBackend:
     official CPU image, but it is configurable so a caller can pin a different
     build without waiting for a library release. Like the CUDA and ROCm
     defaults it is registry-qualified so podman can resolve it without a TTY.
+
+    ``cache_dir`` is a host directory for vLLM's compile caches. When set, it
+    is bind-mounted into the container and the cache environment points at it,
+    so a sweep reuses the kernels the first trial compiled instead of
+    rebuilding them in every fresh container. ``None`` (the default) mounts
+    nothing. The directory's lifetime is the caller's: a sweep driver typically
+    creates a temporary one and removes it when the sweep ends, so repeated
+    trials within the sweep share it while nothing is left behind afterwards.
     """
 
     extra_args: tuple[str, ...] = ()
     cpu_image: str = "docker.io/vllm/vllm-openai-cpu:latest"
+    cache_dir: Path | None = None
 
-    def validate(self, space: ExperimentSpace) -> Sequence[str]:
+    def validate(
+        self,
+        space: ExperimentSpace,
+        hardware: DetectedHardware | None = None,
+    ) -> Sequence[str]:
         """Report every way vLLM cannot support ``space``.
 
         The space is assumed to have passed engine-agnostic validation. Every
@@ -518,6 +646,13 @@ class VLLMBackend:
         between parameters are checked last. Problems are returned as strings
         so the caller can aggregate them; an empty sequence means vLLM supports
         every dimension.
+
+        ``hardware``, when given, additionally asks whether each declared value
+        is supported on that accelerator class and fits its device count, so a
+        CUDA-only attention backend or a tensor-parallel size larger than the
+        host is rejected before the sweep starts instead of failing every trial.
+        ``None`` skips that host-specific half and checks only whether vLLM can
+        forward the parameter and spell the value.
         """
         problems: list[str] = []
         for dimension in space.dimensions:
@@ -528,6 +663,9 @@ class VLLMBackend:
             if isinstance(dimension.spec, Default):
                 continue
             problems.extend(_validate_spec_values(dimension, field))
+            if hardware is not None:
+                problems.extend(_validate_target_support(dimension, field, hardware.target))
+                problems.extend(_validate_device_count(dimension, field, hardware.device_count))
         problems.extend(_validate_engine_bounds(space))
         return problems
 
@@ -543,16 +681,17 @@ class VLLMBackend:
         failing that, the detected hardware, and selects the base image, the
         device mapping, and — when the LLM config leaves it unset — the
         tensor-parallel size. The Hugging Face cache, the model itself when it
-        is a host path, and the result directory are bind-mounted, and the
-        benchmark runs as ``vllm bench throughput`` with ``--output-json``
-        pointing into that mounted directory. The image's own ``vllm serve``
-        entrypoint is overridden so the benchmark subcommand is what runs.
+        is a host path, the result directory, and — when ``cache_dir`` is set —
+        the compile cache are bind-mounted, and the benchmark runs as
+        ``vllm bench throughput`` with ``--output-json`` pointing into that
+        mounted directory. The image's own ``vllm serve`` entrypoint is
+        overridden so the benchmark subcommand is what runs.
 
-        Planning is not side-effect free: the output directory and the host
-        Hugging Face cache directory are created on the host when they do not
-        exist, because both must exist before they can be bind-mounted. Merely
-        planning a run — as the unit tests do — therefore still touches the
-        host filesystem.
+        Planning is not side-effect free: the output directory, the host
+        Hugging Face cache directory, and the compile cache directory are
+        created on the host when they do not exist, because each must exist
+        before it can be bind-mounted. Merely planning a run — as the unit
+        tests do — therefore still touches the host filesystem.
         """
         container = experiment.container
         target = container.target or hardware.target
@@ -562,13 +701,14 @@ class VLLMBackend:
         llm = experiment.llm
         if llm.tensor_parallel_size is None:
             llm = replace(llm, tensor_parallel_size=hardware.device_count)
+        input_key, output_key = _length_targets(experiment.benchmark.dataset_name)
         workload = {
             "model": model,
             "dataset_name": experiment.benchmark.dataset_name,
             "dataset_path": experiment.benchmark.dataset_path,
             "num_prompts": experiment.benchmark.num_prompts,
-            "input_len": experiment.benchmark.input_len,
-            "output_len": experiment.benchmark.output_len,
+            input_key: experiment.benchmark.input_len,
+            output_key: experiment.benchmark.output_len,
         }
         command = (
             "bench",
@@ -578,7 +718,7 @@ class VLLMBackend:
             "--output-json",
             f"{_OUTPUT_MOUNT_PATH}/{_RESULT_FILENAME}",
         )
-        volumes = (
+        volumes = [
             *container.volumes,
             Mount(
                 source=str(_HF_CACHE_HOST),
@@ -586,18 +726,23 @@ class VLLMBackend:
                 options=_SELINUX_OPTIONS,
             ),
             *model_mounts,
-            Mount(
-                source=str(output_dir),
-                target=_OUTPUT_MOUNT_PATH,
-                options=_SELINUX_OPTIONS,
-            ),
+        ]
+        env = dict(container.env)
+        if self.cache_dir is not None:
+            cache_dir = _ensure_directory(self.cache_dir)
+            volumes.append(
+                Mount(source=str(cache_dir), target=_CACHE_MOUNT_PATH, options=_SELINUX_OPTIONS)
+            )
+            env = {**_CACHE_ENV, **env}
+        volumes.append(
+            Mount(source=str(output_dir), target=_OUTPUT_MOUNT_PATH, options=_SELINUX_OPTIONS)
         )
         return ContainerConfig(
-            image=container.image or self._default_image(target),
+            image=container.image or self.image_for(target),
             command=command,
             entrypoint=_VLLM_ENTRYPOINT,
-            env=dict(container.env),
-            volumes=volumes,
+            env=env,
+            volumes=tuple(volumes),
             devices=_DEVICE_MAPPINGS[target],
             mem_limit=container.mem_limit,
             shm_size=container.shm_size,
@@ -606,8 +751,15 @@ class VLLMBackend:
             timeout=experiment.benchmark.timeout,
         )
 
-    def _default_image(self, target: HardwareTarget) -> str:
-        """Return the base image for ``target`` when none was overridden."""
+    def image_for(self, target: HardwareTarget) -> str:
+        """Return the base image this backend uses for ``target``.
+
+        This is the public image-resolution seam: the container image a run is
+        planned with is ``container.image`` when the caller set one, and this
+        method's result otherwise. Exposing it lets a caller resolve the same
+        image a plan will use — for example to prefetch it before planning —
+        without duplicating the default-image mapping.
+        """
         if target == HardwareTarget.CPU:
             return self.cpu_image
         return _DEFAULT_IMAGES[target]

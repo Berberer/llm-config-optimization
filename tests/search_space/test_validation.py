@@ -17,12 +17,14 @@ from types import MappingProxyType
 
 import pytest
 
-from llm_optimization.inference import (
+from llm_config_optimization.inference import (
+    AttentionBackend,
+    DetectedHardware,
     DType,
-    QuantizationMethod,
+    HardwareTarget,
     VLLMBackend,
 )
-from llm_optimization.search_space import (
+from llm_config_optimization.search_space import (
     Categorical,
     Default,
     Dimension,
@@ -36,7 +38,6 @@ from llm_optimization.search_space import (
 SUPPORTED_SPACE = ExperimentSpace(
     dimensions=(
         Dimension("dtype", Fixed(DType.FLOAT16)),
-        Dimension("quantization", Categorical((QuantizationMethod.AWQ, QuantizationMethod.GPTQ))),
         Dimension("kv_cache_dtype", Default()),
         Dimension("max_model_len", Interval(1024, 8192)),
         Dimension("max_num_seqs", Fixed(256)),
@@ -59,7 +60,9 @@ class StubBackend:
 
     problems: tuple[str, ...] = ()
 
-    def validate(self, space: ExperimentSpace) -> Sequence[str]:
+    def validate(
+        self, space: ExperimentSpace, hardware: DetectedHardware | None = None
+    ) -> Sequence[str]:
         """Ignore the space and report the canned problems."""
         return list(self.problems)
 
@@ -77,7 +80,7 @@ def test_a_fully_supported_space_has_no_problems() -> None:
     "dimension",
     [
         Dimension("dtype", Fixed(DType.FLOAT16)),
-        Dimension("quantization", Categorical((QuantizationMethod.AWQ,))),
+        Dimension("attention_backend", Categorical((AttentionBackend.FLASH_ATTENTION,))),
         Dimension("max_model_len", Interval(1024, 8192)),
         Dimension("max_num_seqs", Fixed(256)),
         Dimension("kv_cache_dtype", Default()),
@@ -99,7 +102,9 @@ def test_each_spec_kind_is_accepted_for_a_supported_parameter(dimension: Dimensi
 def test_a_parameter_the_backend_does_not_forward_is_reported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("llm_optimization.inference._vllm.PARAMETER_TARGETS", MappingProxyType({}))
+    monkeypatch.setattr(
+        "llm_config_optimization.inference._vllm.PARAMETER_TARGETS", MappingProxyType({})
+    )
 
     problems = VLLMBackend().validate(space(Dimension("dtype", Fixed(DType.FLOAT16))))
 
@@ -110,7 +115,9 @@ def test_a_default_dimension_still_requires_a_forwarded_parameter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A deferral skips the value check, not the parameter check."""
-    monkeypatch.setattr("llm_optimization.inference._vllm.PARAMETER_TARGETS", MappingProxyType({}))
+    monkeypatch.setattr(
+        "llm_config_optimization.inference._vllm.PARAMETER_TARGETS", MappingProxyType({})
+    )
 
     problems = VLLMBackend().validate(space(Dimension("attention_backend", Default())))
 
@@ -129,7 +136,7 @@ def test_an_unsupported_enum_value_is_reported(
     monkeypatch: pytest.MonkeyPatch, spec: Fixed | Categorical, path: str
 ) -> None:
     monkeypatch.setattr(
-        "llm_optimization.inference._vllm.VALUE_MAPS",
+        "llm_config_optimization.inference._vllm.VALUE_MAPS",
         MappingProxyType({"dtype": {DType.AUTO: "auto"}}),
     )
 
@@ -159,6 +166,107 @@ def test_a_space_that_satisfies_the_engine_bound_has_no_problems() -> None:
     )
 
     assert list(VLLMBackend().validate(satisfying)) == []
+
+
+def test_an_attention_backend_vllm_no_longer_ships_is_reported() -> None:
+    problems = VLLMBackend().validate(
+        space(Dimension("attention_backend", Fixed(AttentionBackend.XFORMERS)))
+    )
+
+    assert any("space.attention_backend.fixed" in problem for problem in problems)
+
+
+@pytest.mark.parametrize("target", [HardwareTarget.ROCM, HardwareTarget.CPU])
+def test_a_cuda_only_attention_backend_is_reported_on_a_non_cuda_target(
+    target: HardwareTarget,
+) -> None:
+    problems = VLLMBackend().validate(
+        space(Dimension("attention_backend", Fixed(AttentionBackend.FLASH_ATTENTION))),
+        DetectedHardware(target, 1),
+    )
+
+    assert any(
+        "space.attention_backend.fixed" in problem and target.value in problem
+        for problem in problems
+    )
+
+
+def test_a_cuda_attention_backend_is_accepted_on_cuda() -> None:
+    problems = VLLMBackend().validate(
+        space(Dimension("attention_backend", Fixed(AttentionBackend.FLASH_ATTENTION))),
+        DetectedHardware(HardwareTarget.CUDA, 1),
+    )
+
+    assert list(problems) == []
+
+
+def test_the_hardware_check_is_skipped_when_no_hardware_is_given() -> None:
+    problems = VLLMBackend().validate(
+        space(Dimension("attention_backend", Fixed(AttentionBackend.FLASH_ATTENTION)))
+    )
+
+    assert list(problems) == []
+
+
+def test_a_tensor_parallel_size_larger_than_the_device_count_is_reported() -> None:
+    problems = VLLMBackend().validate(
+        space(Dimension("tensor_parallel_size", Categorical((1, 2, 4)))),
+        DetectedHardware(HardwareTarget.CUDA, 1),
+    )
+
+    assert any("space.tensor_parallel_size.categorical[1]" in problem for problem in problems)
+    assert any("space.tensor_parallel_size.categorical[2]" in problem for problem in problems)
+
+
+def test_a_tensor_parallel_size_interval_above_the_device_count_is_reported() -> None:
+    problems = VLLMBackend().validate(
+        space(Dimension("tensor_parallel_size", Interval(1, 8))),
+        DetectedHardware(HardwareTarget.CUDA, 4),
+    )
+
+    assert any(
+        "space.tensor_parallel_size.interval" in problem and "8" in problem for problem in problems
+    )
+
+
+def test_a_tensor_parallel_size_that_fits_the_device_count_is_accepted() -> None:
+    problems = VLLMBackend().validate(
+        space(Dimension("tensor_parallel_size", Categorical((1, 2)))),
+        DetectedHardware(HardwareTarget.CUDA, 2),
+    )
+
+    assert list(problems) == []
+
+
+def test_a_default_tensor_parallel_size_skips_the_device_count_check() -> None:
+    problems = VLLMBackend().validate(
+        space(Dimension("tensor_parallel_size", Default())),
+        DetectedHardware(HardwareTarget.CUDA, 1),
+    )
+
+    assert list(problems) == []
+
+
+class RecordingBackend:
+    """A backend that records the hardware it is asked to validate against."""
+
+    def __init__(self) -> None:
+        self.hardware: list[DetectedHardware | None] = []
+
+    def validate(
+        self, space: ExperimentSpace, hardware: DetectedHardware | None = None
+    ) -> Sequence[str]:
+        self.hardware.append(hardware)
+        return []
+
+
+def test_validate_space_forwards_the_hardware_to_the_backend() -> None:
+    backend = RecordingBackend()
+    hardware = DetectedHardware(HardwareTarget.ROCM, 2)
+
+    validate_space(SUPPORTED_SPACE, backend, hardware)
+
+    assert backend.hardware == [hardware]
 
 
 def test_a_default_parameter_skips_the_engine_bound() -> None:

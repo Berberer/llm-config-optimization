@@ -1,13 +1,13 @@
 """Unit tests for the space-to-trial mapping and config reconstruction.
 
 The mapping's observable contract is twofold. Given an engine-neutral
-:class:`~llm_optimization.search_space.ExperimentSpace`, a trial must offer
+:class:`~llm_config_optimization.search_space.ExperimentSpace`, a trial must offer
 exactly the choices each spec kind declares — a one-choice categorical for
 ``Fixed`` so its value is recorded on the trial, the declared values in declared
 order for ``Categorical``, an inclusive integer range for ``Interval``, and no
 suggestion at all for ``Default`` so deferral to the engine survives the sweep.
 Given a sampled parameter mapping, reconstruction must turn it back into an
-:class:`~llm_optimization.inference.LLMConfig`: sampled strings become the
+:class:`~llm_config_optimization.inference.LLMConfig`: sampled strings become the
 field's engine-neutral enum members, a ``Default`` field is unset, and the
 non-tunable fields are inherited from the base config.
 
@@ -22,7 +22,7 @@ from enum import StrEnum
 import optuna
 import pytest
 
-from llm_optimization.inference import (
+from llm_config_optimization.inference import (
     AttentionBackend,
     BenchmarkConfig,
     ContainerRuntimeConfig,
@@ -33,12 +33,12 @@ from llm_optimization.inference import (
     LLMConfig,
     QuantizationMethod,
 )
-from llm_optimization.optimization._optuna import (
+from llm_config_optimization.optimization._optuna import (
     reconstruct_config,
     reconstruct_llm,
     suggest_parameters,
 )
-from llm_optimization.search_space import (
+from llm_config_optimization.search_space import (
     Categorical,
     Default,
     Dimension,
@@ -50,7 +50,6 @@ from llm_optimization.search_space import (
 FULL_SPACE = ExperimentSpace(
     dimensions=(
         Dimension("dtype", Categorical((DType.FLOAT16, DType.BFLOAT16))),
-        Dimension("quantization", Categorical((QuantizationMethod.AWQ, QuantizationMethod.GPTQ))),
         Dimension("kv_cache_dtype", Categorical((KVCacheDType.AUTO, KVCacheDType.FP8_E4M3))),
         Dimension("max_model_len", Interval(1024, 8192)),
         Dimension("max_num_seqs", Fixed(256)),
@@ -66,7 +65,6 @@ FULL_SPACE = ExperimentSpace(
 
 PARAMETERS: dict[str, object] = {
     "dtype": "bfloat16",
-    "quantization": "gptq",
     "kv_cache_dtype": "fp8_e4m3",
     "max_model_len": 4096,
     "max_num_seqs": 256,
@@ -76,7 +74,7 @@ PARAMETERS: dict[str, object] = {
 }
 """A parameter mapping as a persisted study would return it: plain JSON values."""
 
-BASE_LLM = LLMConfig(seed=7, gpu_memory_utilization=0.85)
+BASE_LLM = LLMConfig(quantization=QuantizationMethod.AWQ, seed=7, gpu_memory_utilization=0.85)
 BASE_EXPERIMENT = ExperimentConfig(
     container=ContainerRuntimeConfig(image="example/engine:latest", target=HardwareTarget.CUDA),
     benchmark=BenchmarkConfig(model="meta-llama/Llama-3.1-8B", num_prompts=32),
@@ -172,11 +170,10 @@ def test_default_dimension_leaves_its_field_unset() -> None:
     ("field", "sampled", "expected"),
     [
         ("dtype", "bfloat16", DType.BFLOAT16),
-        ("quantization", "gptq", QuantizationMethod.GPTQ),
         ("kv_cache_dtype", "fp8_e4m3", KVCacheDType.FP8_E4M3),
         ("attention_backend", "flash_attention", AttentionBackend.FLASH_ATTENTION),
     ],
-    ids=["dtype", "quantization", "kv-cache-dtype", "attention-backend"],
+    ids=["dtype", "kv-cache-dtype", "attention-backend"],
 )
 def test_sampled_strings_round_trip_to_enum_members(
     field: str, sampled: str, expected: StrEnum
@@ -200,7 +197,7 @@ def test_reconstruct_llm_takes_tunables_from_the_mapping_and_inherits_the_rest()
 
     assert result == LLMConfig(
         dtype=DType.BFLOAT16,
-        quantization=QuantizationMethod.GPTQ,
+        quantization=QuantizationMethod.AWQ,
         kv_cache_dtype=KVCacheDType.FP8_E4M3,
         max_model_len=4096,
         max_num_seqs=256,

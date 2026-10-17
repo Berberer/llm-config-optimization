@@ -1,25 +1,31 @@
 """Optuna backend for the optimization layer.
 
 This module is the only place that knows Optuna's study and trial API. It maps
-each engine-neutral :class:`~llm_optimization.search_space.types.Spec` kind onto
+each engine-neutral :class:`~llm_config_optimization.search_space.types.Spec` kind onto
 an Optuna suggestion, rebuilds an
-:class:`~llm_optimization.inference.types.ExperimentConfig` from the sampled
+:class:`~llm_config_optimization.inference.types.ExperimentConfig` from the sampled
 parameters, and drives a study to find the best configuration.
 
 The mapping is deliberately faithful to the search-space semantics: a
-:class:`~llm_optimization.search_space.types.Fixed` dimension is submitted as a
+:class:`~llm_config_optimization.search_space.types.Fixed` dimension is submitted as a
 one-choice categorical so its value is recorded on the trial, a
-:class:`~llm_optimization.search_space.types.Categorical` dimension samples only
+:class:`~llm_config_optimization.search_space.types.Categorical` dimension samples only
 its declared values in declared order, an
-:class:`~llm_optimization.search_space.types.Interval` dimension samples
+:class:`~llm_config_optimization.search_space.types.Interval` dimension samples
 integers from its inclusive bounds with the default step, and a
-:class:`~llm_optimization.search_space.types.Default` dimension produces no
+:class:`~llm_config_optimization.search_space.types.Default` dimension produces no
 suggestion at all, so deferral to the engine survives the sweep.
 
 Categorical choices are submitted as their string values because a persisted
 study is reloaded with plain strings; :func:`reconstruct_llm` converts a sampled
 string back to the field's engine-neutral enum class, so an in-memory study and
 a resumed one produce identical configurations.
+
+The entry point accepts an optional per-trial callback, forwarded to Optuna's own
+``callbacks``, so a caller can observe each trial without reimplementing the
+study loop. A Ctrl-C during the sweep is turned into
+:class:`~llm_config_optimization.optimization.types.OptimizationInterrupted` carrying
+the best-so-far result, so the work done before the interrupt is not lost.
 """
 
 from collections.abc import Callable, Mapping
@@ -45,7 +51,7 @@ from ..search_space.types import (
     Fixed,
     ParameterValue,
 )
-from .types import OptimizationError, OptimizationResult
+from .types import OptimizationError, OptimizationInterrupted, OptimizationResult
 
 if TYPE_CHECKING:
     from podman import PodmanClient
@@ -151,7 +157,7 @@ def make_objective(
 
     The returned callable samples the trial's point, rebuilds the experiment
     from ``base``, and runs it through
-    :func:`~llm_optimization.inference.run_experiment` with the injected backend
+    :func:`~llm_config_optimization.inference.run_experiment` with the injected backend
     and container client, returning the run's token throughput as the value to
     maximize. ``backend`` and ``client`` may be ``None``, in which case the
     orchestrator's own defaults apply.
@@ -159,7 +165,7 @@ def make_objective(
     A successful trial records a JSON-serializable projection of its result
     under the ``result`` user attribute, so a persisted study explains what
     actually ran as well as which point won. An
-    :class:`~llm_optimization.inference.types.ExperimentError` records its
+    :class:`~llm_config_optimization.inference.types.ExperimentError` records its
     message under the ``error`` user attribute and is then re-raised, so the
     trial is marked failed rather than silently returning a bogus objective;
     the caller of ``study.optimize`` must pass ``catch=(ExperimentError,)`` for
@@ -184,7 +190,7 @@ def optimize(
     space: ExperimentSpace,
     base: ExperimentConfig,
     *,
-    n_trials: int,
+    n_trials: int | None = None,
     timeout: float | None = None,
     seed: int | None = None,
     storage: str | None = None,
@@ -192,12 +198,16 @@ def optimize(
     backend: InferenceBackend | None = None,
     client: PodmanClient | None = None,
     n_jobs: int = 1,
+    callback: Callable[[optuna.Study, optuna.trial.FrozenTrial], None] | None = None,
 ) -> OptimizationResult:
     """Search ``space`` for the ``base`` experiment with the best throughput.
 
     A study is created for the caller with Optuna's default TPE sampler, seeded
     by ``seed`` (or left non-deterministic when ``seed`` is ``None``) and always
-    maximizing the objective. Passing ``storage`` persists the study to that URL
+    maximizing the objective. ``n_trials`` bounds the sweep and ``timeout``
+    bounds it by wall-clock seconds; either may be ``None``, and ``None`` for
+    both runs the sweep until it is interrupted. Passing ``storage`` persists
+    the study to that URL
     and enables resume-on-existing, so a study of the same ``study_name`` is
     continued rather than recreated; ``n_trials`` is then a budget for *new*
     trials, not a cap on the study. With no ``storage`` the study lives in
@@ -205,21 +215,28 @@ def optimize(
 
     Each trial samples a point of ``space``, rebuilds the full experiment from
     ``base``, and runs it through
-    :func:`~llm_optimization.inference.run_experiment` with the injected
+    :func:`~llm_config_optimization.inference.run_experiment` with the injected
     ``backend`` and ``client``. A trial that raises
-    :class:`~llm_optimization.inference.types.ExperimentError` is marked failed
+    :class:`~llm_config_optimization.inference.types.ExperimentError` is marked failed
     and the study continues, so one out-of-memory configuration does not end the
     sweep.
+
+    ``callback``, when given, is invoked once at the end of every trial with the
+    study and the completed trial, so a caller can report progress without
+    duplicating the study loop; failed trials invoke it too.
 
     ``n_jobs`` is passed through to Optuna unchanged and defaults to one;
     running trials in parallel requires ``storage`` and is the caller's
     responsibility to keep on disjoint devices.
 
     The winning trial's parameters are reconstructed into a complete
-    :class:`~llm_optimization.inference.types.ExperimentConfig` through the same
+    :class:`~llm_config_optimization.inference.types.ExperimentConfig` through the same
     step a trial uses, so the returned configuration re-runs exactly the point
     that won. When no trial completes, :class:`OptimizationError` is raised with
-    the study attached rather than leaking Optuna's own exception.
+    the study attached rather than leaking Optuna's own exception. A Ctrl-C
+    stops the sweep and raises :class:`OptimizationInterrupted` carrying the
+    best-so-far result, or the same empty-sweep :class:`OptimizationError` when
+    no trial completed.
     """
     sampler = optuna.samplers.TPESampler(seed=seed)
     study = optuna.create_study(
@@ -230,14 +247,35 @@ def optimize(
         load_if_exists=storage is not None,
     )
     objective = make_objective(space, base, backend=backend, client=client)
-    study.optimize(
-        objective,
-        n_trials=n_trials,
-        timeout=timeout,
-        n_jobs=n_jobs,
-        catch=(ExperimentError,),
-    )
+    try:
+        study.optimize(
+            objective,
+            n_trials=n_trials,
+            timeout=timeout,
+            n_jobs=n_jobs,
+            catch=(ExperimentError,),
+            callbacks=None if callback is None else [callback],
+        )
+    except KeyboardInterrupt:
+        raise OptimizationInterrupted(
+            f"optimization was interrupted after {len(study.trials)} trials",
+            result=_result_from_study(study, space, base),
+        ) from None
+    return _result_from_study(study, space, base)
 
+
+def _result_from_study(
+    study: optuna.Study,
+    space: ExperimentSpace,
+    base: ExperimentConfig,
+) -> OptimizationResult:
+    """Project a study's best completed trial onto an :class:`OptimizationResult`.
+
+    This is shared by the normal return and the interrupt path, so an
+    interrupted sweep reports exactly the result a finished one would. When the
+    study holds no completed trial there is nothing to report, so the existing
+    empty-sweep :class:`OptimizationError` is raised instead.
+    """
     completed = [trial for trial in study.trials if trial.state is optuna.trial.TrialState.COMPLETE]
     if not completed:
         raise OptimizationError(
@@ -266,7 +304,7 @@ def optimize(
 def _project_result(result: ExperimentResult) -> dict[str, object]:
     """Project an experiment result onto the JSON-serializable fields to record.
 
-    The full :class:`~llm_optimization.inference.types.ExperimentResult` is not
+    The full :class:`~llm_config_optimization.inference.types.ExperimentResult` is not
     stored because its raw container output is not JSON-serializable; the typed
     metrics and the resolved target, image, and devices are, so the study keeps
     an inspectable record of what actually ran.
@@ -304,7 +342,7 @@ def _coerce_value(field: str, value: object) -> object:
     That is sound for the current tunable set, where every non-enum tunable is
     an ``int`` field and the one float field, ``gpu_memory_utilization``, is a
     non-tunable absent from
-    :data:`~llm_optimization.search_space.registry.TUNABLE_PARAMETERS`; the YAML
+    :data:`~llm_config_optimization.search_space.registry.TUNABLE_PARAMETERS`; the YAML
     loader additionally rejects a float ``Interval``. Two paths bypass those
     guards and would need a float branch: a hand-built ``Interval`` with float
     bounds, and a resumed study whose ``best.params`` came from a float
