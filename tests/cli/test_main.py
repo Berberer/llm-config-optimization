@@ -11,10 +11,11 @@ The model argument is a real temporary directory, so the preparation stage takes
 the local-checkpoint branch and never touches the network, and ``--target cpu``
 forces the CPU target so hardware detection short-circuits without a probe. The
 scenarios mirror the exit-code contract: a successful bounded sweep, a space the
-backend rejects, an invalid definition, a sweep that completes no trial, an
-interrupt, and an explicit TUI request without a terminal.
+backend rejects, a model the backend rejects, an invalid definition, a sweep that
+completes no trial, an interrupt, and an explicit TUI request without a terminal.
 """
 
+import json
 from io import StringIO
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from fakes import FakeBackend, FakePodmanClient
 from llm_config_optimization.cli import main
 from llm_config_optimization.inference import (
     DetectedHardware,
+    ExperimentConfig,
     ExperimentError,
     ExperimentResult,
     HardwareTarget,
@@ -74,6 +76,42 @@ class HardwareRecordingBackend(FakeBackend):
         return ()
 
 
+class ModelProblemBackend(FakeBackend):
+    """A backend that reports canned model-compatibility problems and records the calls.
+
+    It records every ``(experiment, model)`` pair it is asked about, so a test
+    can pin that the CLI passed the base configuration and the resolved
+    checkpoint path, and it returns every canned problem so the aggregation
+    into one failure can be observed.
+    """
+
+    def __init__(self, *problems: str) -> None:
+        super().__init__(PLAN, RESULT, [])
+        self.problems = problems
+        self.model_calls: list[tuple[ExperimentConfig, Path]] = []
+
+    def validate_model(self, experiment: ExperimentConfig, model: Path) -> tuple[str, ...]:
+        self.model_calls.append((experiment, model))
+        return self.problems
+
+
+class CheckpointValidatingBackend(FakeBackend):
+    """A fake backend that delegates model validation to the real vLLM rule.
+
+    Planning and result parsing stay canned, so a compatible run completes
+    without a daemon or a valid benchmark payload, while the checkpoint on disk
+    is inspected by :meth:`VLLMBackend.validate_model`. This is the CLI wiring
+    under test; the compatibility rule itself is covered directly against the
+    backend.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(PLAN, RESULT, [])
+
+    def validate_model(self, experiment: ExperimentConfig, model: Path) -> tuple[str, ...]:
+        return tuple(VLLMBackend().validate_model(experiment, model))
+
+
 class InterruptingBackend(FakeBackend):
     """A backend that completes one trial and then raises ``KeyboardInterrupt``.
 
@@ -110,6 +148,12 @@ def _write_space(path: Path, **overrides: object) -> Path:
     space.update({"dtype": {"fixed": "float16"}, **overrides})
     path.write_text(yaml.safe_dump({"space": space}), encoding="utf-8")
     return path
+
+
+def _write_checkpoint(model: str, method: str) -> None:
+    """Write a ``config.json`` declaring ``method`` into the checkpoint directory."""
+    payload = {"quantization_config": {"quant_method": method}}
+    Path(model, "config.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _invoke(
@@ -305,6 +349,96 @@ def test_a_tensor_parallel_size_larger_than_the_device_count_is_rejected_up_fron
     assert code == 4
     assert "tensor_parallel_size" in err
     assert "preparing study" not in out
+
+
+def test_every_model_compatibility_problem_is_reported_before_the_image_pull(
+    tmp_path: Path, model: str
+) -> None:
+    """The backend's problems are aggregated and fail the run before the pull."""
+    space = _write_space(tmp_path / "space.yaml")
+    backend = ModelProblemBackend("first problem", "second problem")
+    client = FakePodmanClient()
+
+    code, out, err = _invoke(model, space, "--n-trials", "1", backend=backend, client=client)
+
+    assert code == 4
+    assert "unsupported configuration" in err
+    assert "  - first problem" in err
+    assert "  - second problem" in err
+    assert "validating model compatibility" in out
+    assert "pulling container image" not in out
+    assert "preparing study" not in out
+    assert client.pull_calls == []
+    assert len(backend.model_calls) == 1
+    experiment, resolved = backend.model_calls[0]
+    assert experiment.llm.quantization is None
+    assert resolved == Path(model).expanduser().resolve()
+
+
+def test_an_incompatible_quantization_is_rejected_before_the_image_pull(
+    tmp_path: Path, model: str
+) -> None:
+    """An AWQ checkpoint with ``--quantization gptq`` fails before any download."""
+    _write_checkpoint(model, "awq")
+    space = _write_space(tmp_path / "space.yaml")
+    client = FakePodmanClient()
+
+    code, out, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--quantization",
+        "gptq",
+        backend=CheckpointValidatingBackend(),
+        client=client,
+    )
+
+    assert code == 4
+    assert "unsupported configuration" in err
+    assert "awq" in err
+    assert "gptq" in err
+    assert "validating model compatibility" in out
+    assert "pulling container image" not in out
+    assert client.pull_calls == []
+
+
+def test_a_compatible_quantization_proceeds_to_the_image_pull(tmp_path: Path, model: str) -> None:
+    """An AWQ checkpoint with ``--quantization awq`` is accepted and the sweep runs."""
+    _write_checkpoint(model, "awq")
+    space = _write_space(tmp_path / "space.yaml")
+    client = FakePodmanClient()
+
+    code, out, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--quantization",
+        "awq",
+        backend=CheckpointValidatingBackend(),
+        client=client,
+    )
+
+    assert code == 0
+    assert err == ""
+    assert "validating model compatibility" in out
+    assert f"pulling container image: {PLAN.image}" in out
+    assert (PLAN.image, "missing") in client.pull_calls
+
+
+def test_an_omitted_quantization_accepts_a_mismatched_checkpoint(
+    tmp_path: Path, model: str
+) -> None:
+    """With no ``--quantization`` the engine auto-detects, so the check is a no-op."""
+    _write_checkpoint(model, "awq")
+    space = _write_space(tmp_path / "space.yaml")
+
+    code, out, err = _invoke(model, space, "--n-trials", "1", backend=CheckpointValidatingBackend())
+
+    assert code == 0
+    assert err == ""
+    assert "validating model compatibility" in out
 
 
 def test_an_invalid_definition_returns_the_definition_code(tmp_path: Path, model: str) -> None:

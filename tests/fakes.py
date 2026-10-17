@@ -194,6 +194,10 @@ class FakeBackend:
         self.events.append("validate")
         return ()
 
+    def validate_model(self, experiment: ExperimentConfig, model: Path) -> Sequence[str]:
+        self.events.append("validate_model")
+        return ()
+
     def image_for(self, target: HardwareTarget) -> str:
         return self.plan_config.image
 

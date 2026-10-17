@@ -149,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--quantization",
         choices=("awq", "gptq", "fp8"),
         default=None,
-        help="Weight quantization the checkpoint was produced with; the engine's default when omitted.",
+        help="Weight quantization the checkpoint was produced with; checked against the resolved checkpoint. The engine auto-detects when omitted.",
     )
     engine.add_argument(
         "--gpu-memory-utilization",

@@ -9,17 +9,20 @@ reporters, and the final summary and configuration writer.
 
 The package is driven through a single :func:`main` entry point that returns an
 integer exit code, so both the console script and ``python -m llm_config_optimization``
-can share one implementation. ``main`` is a pure composition root: it loads the search space, resolves the
-hardware target, validates the space against that target, prefetches the model
-and image, and then calls the optimization adapter with the injected backend,
-client, and reporter. Nothing about the study itself is duplicated here.
+can share one implementation. ``main`` is a pure composition root: it loads the
+search space, resolves the hardware target, validates the space against that
+target, builds the base configuration, resolves the model to a local directory,
+validates the model against that configuration, pulls the container image, and
+then calls the optimization adapter with the injected backend, client, and
+reporter. Nothing about the study itself is duplicated here.
 
 Exit codes are distinct so scripts can react to each outcome: ``0`` success,
 ``2`` a usage error (including an explicit TUI request without a terminal),
-``3`` an invalid or unreadable search-space definition, ``4`` a space the
-backend does not support, ``5`` a sweep that finished with no completed trial,
-``130`` an interrupt, and ``1`` any unexpected error. Progress and the summary
-go to stdout; warnings and errors go to stderr.
+``3`` an invalid or unreadable search-space definition, ``4`` a configuration
+the backend does not support (the search space or the resolved model), ``5`` a
+sweep that finished with no completed trial, ``130`` an interrupt, and ``1`` any
+unexpected error. Progress and the summary go to stdout; warnings and errors go
+to stderr.
 """
 
 import argparse
@@ -34,7 +37,7 @@ import optuna
 from huggingface_hub import snapshot_download
 
 from ..inference import VLLMBackend, detect_hardware
-from ..inference.types import DetectedHardware, HardwareTarget, InferenceBackend
+from ..inference.types import DetectedHardware, ExperimentConfig, HardwareTarget, InferenceBackend
 from ..optimization import (
     OptimizationError,
     OptimizationInterrupted,
@@ -179,8 +182,10 @@ def _sweep(
         space = _load_space(args.space, out)
         hardware = _detect_hardware(args, out)
         _check_supported(space, resolved_backend, hardware, out)
-        image = _prefetch(args, hardware.target, resolved_backend, client, out)
         base = build_base_config(args)
+        model = _prefetch_model(args.model, out)
+        _check_model(base, model, resolved_backend, out)
+        image = _pull_image(args, hardware.target, resolved_backend, client, out)
         reporter = _make_reporter(mode, args, out)
         print("preparing study", file=out)
         reporter.start()
@@ -283,6 +288,31 @@ def _check_supported(
         raise _CliFailure(str(error), _EXIT_UNSUPPORTED) from error
 
 
+def _check_model(
+    experiment: ExperimentConfig,
+    model: Path,
+    backend: InferenceBackend,
+    out: TextIO,
+) -> None:
+    """Ask whether the resolved checkpoint supports the base configuration.
+
+    The model-aware half of preparation: the backend inspects the checkpoint
+    the run will mount and reports every way it cannot serve the configured
+    experiment. The problems are aggregated under an "unsupported configuration"
+    headline and mapped to the unsupported exit code, mirroring how
+    :func:`_check_supported` reports the space. It runs after the model is
+    resolved and before the image is pulled, so a doomed configuration does not
+    wait on a multi-gigabyte download. A checkpoint the backend cannot read
+    reports no problems, leaving the engine as the final authority at load time.
+    """
+    print("validating model compatibility", file=out)
+    problems = tuple(backend.validate_model(experiment, model))
+    if not problems:
+        return
+    detail = "\n".join(f"  - {problem}" for problem in problems)
+    raise _CliFailure(f"unsupported configuration:\n{detail}", _EXIT_UNSUPPORTED)
+
+
 def _detect_hardware(args: argparse.Namespace, out: TextIO) -> DetectedHardware:
     """Resolve the host's accelerator target and device count, honouring ``--target``."""
     print("detecting hardware target", file=out)
@@ -292,22 +322,41 @@ def _detect_hardware(args: argparse.Namespace, out: TextIO) -> DetectedHardware:
     return hardware
 
 
-def _prefetch(
+def _prefetch_model(model: str, out: TextIO) -> Path:
+    """Resolve the model to a local directory, downloading a Hub id if needed.
+
+    A local checkpoint is used directly and the resolved host path is returned;
+    anything else is a Hugging Face id whose snapshot directory the download
+    returns, so a later model-aware check inspects the same checkpoint the run
+    reads through the mounted cache. The snapshot download is called without an
+    explicit token, so ``huggingface_hub``'s own credential resolution applies
+    and a gated model is fetched from ``HF_TOKEN`` or a stored login. A download
+    failure fails the run before any trial.
+    """
+    print(f"resolving model: {model}", file=out)
+    if is_local_model(model):
+        print(f"using local model: {model}", file=out)
+        return Path(model).expanduser().resolve()
+    print(f"downloading model: {model}", file=out)
+    try:
+        return Path(snapshot_download(model))
+    except Exception as error:
+        raise _CliFailure(f"failed to download model {model!r}: {error}", _EXIT_ERROR) from error
+
+
+def _pull_image(
     args: argparse.Namespace,
     target: HardwareTarget,
     backend: InferenceBackend,
     client: PodmanClient | None,
     out: TextIO,
 ) -> str:
-    """Resolve and prefetch the model and the container image, returning the image.
+    """Resolve the container image for ``target`` and pull it, returning its name.
 
-    The model is downloaded on the host only when it is a Hugging Face id, so a
-    local checkpoint is used directly and the first trial reads the cache the
-    backend bind-mounts rather than a download. The image is the explicit
-    ``--image`` or the backend's image for the target, and is pulled through the
-    runtime's public helper unless the policy is ``never``.
+    The image is the explicit ``--image`` or the backend's image for the target,
+    and is pulled through the runtime's public helper unless the policy is
+    ``never``.
     """
-    _prefetch_model(args.model, out)
     image = args.image or backend.image_for(target)
     if args.pull_policy == "never":
         print(f"using container image: {image} (pull policy never)", file=out)
@@ -318,25 +367,6 @@ def _prefetch(
     except ContainerRunError as error:
         raise _CliFailure(f"failed to pull image {image!r}: {error}", _EXIT_ERROR) from error
     return image
-
-
-def _prefetch_model(model: str, out: TextIO) -> None:
-    """Download a Hugging Face model to the host cache, or use a local path directly.
-
-    The snapshot download is called without an explicit token, so
-    ``huggingface_hub``'s own credential resolution applies and a gated model is
-    fetched from ``HF_TOKEN`` or a stored login. A download failure fails the
-    run before any trial.
-    """
-    print(f"resolving model: {model}", file=out)
-    if is_local_model(model):
-        print(f"using local model: {model}", file=out)
-        return
-    print(f"downloading model: {model}", file=out)
-    try:
-        snapshot_download(model)
-    except Exception as error:
-        raise _CliFailure(f"failed to download model {model!r}: {error}", _EXIT_ERROR) from error
 
 
 def _make_reporter(mode: str, args: argparse.Namespace, out: TextIO) -> LogReporter | TuiReporter:

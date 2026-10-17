@@ -317,7 +317,10 @@ class InferenceBackend(Protocol):
 
     Before a series runs, :meth:`validate` checks a search-space definition
     against the backend, so a parameter or value the engine does not support is
-    rejected up front rather than midway through an expensive sweep.
+    rejected up front rather than midway through an expensive sweep. Once the
+    model has been resolved to a local directory, :meth:`validate_model` checks
+    it against the configuration, so a checkpoint that cannot serve the
+    experiment is rejected before anything is pulled or run.
 
     An output directory is optional because not every engine writes a result
     file. A backend that does not need one ignores the argument; a backend that
@@ -350,6 +353,27 @@ class InferenceBackend(Protocol):
         the host cannot fit (a tensor-parallel size larger than its device
         count), is rejected before the sweep starts. ``None`` asks the
         host-agnostic question only.
+        """
+        ...
+
+    def validate_model(self, experiment: ExperimentConfig, model: Path) -> Sequence[str]:
+        """Report every way the resolved ``model`` cannot serve ``experiment``.
+
+        This is the model-aware half of backend validation. It runs once the
+        checkpoint has been resolved to a local directory and before anything
+        is executed, so a configuration the checkpoint cannot satisfy fails
+        before a container is pulled. The hook receives the whole experiment
+        rather than only the model-dependent field, so further model-aware
+        checks can be added without widening the protocol, and ``model`` is the
+        same directory the run will mount, so validation and execution inspect
+        one checkpoint.
+
+        Problems are returned as human-readable strings, mirroring
+        :meth:`validate`, so the caller can aggregate and report them together;
+        an empty sequence means the checkpoint supports the configuration. A
+        checkpoint whose metadata cannot be read is accepted: absence of
+        evidence is not a mismatch, and the engine remains the final authority
+        when the model loads.
         """
         ...
 

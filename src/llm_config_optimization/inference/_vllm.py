@@ -133,6 +133,33 @@ the member is rejected instead of being forwarded to a flag the engine will
 not accept.
 """
 
+_CHECKPOINT_QUANTIZATION_METHODS: Mapping[QuantizationMethod, frozenset[str]] = MappingProxyType(
+    {
+        QuantizationMethod.AWQ: frozenset({"awq", "auto_awq", "awq_marlin"}),
+        QuantizationMethod.GPTQ: frozenset({"gptq", "auto_gptq", "gptq_marlin"}),
+        QuantizationMethod.FP8: frozenset({"fp8"}),
+    }
+)
+"""Checkpoint spellings of each quantization method vLLM can load.
+
+A checkpoint names its method under ``quantization_config.quant_method``, and
+checkpoint authors are inconsistent about the exact spelling (``awq`` against
+``auto_awq`` or ``awq_marlin``, for example), so each engine-neutral member
+maps to the set of spellings it can serve. The spellings are vLLM-version-
+specific and drift with the engine, exactly like :data:`VALUE_MAPS`, so they
+live here rather than in the engine-neutral types. A declared method absent
+from every set is one this backend does not model, so no explicit quantization
+value is accepted for it and the user is steered to auto-detection.
+"""
+
+_ONLINE_QUANTIZATION_METHODS: frozenset[QuantizationMethod] = frozenset({QuantizationMethod.FP8})
+"""Methods vLLM can apply to an unquantized checkpoint while loading it.
+
+A checkpoint that declares no method carries full-precision weights, so only a
+method the engine quantizes on the fly can be requested for it; a checkpoint-
+time method such as AWQ has no quantized weights to load.
+"""
+
 _ATTENTION_BACKEND_TARGETS: Mapping[AttentionBackend, frozenset[HardwareTarget]] = MappingProxyType(
     {
         AttentionBackend.FLASH_ATTENTION: frozenset({HardwareTarget.CUDA}),
@@ -598,6 +625,46 @@ def _validate_engine_bounds(space: ExperimentSpace) -> list[str]:
     return problems
 
 
+class _UnreadableCheckpoint:
+    """Sentinel type for a checkpoint whose configuration cannot be read."""
+
+
+_UNREADABLE_CHECKPOINT = _UnreadableCheckpoint()
+"""Returned when ``config.json`` is missing, malformed, or not a JSON object.
+
+Kept distinct from ``None``, which means the file was read but declares no
+method: an unreadable checkpoint is accepted (fail-open), while a readable one
+that declares no method accepts only a method the engine can apply online.
+"""
+
+
+def _read_checkpoint_quantization(model: Path) -> str | _UnreadableCheckpoint | None:
+    """Return the quantization method a checkpoint declares, lower-cased.
+
+    The standard ``config.json`` names the method under
+    ``quantization_config.quant_method``. A missing or unreadable file,
+    malformed JSON, or a payload that is not a JSON object is *unreadable*: the
+    caller accepts the configuration rather than rejecting on metadata it could
+    not see. A readable object with no ``quantization_config`` or a non-string
+    ``quant_method`` declares no method and returns ``None``. The value is
+    lower-cased because checkpoint authors are inconsistent about case while
+    the engine's spellings are lower-case.
+    """
+    try:
+        payload = json.loads((model / "config.json").read_text(encoding="utf-8"))
+    except OSError, json.JSONDecodeError:
+        return _UNREADABLE_CHECKPOINT
+    if not isinstance(payload, Mapping):
+        return _UNREADABLE_CHECKPOINT
+    quantization_config = payload.get("quantization_config")
+    if not isinstance(quantization_config, Mapping):
+        return None
+    method = quantization_config.get("quant_method")
+    if not isinstance(method, str):
+        return None
+    return method.lower()
+
+
 @dataclass(frozen=True, slots=True)
 class VLLMBackend:
     """The vLLM implementation of the inference backend seam.
@@ -668,6 +735,42 @@ class VLLMBackend:
                 problems.extend(_validate_device_count(dimension, field, hardware.device_count))
         problems.extend(_validate_engine_bounds(space))
         return problems
+
+    def validate_model(self, experiment: ExperimentConfig, model: Path) -> Sequence[str]:
+        """Report every way the checkpoint at ``model`` cannot serve ``experiment``.
+
+        The only model-dependent check today is quantization. An unset
+        ``quantization`` is always accepted because the engine auto-detects the
+        method from the checkpoint. An unquantized checkpoint accepts only a
+        method the engine can apply online, while a quantized checkpoint
+        accepts only the method it was produced with, matched through
+        :data:`_CHECKPOINT_QUANTIZATION_METHODS`. A declared method this
+        backend does not model accepts no explicit value, steering the user to
+        auto-detection. Problems are returned as strings; a checkpoint whose
+        configuration cannot be read is accepted (fail-open), so custom
+        checkpoints are never blocked by metadata the check could not see.
+        """
+        quantization = experiment.llm.quantization
+        if quantization is None:
+            return []
+        declared = _read_checkpoint_quantization(model)
+        if isinstance(declared, _UnreadableCheckpoint):
+            return []
+        if declared is None:
+            if quantization in _ONLINE_QUANTIZATION_METHODS:
+                return []
+            return [
+                f"the checkpoint at {model} declares no quantization method, but "
+                f"quantization={quantization.value!r} was requested; omit quantization "
+                f"to let vLLM auto-detect"
+            ]
+        if declared in _CHECKPOINT_QUANTIZATION_METHODS.get(quantization, frozenset()):
+            return []
+        return [
+            f"the checkpoint at {model} was quantized with {declared!r}, which is "
+            f"incompatible with the requested quantization={quantization.value!r}; omit "
+            f"quantization to let vLLM auto-detect"
+        ]
 
     def plan(
         self,

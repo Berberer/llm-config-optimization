@@ -104,7 +104,7 @@ command line.
 | Flag                         | Default          | Description                                                                 |
 | ---------------------------- | ---------------- | --------------------------------------------------------------------------- |
 | `--llm-seed`                 | `0`              | Engine seed, so every trial runs under the same prompt randomness.           |
-| `--quantization`             | engine default   | Weight quantization the checkpoint was produced with (`awq`, `gptq`, `fp8`). |
+| `--quantization`             | engine default   | Weight quantization the checkpoint was produced with (`awq`, `gptq`, `fp8`); checked against the resolved checkpoint. Omit to let the engine auto-detect. |
 | `--gpu-memory-utilization`   | engine default   | Fraction of GPU memory the engine may use.                                   |
 | `--sampler-seed`             | unset            | Seed for the optimization sampler; a non-deterministic search when omitted.  |
 
@@ -154,7 +154,7 @@ so `> run.log` captures a clean record.
 | `1`   | Unexpected error.                                              |
 | `2`   | Usage error (including an explicit TUI request without a terminal). |
 | `3`   | Invalid or unreadable search-space definition.                 |
-| `4`   | A space the backend does not support.                          |
+| `4`   | A configuration the backend does not support — the search space or the resolved model. |
 | `5`   | Sweep finished with no completed trial.                        |
 | `130` | Interrupted.                                                   |
 
@@ -327,9 +327,15 @@ set on the command line (`--llm-seed`, `--gpu-memory-utilization`);
 `quantization` describes how the checkpoint was produced, so it is a model
 property rather than a runtime choice and is set with `--quantization`.
 
+Because it is a checkpoint property, `--quantization` is validated against the
+resolved checkpoint before the image is pulled: a quantized checkpoint accepts
+only the method it was produced with, and an unquantized checkpoint accepts only
+a method the engine can apply online (`fp8`). Omit `--quantization` to let the
+engine auto-detect the method, which is always accepted.
+
 ### Validation
 
-Validation happens in two stages, both before any container runs:
+Validation happens in three stages, all before any container runs:
 
 1. **Engine-agnostic**: Performed when the file is loaded. It checks the
    top-level shape, registry membership, that each dimension carries exactly one
@@ -342,10 +348,18 @@ Validation happens in two stages, both before any container runs:
    accelerator class, and fits the resolved device count. It also enforces its
    own cross-parameter rule `max_num_batched_tokens >= max_num_seqs` (checked
    against the most permissive point the space allows).
+3. **Model-aware**: Once the checkpoint is resolved to a local directory (a host
+   path, or the snapshot the Hugging Face download produced), `vLLM` inspects
+   the quantization method it declares and rejects a `--quantization` the
+   checkpoint cannot serve. The check runs before the container image is pulled,
+   so a doomed configuration does not wait on a multi-gigabyte download. An
+   omitted `--quantization` always passes, because the engine auto-detects the
+   method, and a checkpoint whose metadata cannot be read is likewise accepted,
+   so custom checkpoints are never blocked.
 
 Malformed YAML and a non-mapping document are reported through the same error as
-a structural problem, so a broken file fails uniformly with exit code `3`
-(unsupported space: `4`).
+a structural problem, so a broken file fails uniformly with exit code `3`; an
+unsupported space or model fails with exit code `4`.
 
 ### All-default and mixed examples
 
@@ -406,8 +420,9 @@ The codebase is layered so engine details stay at the edges:
 - `search_space/`: Engine-neutral definition types, the tunable registry, the
   YAML loader, and validation.
 - `inference/`: The engine-neutral experiment surface (a backend `Protocol`)
-  plus the `VLLMBackend` that maps an experiment to a container run and parses
-  results. A second engine would be another implementation of that protocol.
+  plus the `VLLMBackend` that validates a resolved checkpoint, maps an
+  experiment to a container run, and parses results. A second engine would be
+  another implementation of that protocol.
 - `runtime/`: Backend-agnostic container types and the Podman client (plus
   SELinux auto-detection).
 - `optimization/`: The Optuna adapter that maps spec kinds to suggestions and

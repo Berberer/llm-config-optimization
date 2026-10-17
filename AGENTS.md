@@ -30,15 +30,23 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
 - `optimization/_optuna.py` is the only module that knows Optuna's study and
   trial API.
 - Engine spellings live only in `inference/_vllm.py` (`PARAMETER_TARGETS`,
-  `VALUE_MAPS`); the search space uses engine-neutral enum values.
+  `VALUE_MAPS`, `_CHECKPOINT_QUANTIZATION_METHODS`); the search space uses
+  engine-neutral enum values.
+- `InferenceBackend.validate_model` is the model-aware half of backend
+  validation: it receives the whole `ExperimentConfig` and the resolved model
+  path, returns problems rather than raising, and fails open when the
+  checkpoint's metadata cannot be read. Reading the checkpoint and the
+  method-to-spelling mapping live in `inference/_vllm.py`, so the
+  engine-neutral surfaces carry no checkpoint vocabulary.
 - The search space is **total**: every tunable in `TUNABLE_PARAMETERS` must be
   declared, so a value never silently falls back to an engine default.
 
 ### Extension recipes
 
 - **New inference engine** — implement `InferenceBackend` (`inference/types.py`):
-  `validate`, `image_for`, `plan`, `parse_result`. The file format and the layers
-  above are unchanged, so a second engine is an addition, not a rewrite.
+  `validate`, `validate_model`, `image_for`, `plan`, `parse_result`. The file
+  format and the layers above are unchanged, so a second engine is an addition,
+  not a rewrite.
 - **New tunable parameter** — see the checklist below; the search space is
   total, so this touches code, both example files, the README, and the tests in
   one change.
@@ -109,10 +117,12 @@ Tests:
 ### Data flow
 
 `cli.main` loads and engine-agnostically validates the space, asks the backend to
-`validate` it, resolves the hardware target and image, then calls
-`optimization.optimize`. Each trial: Optuna samples a point → `inference` plans a
-container run → `runtime` executes it → the backend parses the result → the
-reporter callback runs. `cli/__init__.py` maps outcomes onto exit codes.
+`validate` it against the resolved hardware, builds the base configuration,
+resolves the model to a local directory, asks the backend to `validate_model` it
+against that checkpoint, pulls the image, then calls `optimization.optimize`.
+Each trial: Optuna samples a point → `inference` plans a container run →
+`runtime` executes it → the backend parses the result → the reporter callback
+runs. `cli/__init__.py` maps outcomes onto exit codes.
 
 ## Code style
 
