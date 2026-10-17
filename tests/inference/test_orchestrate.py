@@ -5,7 +5,8 @@ the host's hardware once, ask the backend to plan a run, execute that plan
 through the runtime layer, and hand the captured outcome back to the backend for
 parsing — in that order, with the detected hardware, the experiment, and the
 managed output directory passed through. A failed container run becomes an
-``ExperimentError`` that preserves the cause and the raw result.
+``ExperimentError`` that preserves the cause and the raw result, and its message
+keeps the engine's root-cause line alongside a bounded traceback tail.
 
 These tests inject a fake hardware detector, a fake backend, and the shared fake
 Podman client, so no daemon, inference engine, or specific hardware is required.
@@ -36,6 +37,28 @@ _PLAN = ContainerConfig(
     image="fake/engine:latest",
     command=("bench", "--model", HUB_MODEL),
 )
+
+_ROOT_CAUSE = "AssertionError: ChunkGatedDeltaRuleFunction does not support float32"
+
+
+def _engine_output(root_cause: str, *, frames: int) -> bytes:
+    """Build engine-like output: a root cause followed by a traceback."""
+    traceback = "\n".join(
+        f'  File "/usr/lib/python3.12/site-packages/module_{i}.py", line {i}, in <module>'
+        for i in range(frames)
+    )
+    return f"{root_cause}\nTraceback (most recent call last):\n{traceback}".encode()
+
+
+def _failure_message(monkeypatch: pytest.MonkeyPatch, payload: bytes) -> str:
+    """Drive a failed run with synthetic engine output and return the error message."""
+    events: list[str] = []
+    client = RecordingPodmanClient(events, exit_code=1, logs=_frame(2, payload))
+    backend = FakeBackend(_PLAN, _result(), events)
+    _detector(monkeypatch, events)
+    with pytest.raises(ExperimentError) as excinfo:
+        run_experiment(_experiment(), backend, client=client)
+    return str(excinfo.value)
 
 
 def _experiment(*, target: HardwareTarget | None = None) -> ExperimentConfig:
@@ -237,6 +260,52 @@ def test_container_failure_output_is_bounded(
 
     assert "…" in str(excinfo.value)
     assert len(str(excinfo.value)) < 10000
+
+
+def test_failure_excerpt_keeps_a_root_cause_before_a_long_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The engine's cause leads the excerpt even when a long traceback follows it."""
+    message = _failure_message(monkeypatch, _engine_output(_ROOT_CAUSE, frames=80))
+
+    assert _ROOT_CAUSE in message
+    assert "…" in message
+    assert message.index(_ROOT_CAUSE) < message.index("…")
+
+
+def test_failure_excerpt_leaves_a_short_message_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message that fits the budget is attached verbatim, with no truncation."""
+    short = "ValueError: the configured dtype is unsupported"
+
+    message = _failure_message(monkeypatch, short.encode())
+
+    assert message.endswith(short)
+    assert "…" not in message
+
+
+def test_failure_excerpt_of_empty_output_stays_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An engine that captures nothing adds no excerpt to the error."""
+    message = _failure_message(monkeypatch, b"")
+
+    assert "\n" not in message
+    assert "…" not in message
+
+
+def test_failure_excerpt_stays_bounded_while_keeping_the_root_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A root cause is kept without letting a chatty engine flood the message."""
+    output = _engine_output(_ROOT_CAUSE, frames=300)
+
+    message = _failure_message(monkeypatch, output)
+
+    assert len(output) > 10000
+    assert _ROOT_CAUSE in message
+    assert len(message) < 3000
 
 
 def test_container_start_failure_is_wrapped_without_a_result(

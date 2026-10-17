@@ -18,7 +18,7 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
 | `inference/`    | Engine-neutral experiment surface (the `InferenceBackend` protocol) plus the vLLM backend and hardware detection | `types.py`, `_orchestrate.py`, `_vllm.py`, `hardware.py` |
 | `runtime/`      | Backend-agnostic container types and the Podman client plus SELinux probe                            | `types.py`, `_podman.py`, `_selinux.py` |
 | `optimization/` | The Optuna adapter: maps spec kinds to suggestions and drives a study                                | `types.py`, `_optuna.py` |
-| `cli/`          | Composition root: argument parsing, base-config construction, log/TUI reporters, summary/writer, exit codes | `arguments.py`, `config.py`, `log.py`, `tui.py`, `summary.py`, `__init__.py` |
+| `cli/`          | Composition root: argument parsing, base-config construction, model download progress, log/TUI reporters, summary/writer, exit codes | `arguments.py`, `config.py`, `download.py`, `log.py`, `tui.py`, `summary.py`, `__init__.py` |
 
 ### Invariants
 

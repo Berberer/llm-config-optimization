@@ -6,7 +6,8 @@ records what ran on the trial, keeps going when a trial fails, and reports the
 winning point reconstructed into a complete experiment. A sweep that completes
 no trial raises ``OptimizationError`` carrying the study, and passing a storage
 URL persists the study so a later call resumes it by name. An optional per-trial
-callback is invoked once at the end of every trial — failed ones included — and
+callback is invoked once at the end of every trial — failed ones included — an
+optional trial-start hook is invoked once at the beginning of every trial, and
 a Ctrl-C during the sweep raises ``OptimizationInterrupted`` carrying the
 best-so-far result, or the empty-sweep error when nothing completed.
 
@@ -315,6 +316,42 @@ def test_the_callback_fires_for_failed_trials_too() -> None:
         optuna.trial.TrialState.FAIL,
         optuna.trial.TrialState.COMPLETE,
     ]
+
+
+def test_the_trial_start_hook_fires_once_per_trial() -> None:
+    starts: list[None] = []
+
+    result = optimize(
+        SPACE,
+        BASE,
+        n_trials=3,
+        seed=0,
+        backend=_backend(),
+        client=FakePodmanClient(),
+        on_trial_start=lambda: starts.append(None),
+    )
+
+    assert len(starts) == len(result.study.trials) == 3
+
+
+def test_the_trial_start_hook_fires_for_failed_trials_too() -> None:
+    starts: list[None] = []
+
+    result = optimize(
+        SPACE,
+        BASE,
+        n_trials=2,
+        seed=0,
+        backend=FailsOnceBackend(PLAN, RESULT),
+        client=FakePodmanClient(),
+        on_trial_start=lambda: starts.append(None),
+    )
+
+    assert [trial.state for trial in result.study.trials] == [
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.COMPLETE,
+    ]
+    assert len(starts) == 2
 
 
 def test_an_interrupt_raises_the_dedicated_exception_with_the_best_result() -> None:

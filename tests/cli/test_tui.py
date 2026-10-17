@@ -10,6 +10,7 @@ without breaking them.
 """
 
 import io
+import re
 
 import optuna
 
@@ -65,6 +66,32 @@ def graph_body(frame: str) -> str:
     return frame.rstrip("\n").rsplit("\n", 1)[0]
 
 
+def x_tick_labels(frame: str) -> list[str]:
+    """Return the x-axis tick labels, read from the line under the plot."""
+    lines = frame.splitlines()
+    axis_line = next(index for index, line in enumerate(lines) if line.startswith("tps "))
+    return lines[axis_line - 1].split()
+
+
+def y_tick_labels(frame: str) -> list[str]:
+    """Return the y-axis tick labels, read from the left edge of the plot."""
+    return re.findall(r"^\s*([\d,\.]+)┤", frame, re.MULTILINE)
+
+
+def final_frame(*values: float, n_trials: int | None = None) -> str:
+    """Drive the reporter over ``values`` and return the last frame it drew."""
+    stream = io.StringIO()
+    reporter = TuiReporter(n_trials=n_trials, stream=stream, clock=FakeClock())
+    study = optuna.create_study(direction="maximize")
+    for value in values:
+        trial = completed_trial(value)
+        study.add_trial(trial)
+        stream.truncate(0)
+        stream.seek(0)
+        reporter(study, trial)
+    return stream.getvalue()
+
+
 def test_a_frame_plots_both_series_with_a_status_line() -> None:
     reporter = TuiReporter(n_trials=10, clock=FakeClock())
     trial = completed_trial(42.0)
@@ -77,7 +104,7 @@ def test_a_frame_plots_both_series_with_a_status_line() -> None:
     assert "tps" in graph_body(frame)
     assert "best" in graph_body(frame)
     assert "trials" in graph_body(frame)
-    assert status_line(frame) == "trials 1/10  best 42.00 tps  (0.0s)"
+    assert status_line(frame) == "trials 1/10  best 42.00 tps  avg trial 0.0s  (0.0s)"
 
 
 def test_the_status_line_reports_count_best_and_elapsed() -> None:
@@ -87,7 +114,58 @@ def test_the_status_line_reports_count_best_and_elapsed() -> None:
     study = study_with(trial)
     clock.now = 3.5
 
-    assert status_line(reporter.render(study, trial)) == "trials 1/10  best 42.00 tps  (3.5s)"
+    assert status_line(reporter.render(study, trial)) == (
+        "trials 1/10  best 42.00 tps  avg trial 3.5s  (3.5s)"
+    )
+
+
+def test_the_average_is_omitted_until_a_trial_succeeds() -> None:
+    clock = FakeClock()
+    reporter = TuiReporter(n_trials=10, clock=clock)
+    trial = failed_trial("oom")
+    study = study_with(trial)
+    reporter.trial_started()
+    clock.now = 5.0
+
+    status = status_line(reporter.render(study, trial))
+
+    assert "avg" not in status
+    assert status == "trials 1/10  best n/a  (5.0s)"
+
+
+def test_failed_trials_do_not_contribute_to_the_average() -> None:
+    clock = FakeClock()
+    stream = io.StringIO()
+    reporter = TuiReporter(n_trials=10, stream=stream, clock=clock)
+    good = completed_trial(50.0)
+    study = study_with(good)
+    reporter.trial_started()
+    clock.now = 10.0
+    reporter(study, good)
+    bad = failed_trial("oom")
+    study.add_trial(bad)
+    reporter.trial_started()
+    clock.now = 100.0
+    reporter(study, bad)
+
+    assert (
+        status_line(stream.getvalue()) == "trials 2/10  best 50.00 tps  avg trial 10.0s  (100.0s)"
+    )
+
+
+def test_the_average_is_the_mean_of_successful_trial_durations() -> None:
+    clock = FakeClock()
+    stream = io.StringIO()
+    reporter = TuiReporter(n_trials=10, stream=stream, clock=clock)
+    study = optuna.create_study(direction="maximize")
+    for value, elapsed in ((40.0, 10.0), (50.0, 20.0)):
+        trial = completed_trial(value)
+        study.add_trial(trial)
+        reporter.trial_started()
+        clock.now += elapsed
+        reporter(study, trial)
+
+    assert status_line(stream.getvalue()) == "trials 2/10  best 50.00 tps  avg trial 15.0s  (30.0s)"
 
 
 def test_an_unbounded_sweep_omits_the_denominator() -> None:
@@ -95,7 +173,9 @@ def test_an_unbounded_sweep_omits_the_denominator() -> None:
     trial = completed_trial(42.0)
     study = study_with(trial)
 
-    assert status_line(reporter.render(study, trial)) == "trials 1  best 42.00 tps  (0.0s)"
+    assert status_line(reporter.render(study, trial)) == (
+        "trials 1  best 42.00 tps  avg trial 0.0s  (0.0s)"
+    )
 
 
 def test_a_failed_trial_advances_the_axis_with_the_best_carried_forward() -> None:
@@ -108,7 +188,7 @@ def test_a_failed_trial_advances_the_axis_with_the_best_carried_forward() -> Non
 
     frame = reporter.render(study, bad)
 
-    assert status_line(frame) == "trials 2/10  best 50.00 tps  (0.0s)"
+    assert status_line(frame) == "trials 2/10  best 50.00 tps  avg trial 0.0s  (0.0s)"
     assert "best" in graph_body(frame)
 
 
@@ -136,6 +216,37 @@ def test_start_announces_preparation_without_drawing_a_frame() -> None:
     assert "tps" not in output
 
 
+def test_the_running_frame_marks_the_trial_in_flight() -> None:
+    stream = io.StringIO()
+    reporter = TuiReporter(n_trials=10, stream=stream, clock=FakeClock())
+
+    reporter.trial_started()
+
+    frame = stream.getvalue()
+    assert "tokens per second" in graph_body(frame)
+    assert status_line(frame) == "trials 0/10  running trial 1  best n/a  (0.0s)"
+
+
+def test_the_running_frame_keeps_the_summary_columns() -> None:
+    clock = FakeClock()
+    stream = io.StringIO()
+    reporter = TuiReporter(n_trials=10, stream=stream, clock=clock)
+    good = completed_trial(42.0)
+    study = study_with(good)
+    reporter.trial_started()
+    clock.now = 10.0
+    reporter(study, good)
+    clock.now = 12.0
+    stream.truncate(0)
+    stream.seek(0)
+
+    reporter.trial_started()
+
+    assert status_line(stream.getvalue()) == (
+        "trials 1/10  running trial 2  best 42.00 tps  avg trial 10.0s  (12.0s)"
+    )
+
+
 def test_the_first_completed_trial_draws_the_graph() -> None:
     """The plot appears once there is something to plot."""
     stream = io.StringIO()
@@ -150,7 +261,33 @@ def test_the_first_completed_trial_draws_the_graph() -> None:
 
     frame = stream.getvalue()
     assert "tokens per second" in graph_body(frame)
-    assert status_line(frame) == "trials 1/10  best 42.00 tps  (0.0s)"
+    assert status_line(frame) == "trials 1/10  best 42.00 tps  avg trial 0.0s  (0.0s)"
+
+
+def test_a_short_sweep_ticks_every_integer_trial() -> None:
+    frame = final_frame(*[float(value) for value in range(10)], n_trials=10)
+
+    labels = x_tick_labels(frame)
+
+    assert labels == [str(value) for value in range(1, 11)]
+
+
+def test_a_long_sweep_thins_the_x_axis_to_integer_ticks() -> None:
+    frame = final_frame(*[float(value) for value in range(20)], n_trials=20)
+
+    labels = x_tick_labels(frame)
+
+    assert all(label.isdigit() for label in labels)
+    assert labels == ["1", "4", "7", "10", "13", "16", "19"]
+
+
+def test_the_y_axis_labels_are_thousands_separated_and_never_scientific() -> None:
+    frame = final_frame(1_000_000.0, 1_500_000.0, 2_000_000.0, n_trials=3)
+
+    labels = y_tick_labels(frame)
+
+    assert labels == ["2,000,000", "1,500,000", "1,000,000"]
+    assert all("e" not in label.lower() for label in labels)
 
 
 def test_start_resets_the_series_so_a_restart_does_not_replay_points() -> None:
@@ -165,4 +302,4 @@ def test_start_resets_the_series_so_a_restart_does_not_replay_points() -> None:
 
     reporter(study, good)
 
-    assert status_line(stream.getvalue()) == "trials 1/10  best 50.00 tps  (0.0s)"
+    assert status_line(stream.getvalue()) == "trials 1/10  best 50.00 tps  avg trial 0.0s  (0.0s)"

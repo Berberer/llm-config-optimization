@@ -4,8 +4,9 @@ This subpackage is the composition root that turns the console script into a
 usable tool: it parses the command line, builds the fixed
 :class:`~llm_config_optimization.inference.types.ExperimentConfig` the search space is
 varied around, reports progress, and maps outcomes onto exit codes. The
-modules here own argument parsing, base-config construction, the log and TUI
-reporters, and the final summary and configuration writer.
+modules here own argument parsing, base-config construction, the model download
+progress line, the log and TUI reporters, and the final summary and
+configuration writer.
 
 The package is driven through a single :func:`main` entry point that returns an
 integer exit code, so both the console script and ``python -m llm_config_optimization``
@@ -34,7 +35,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 import optuna
-from huggingface_hub import snapshot_download
 
 from ..inference import VLLMBackend, detect_hardware
 from ..inference.types import DetectedHardware, ExperimentConfig, HardwareTarget, InferenceBackend
@@ -53,6 +53,7 @@ from ..search_space import (
 )
 from .arguments import parse_args
 from .config import build_base_config, is_local_model
+from .download import download_model
 from .log import LogReporter
 from .summary import render_summary, write_config
 from .tui import TuiReporter
@@ -201,6 +202,7 @@ def _sweep(
             client=client,
             n_jobs=args.n_jobs,
             callback=reporter,
+            on_trial_start=reporter.trial_started if isinstance(reporter, TuiReporter) else None,
         )
     except _CliFailure as failure:
         print(failure, file=err)
@@ -337,9 +339,8 @@ def _prefetch_model(model: str, out: TextIO) -> Path:
     if is_local_model(model):
         print(f"using local model: {model}", file=out)
         return Path(model).expanduser().resolve()
-    print(f"downloading model: {model}", file=out)
     try:
-        return Path(snapshot_download(model))
+        return download_model(model, out)
     except Exception as error:
         raise _CliFailure(f"failed to download model {model!r}: {error}", _EXIT_ERROR) from error
 

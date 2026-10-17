@@ -3,7 +3,9 @@
 This module is the log output mode: one line per finished trial, printed to
 stdout so a run can be watched in a terminal or redirected to a file. It is the
 callback the optimizer invokes after every trial, so it needs no study loop of
-its own and cannot diverge from the sweep's own accounting.
+its own and cannot diverge from the sweep's own accounting. Unlike the TUI
+reporter, log mode has no running-trial marker: the format is deliberately one
+line per finished trial, so a redirected log stays easy to parse.
 
 The line is::
 

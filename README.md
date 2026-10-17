@@ -146,6 +146,39 @@ lines. Asking for `--output tui` without a terminal is a usage error.
 Progress and the summary go to **stdout**; warnings and errors go to **stderr**,
 so `> run.log` captures a clean record.
 
+Both modes first resolve the model. A Hugging Face id is downloaded with a
+single progress line — `downloading <model>: 40%|…| 4/10` — that names the model
+and shows file progress; the Hub's own transfer and reconstruction bars are
+hidden. A warning emitted mid-download, such as the missing-`HF_TOKEN` advice,
+is terminated onto its own line rather than being overwritten by the next bar
+refresh. A local model path skips the download entirely.
+
+**TUI mode** draws a plotext graph of the sweep, redrawn at the start of each
+trial and again when it finishes. The running frame's status line marks the
+trial as in flight, so a long trial is visibly running rather than frozen:
+
+```
+trials 3/10  running trial 3  best 42.00 tps  avg trial 12.3s  (36.9s)
+```
+
+`running trial` appears only while a trial is in flight, and `avg trial` — the
+mean seconds per successful trial, with failed trials excluded — only after the
+first success, so the remaining budget can be estimated. The graph's y-axis is
+labelled with thousands-separated plain numbers (never scientific notation) and
+its x-axis with integer trial numbers, thinned to an even step once a sweep
+grows past ten trials.
+
+**Log mode** keeps a single line per finished trial, with no running marker, so
+a redirected log stays easy to parse:
+
+```
+trial 3/10  COMPLETE  42.00 tps  best 42.00  (36.9s)
+```
+
+With `--n-jobs` greater than one the reporters are driven from several worker
+threads; they are not thread-safe, so frames and lines can interleave. Use log
+mode with a single job when a clean record matters.
+
 ### Exit codes
 
 | Code  | Meaning                                                        |

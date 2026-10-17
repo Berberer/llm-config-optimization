@@ -180,6 +180,13 @@ def _invoke(
     return code, out.getvalue(), err.getvalue()
 
 
+class TtyStringIO(StringIO):
+    """A captured stream that reports itself as a terminal, so TUI mode is selected."""
+
+    def isatty(self) -> bool:
+        return True
+
+
 @pytest.fixture
 def model(tmp_path: Path) -> str:
     """A local checkpoint path, so preparation never downloads a model."""
@@ -499,6 +506,28 @@ def test_an_explicit_tui_request_without_a_terminal_is_a_usage_error(
     assert code == 2
     assert "requires a terminal" in err
     assert out == ""
+
+
+def test_tui_mode_prints_preparation_before_the_first_frame(tmp_path: Path, model: str) -> None:
+    """The cold start is explained on screen, and no frame is drawn until a trial runs."""
+    space = _write_space(tmp_path / "space.yaml")
+    out, err = TtyStringIO(), StringIO()
+
+    code = main(
+        [model, str(space), "--target", "cpu", "--n-trials", "1", "--output", "tui"],
+        backend=_backend(),
+        client=FakePodmanClient(),
+        stdout=out,
+        stderr=err,
+    )
+
+    output = out.getvalue()
+    assert code == 0
+    assert err.getvalue() == ""
+    preparation = output.index("preparing experiments")
+    assert output.index("preparing study") < preparation
+    assert "tokens per second" not in output[:preparation]
+    assert output.index("tokens per second") > preparation
 
 
 def test_version_exits_zero_without_running_a_sweep() -> None:

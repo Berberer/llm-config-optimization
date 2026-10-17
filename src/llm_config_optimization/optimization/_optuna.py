@@ -152,6 +152,7 @@ def make_objective(
     *,
     backend: InferenceBackend | None = None,
     client: PodmanClient | None = None,
+    on_trial_start: Callable[[], None] | None = None,
 ) -> Callable[[optuna.Trial], float]:
     """Build the Optuna objective that evaluates one point of ``space``.
 
@@ -161,6 +162,12 @@ def make_objective(
     and container client, returning the run's token throughput as the value to
     maximize. ``backend`` and ``client`` may be ``None``, in which case the
     orchestrator's own defaults apply.
+
+    ``on_trial_start``, when given, is invoked once at the start of every trial
+    — before the experiment runs — so a caller can observe an in-flight trial
+    that the completion callback cannot. It takes no arguments, because the
+    optimizer's trial API is not exposed through it; a reporter derives what it
+    needs from its own state.
 
     A successful trial records a JSON-serializable projection of its result
     under the ``result`` user attribute, so a persisted study explains what
@@ -173,6 +180,8 @@ def make_objective(
     """
 
     def objective(trial: optuna.Trial) -> float:
+        if on_trial_start is not None:
+            on_trial_start()
         parameters = suggest_parameters(trial, space)
         config = reconstruct_config(space, base, parameters)
         try:
@@ -199,6 +208,7 @@ def optimize(
     client: PodmanClient | None = None,
     n_jobs: int = 1,
     callback: Callable[[optuna.Study, optuna.trial.FrozenTrial], None] | None = None,
+    on_trial_start: Callable[[], None] | None = None,
 ) -> OptimizationResult:
     """Search ``space`` for the ``base`` experiment with the best throughput.
 
@@ -225,6 +235,11 @@ def optimize(
     study and the completed trial, so a caller can report progress without
     duplicating the study loop; failed trials invoke it too.
 
+    ``on_trial_start``, when given, is invoked once at the start of every trial
+    — before the experiment runs — so a caller can report a trial as in flight
+    rather than only once it has finished. It is argument-less and defaults to
+    ``None``, leaving callers that do not report progress unchanged.
+
     ``n_jobs`` is passed through to Optuna unchanged and defaults to one;
     running trials in parallel requires ``storage`` and is the caller's
     responsibility to keep on disjoint devices.
@@ -246,7 +261,9 @@ def optimize(
         direction="maximize",
         load_if_exists=storage is not None,
     )
-    objective = make_objective(space, base, backend=backend, client=client)
+    objective = make_objective(
+        space, base, backend=backend, client=client, on_trial_start=on_trial_start
+    )
     try:
         study.optimize(
             objective,

@@ -7,6 +7,7 @@ backend for parsing. It knows nothing about any inference engine — every
 engine-specific decision lives behind the injected backend.
 """
 
+import re
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -69,13 +70,33 @@ def run_experiment(
 
 
 _FAILURE_OUTPUT_LIMIT = 2000
-"""How many trailing characters of a failed run's output to attach to the error.
+"""How many characters of a failed run's output to attach to the error.
 
 The engine's own diagnostics — a traceback, a missing-library message — live on
-its stderr, so the error message is nearly useless without them. The tail is
-kept because the root cause usually sits just above the final exception, and it
-is bounded so a chatty engine cannot flood a log line.
+its stderr, so the error message is nearly useless without them. The engine
+prints the root cause before the traceback that follows it, so the excerpt keeps
+both: the root-cause line is rendered first and the trailing window follows. The
+whole excerpt is bounded so a chatty engine cannot flood a log line.
 """
+
+_EXCEPTION_LINE = re.compile(r"\b\w*(?:Error|Exception):")
+"""Matches a line that names an exception, e.g. ``AssertionError: ...``."""
+
+
+def _root_cause(text: str) -> str | None:
+    """Return the last line of ``text`` that names an exception, if any.
+
+    An engine prints the cause of a failure — for example ``AssertionError:
+    ...`` — before the traceback that follows it, so a trailing window alone can
+    discard the most useful line. The line is selected by its shape rather than
+    its position because the traceback length varies with the engine and the
+    failure.
+    """
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if _EXCEPTION_LINE.search(stripped):
+            return stripped
+    return None
 
 
 def _failure_output(result: ContainerResult | None) -> str:
@@ -83,17 +104,27 @@ def _failure_output(result: ContainerResult | None) -> str:
 
     stderr is preferred because that is where an engine reports a failure, with
     stdout as the fallback for engines that log there. The excerpt keeps the
-    last :data:`_FAILURE_OUTPUT_LIMIT` characters, so the most specific part of
-    a traceback survives while the leading noise does not.
+    trailing window and, when the root cause falls outside it, the root-cause
+    line rendered first, so the most specific line survives at the front. The
+    result stays within :data:`_FAILURE_OUTPUT_LIMIT` characters, so a chatty
+    engine cannot flood the log.
     """
     if result is None:
         return ""
     text = result.stderr_text.strip() or result.stdout_text.strip()
     if not text:
         return ""
-    if len(text) > _FAILURE_OUTPUT_LIMIT:
-        return "…" + text[-_FAILURE_OUTPUT_LIMIT:]
-    return text
+    if len(text) <= _FAILURE_OUTPUT_LIMIT:
+        return text
+    tail = text[-(_FAILURE_OUTPUT_LIMIT - 1) :]
+    root_cause = _root_cause(text)
+    if root_cause is None or root_cause in tail:
+        return "…" + tail
+    prefix = f"{root_cause}\n…"
+    room = _FAILURE_OUTPUT_LIMIT - len(prefix)
+    if room <= 0:
+        return root_cause[:_FAILURE_OUTPUT_LIMIT]
+    return prefix + text[-room:]
 
 
 def _run(
