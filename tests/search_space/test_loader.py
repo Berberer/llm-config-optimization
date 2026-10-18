@@ -94,9 +94,10 @@ def test_dimensions_follow_the_registry_order_not_the_file_order() -> None:
             Categorical((AttentionBackend.XFORMERS, AttentionBackend.FLASH_ATTENTION)),
         ),
         ("max_model_len", {"interval": {"min": 1024, "max": 8192}}, Interval(1024, 8192)),
+        ("max_num_seqs", {"categorical": [1, 20, 99]}, Categorical((1, 20, 99))),
         ("kv_cache_dtype", {"default": True}, Default()),
     ],
-    ids=["fixed", "categorical", "interval", "default"],
+    ids=["fixed", "categorical", "interval", "categorical-integers", "default"],
 )
 def test_each_spec_kind_parses_to_its_engine_neutral_type(
     name: str, spec: object, expected: object

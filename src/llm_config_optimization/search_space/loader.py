@@ -200,7 +200,11 @@ def _parse_categorical(
     positive: bool,
     problems: list[str],
 ) -> Categorical | None:
-    """Parse a ``categorical`` spec, preserving the declared order of values."""
+    """Parse a ``categorical`` spec, preserving the declared order of values.
+
+    For a numeric parameter the values are integers, so the same kind,
+    uniqueness, and floor checks apply as for ``fixed`` and ``interval``.
+    """
     value_path = f"{path}.categorical"
     if not isinstance(value, list):
         problems.append(

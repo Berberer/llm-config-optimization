@@ -136,6 +136,19 @@ def test_categorical_dimension_samples_only_declared_values() -> None:
     assert sampled
 
 
+def test_numeric_categorical_samples_only_its_declared_integers() -> None:
+    """A numeric ``Categorical`` offers its declared integers and nothing between them."""
+    space = ExperimentSpace(dimensions=(Dimension("max_num_seqs", Categorical((1, 20, 99))),))
+
+    trials = _sample(space, 30, seed=3)
+    distribution = trials[0].distributions["max_num_seqs"]
+    sampled = {trial.params["max_num_seqs"] for trial in trials}
+
+    assert distribution.choices == (1, 20, 99)
+    assert sampled <= {1, 20, 99}
+    assert sampled
+
+
 def test_interval_dimension_samples_integers_within_its_inclusive_bounds() -> None:
     space = ExperimentSpace(dimensions=(Dimension("max_model_len", Interval(1024, 8192)),))
 

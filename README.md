@@ -345,12 +345,14 @@ Each dimension carries exactly one spec tag:
 | Spec          | Form                              | Meaning                                                                 |
 | ------------- | --------------------------------- | ----------------------------------------------------------------------- |
 | `fixed`       | `fixed: <value>`                  | Pin the parameter to one value that must not be varied.                 |
-| `categorical` | `categorical: [<value>, ...]`     | A non-empty, duplicate-free subset of allowed values, in declared order. |
+| `categorical` | `categorical: [<value>, ...]`     | A non-empty, duplicate-free subset of allowed values, in declared order. For a numeric parameter, give integers to sweep only those values. |
 | `interval`    | `interval: {min: <int>, max: <int>}` | An inclusive integer range; the optimizer chooses where to sample. `min` must not exceed `max`. |
 | `default`     | `default: true`                   | Explicitly defer to the engine's own default. Must be exactly boolean `true`. |
 
-There is no step or count on an `interval`. Instead, sampling is the optimizer's job.
-When only specific numbers are valid, use `categorical`.
+There is no step or count on an `interval`. When only specific numbers are
+valid, use `categorical` with the exact values, e.g.
+`max_model_len: {categorical: [1024, 4096, 8192]}`; only those values are
+sampled and the optimizer cannot interpolate between them.
 
 ### Tunable parameters
 
@@ -358,19 +360,20 @@ All seven parameters below are **required** in every definition. Omitting one is
 an error naming the missing parameter, so a value can never silently fall back
 to an engine default. Write `default: true` for using that default value.
 
-| Parameter                  | Kind        | Accepted values                                                        |
-| -------------------------- | ----------- | ---------------------------------------------------------------------- |
-| `dtype`                    | categorical | `auto`, `float16`, `bfloat16`, `float32`                               |
-| `kv_cache_dtype`           | categorical | `auto`, `float16`, `bfloat16`, `fp8_e4m3`, `fp8_e5m2`                  |
-| `attention_backend`        | categorical | `flash_attention`, `flash_infer`                                        |
-| `max_model_len`            | integer     | ≥ 1                                                                    |
-| `max_num_seqs`             | integer     | ≥ 1                                                                    |
-| `max_num_batched_tokens`   | integer     | ≥ 1                                                                    |
-| `tensor_parallel_size`     | integer     | ≥ 1                                                                    |
+| Parameter                | Kind                                            | Accepted values                                       |
+| ------------------------ | ----------------------------------------------- | ----------------------------------------------------- |
+| `dtype`                  | enum (fixed, categorical, default)              | `auto`, `float16`, `bfloat16`, `float32`              |
+| `kv_cache_dtype`         | enum (fixed, categorical, default)              | `auto`, `float16`, `bfloat16`, `fp8_e4m3`, `fp8_e5m2` |
+| `attention_backend`      | enum (fixed, categorical, default)              | `flash_attention`, `flash_infer`                      |
+| `max_model_len`          | integer (interval, fixed, categorical, default) | ≥ 1                                                   |
+| `max_num_seqs`           | integer (interval, fixed, categorical, default) | ≥ 1                                                   |
+| `max_num_batched_tokens` | integer (interval, fixed, categorical, default) | ≥ 1                                                   |
+| `tensor_parallel_size`   | integer (interval, fixed, categorical, default) | ≥ 1                                                   |
 
 `interval` is only valid for the integer parameters. `fixed` and `categorical`
-are valid for both kinds, and categorical values are written using the
-engine-neutral spellings above (not vLLM's own names).
+are valid for both kinds: an enum parameter's categorical values are written
+using the engine-neutral spellings above (not vLLM's own names), while a
+numeric parameter's categorical values are the integers themselves.
 
 `attention_backend` and `tensor_parallel_size` are the two host-dependent
 parameters. `flash_attention` and `flash_infer` are CUDA-only, so a ROCm or CPU

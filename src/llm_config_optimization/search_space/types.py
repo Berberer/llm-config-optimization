@@ -12,7 +12,9 @@ A :class:`Dimension` names a tunable parameter and carries exactly one
 :data:`Spec`:
 
 * :class:`Fixed` pins the parameter to one value;
-* :class:`Categorical` lists a subset of allowed values in declared order;
+* :class:`Categorical` lists a subset of allowed values in declared order,
+  and for a numeric parameter that subset is a set of integers the optimizer
+  may pick from;
 * :class:`Interval` gives an inclusive numeric range the optimizer samples from;
 * :class:`Default` records the explicit decision to defer to the engine.
 
@@ -31,8 +33,8 @@ type ParameterValue = DType | KVCacheDType | AttentionBackend | int
 """A value a tunable parameter may take.
 
 Categorical parameters hold an engine-neutral enum member and numeric
-parameters hold an integer; the validator rejects a value of the wrong kind for
-its parameter.
+parameters hold an integer, whatever spec kind supplies the value; the
+validator rejects a value of the wrong kind for its parameter.
 """
 
 
@@ -51,9 +53,11 @@ class Fixed:
 class Categorical:
     """A subset of allowed values for a parameter, in declared order.
 
-    The order is preserved because it can express a preferred or baseline-first
-    ordering; it is not sorted or deduplicated here — validation rejects a
-    duplicate or empty list.
+    For an enum parameter the values are engine-neutral enum members; for a
+    numeric parameter they are integers, and the optimizer samples only those
+    integers rather than interpolating a range. The order is preserved because
+    it can express a preferred or baseline-first ordering; it is not sorted or
+    deduplicated here — validation rejects a duplicate or empty list.
     """
 
     values: tuple[ParameterValue, ...]

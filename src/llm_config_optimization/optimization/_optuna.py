@@ -10,7 +10,8 @@ The mapping is deliberately faithful to the search-space semantics: a
 :class:`~llm_config_optimization.search_space.types.Fixed` dimension is submitted as a
 one-choice categorical so its value is recorded on the trial, a
 :class:`~llm_config_optimization.search_space.types.Categorical` dimension samples only
-its declared values in declared order, an
+its declared values in declared order, which for a numeric parameter is the set
+of integers it declares, an
 :class:`~llm_config_optimization.search_space.types.Interval` dimension samples
 integers from its inclusive bounds with the default step, and a
 :class:`~llm_config_optimization.search_space.types.Default` dimension produces no
@@ -74,7 +75,10 @@ def suggest_parameters(trial: optuna.Trial, space: ExperimentSpace) -> dict[str,
     Each dimension is submitted according to its spec kind: a ``Fixed`` or
     ``Categorical`` dimension becomes a categorical suggestion over the declared
     values, and an ``Interval`` dimension becomes an integer suggestion over its
-    inclusive bounds. A ``Default`` dimension is skipped entirely, so its
+    inclusive bounds. A numeric ``Categorical`` dimension's declared values are
+    integers, so Optuna treats them as unordered choices and samples only those
+    integers; use an ``Interval`` when the values should be modeled as an
+    ordered range. A ``Default`` dimension is skipped entirely, so its
     parameter is absent from ``trial.params`` and reconstruction leaves the
     field unset.
 
