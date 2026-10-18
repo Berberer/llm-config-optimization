@@ -84,7 +84,9 @@ def _read_logs(container: Container) -> tuple[bytes, bytes]:
     The high-level ``Container.logs`` helper discards the frame headers, so the
     raw logs endpoint is used here to keep stdout and stderr distinguishable.
     """
-    response = container.client.get(
+    client = container.client
+    assert client is not None  # podman sets a client on every container it returns
+    response = client.get(
         f"/containers/{container.id}/logs",
         params={"stdout": True, "stderr": True, "tail": "all"},
     )

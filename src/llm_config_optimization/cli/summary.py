@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from ..inference.types import ExperimentConfig, HardwareTarget
+from ..inference.types import BenchmarkConfig, ExperimentConfig, HardwareTarget, LLMConfig
 
 if TYPE_CHECKING:
     from ..optimization.types import OptimizationResult
@@ -120,7 +120,7 @@ def _config_document(
     }
 
 
-def _section(config: object) -> dict[str, object]:
+def _section(config: BenchmarkConfig | LLMConfig) -> dict[str, object]:
     """Return every field of a frozen config dataclass, keyed by field name."""
     return {field.name: _scalar(getattr(config, field.name)) for field in fields(config)}
 

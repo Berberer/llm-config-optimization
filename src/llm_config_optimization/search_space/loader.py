@@ -22,10 +22,11 @@ Malformed YAML and a non-mapping document are reported through the same error
 type, so a caller handles a broken file uniformly.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import fields
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
 
 import yaml
 
@@ -116,7 +117,7 @@ def _parse_dimensions(space: Mapping[object, object]) -> ExperimentSpace:
 def _parse_dimension(name: object, raw_spec: object, problems: list[str]) -> Dimension | None:
     """Resolve a parameter name to a tunable and parse its spec."""
     path = f"{_SPACE_KEY}.{name}"
-    if name not in TUNABLE_PARAMETERS:
+    if not isinstance(name, str) or name not in TUNABLE_PARAMETERS:
         if name in _LLM_CONFIG_FIELDS:
             problems.append(f"{path}: {name!r} is a known parameter but is not tunable")
         else:
@@ -186,7 +187,7 @@ def _parse_fixed(
     coerced = _coerce_value(value_path, value, kind, problems)
     if coerced is None:
         return None
-    if positive and coerced < 1:
+    if positive and isinstance(coerced, int) and coerced < 1:
         problems.append(f"{value_path}: value must be at least 1, got {coerced}")
     return Fixed(coerced)
 
@@ -216,7 +217,7 @@ def _parse_categorical(
         result = _coerce_value(item_path, item, kind, problems)
         if result is None:
             continue
-        if positive and result < 1:
+        if positive and isinstance(result, int) and result < 1:
             problems.append(f"{item_path}: value must be at least 1, got {result}")
         coerced.append(result)
 
@@ -283,14 +284,14 @@ def _coerce_value(
     """Coerce a declared value to its parameter's engine-neutral kind."""
     if issubclass(kind, StrEnum):
         if isinstance(value, kind):
-            return value
+            return cast("ParameterValue", value)
         if not isinstance(value, str):
             problems.append(
                 f"{path}: expected one of {_format_values(kind)}, got {type(value).__name__}"
             )
             return None
         try:
-            return kind(value)
+            return cast("ParameterValue", kind(value))
         except ValueError:
             problems.append(
                 f"{path}: {value!r} is not a valid {kind.__name__}; "
@@ -313,7 +314,7 @@ def _format_kinds() -> str:
     return ", ".join(_SPEC_KINDS)
 
 
-def _format_keys(keys: list[object]) -> str:
+def _format_keys(keys: Iterable[object]) -> str:
     """Render mapping keys for an error message."""
     return ", ".join(repr(key) for key in keys)
 

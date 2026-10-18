@@ -25,6 +25,7 @@ from dataclasses import dataclass, fields, replace
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
+from typing import cast
 
 from ..runtime.types import ContainerConfig, ContainerResult, Mount
 from ..search_space.registry import TUNABLE_PARAMETERS
@@ -751,6 +752,16 @@ def _read_json_object(path: Path, result: ContainerResult, *, what: str) -> Mapp
     return payload
 
 
+def _as_float(value: object) -> float:
+    """Coerce a JSON scalar to ``float``; a bad value raises for the caller to report."""
+    return float(cast("str | int | float", value))
+
+
+def _as_int(value: object) -> int:
+    """Coerce a JSON scalar to ``int``; a bad value raises for the caller to report."""
+    return int(cast("str | int | float", value))
+
+
 def _parse_run(path: Path, result: ContainerResult) -> RunMetrics:
     """Parse one measured run's online benchmark payload into :class:`RunMetrics`.
 
@@ -763,10 +774,10 @@ def _parse_run(path: Path, result: ContainerResult) -> RunMetrics:
     payload = _read_json_object(path, result, what="benchmark run result")
     try:
         return RunMetrics(
-            tokens_per_second=float(payload["total_token_throughput"]),
-            requests_per_second=float(payload["request_throughput"]),
-            elapsed_time=float(payload["duration"]),
-            num_prompts=int(payload["completed"]),
+            tokens_per_second=_as_float(payload["total_token_throughput"]),
+            requests_per_second=_as_float(payload["request_throughput"]),
+            elapsed_time=_as_float(payload["duration"]),
+            num_prompts=_as_int(payload["completed"]),
             raw_json=payload,
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -917,7 +928,10 @@ def _numeric_range(spec: Spec) -> tuple[int, int] | None:
         return None
     if any(isinstance(value, Enum) for value in values):
         return None
-    return min(values), max(values)
+    numeric = [value for value in values if isinstance(value, int)]
+    if len(numeric) != len(values):
+        return None
+    return min(numeric), max(numeric)
 
 
 def _validate_engine_bounds(space: ExperimentSpace) -> list[str]:
@@ -1233,8 +1247,8 @@ class VLLMBackend:
         manifest_path = output_dir / _MANIFEST_FILENAME
         manifest = _read_json_object(manifest_path, result, what="benchmark manifest")
         try:
-            repetitions = int(manifest["repetitions"])
-            failed_runs = int(manifest["failed_runs"])
+            repetitions = _as_int(manifest["repetitions"])
+            failed_runs = _as_int(manifest["failed_runs"])
             run_files = manifest["runs"]
         except (KeyError, TypeError, ValueError) as exc:
             raise ExperimentError(

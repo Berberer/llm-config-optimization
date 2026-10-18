@@ -22,7 +22,7 @@ before a warning is written, so a warning printed mid-download — the missing
 """
 
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TextIO
@@ -69,7 +69,7 @@ class _ProgressLineWarningHandler(logging.Handler):
 
 
 @contextmanager
-def _hub_warning_handler(stream: TextIO) -> Iterator[None]:
+def _hub_warning_handler(stream: TextIO) -> Generator[None]:
     """Route the Hub's log records through a progress-aware handler on ``stream``.
 
     For the duration of the block the ``huggingface_hub`` logger writes through

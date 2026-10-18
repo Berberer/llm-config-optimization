@@ -31,7 +31,7 @@ the best-so-far result, so the work done before the interrupt is not lost.
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import optuna
 
@@ -98,7 +98,7 @@ def suggest_parameters(trial: optuna.Trial, space: ExperimentSpace) -> dict[str,
             )
         else:
             parameters[dimension.name] = trial.suggest_int(
-                dimension.name, spec.minimum, spec.maximum
+                dimension.name, int(spec.minimum), int(spec.maximum)
             )
     return parameters
 
@@ -349,7 +349,7 @@ def _project_result(result: ExperimentResult) -> dict[str, object]:
     }
 
 
-def _choice_value(value: ParameterValue) -> object:
+def _choice_value(value: ParameterValue) -> str | int:
     """Render a declared value as the JSON-native choice Optuna records.
 
     An engine-neutral enum member becomes its string value, because a persisted
@@ -382,4 +382,4 @@ def _coerce_value(field: str, value: object) -> object:
     kind = expected_kind(field)
     if issubclass(kind, Enum):
         return kind(value)
-    return int(value)
+    return int(cast("str | int | float", value))
