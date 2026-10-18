@@ -294,6 +294,7 @@ name = "llm-config-optimization"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx2" },
     { name = "huggingface-hub" },
     { name = "optuna" },
     { name = "plotext" },
@@ -310,6 +311,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx2", specifier = ">=2.13.1" },
     { name = "huggingface-hub", specifier = ">=2.2.0" },
     { name = "optuna", specifier = ">=5.0" },
     { name = "plotext", specifier = ">=6.1.0" },

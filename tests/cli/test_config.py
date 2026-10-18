@@ -4,10 +4,9 @@
 :class:`~llm_config_optimization.inference.types.ExperimentConfig` it produces: the
 container, benchmark, and non-tunable LLM values come from the flags, every
 tunable serving parameter is left unset for the space to fill, and an omitted
-target or image stays ``None`` for the backend to resolve. ``is_local_model``
-decides whether the model argument is a host checkpoint or a Hugging Face id.
-These tests parse real argument vectors and assert on the resulting config, so
-the parser and the builder are exercised together without a backend.
+target or image stays ``None`` for the backend to resolve. These tests parse
+real argument vectors and assert on the resulting config, so the parser and the
+builder are exercised together without a backend.
 """
 
 from pathlib import Path
@@ -15,12 +14,12 @@ from pathlib import Path
 import pytest
 
 from llm_config_optimization.cli.arguments import parse_args
-from llm_config_optimization.cli.config import build_base_config, is_local_model
+from llm_config_optimization.cli.config import build_base_config
 from llm_config_optimization.inference import HardwareTarget, QuantizationMethod
 
 
 def test_defaults_produce_the_documented_base_config() -> None:
-    config = build_base_config(parse_args(["facebook/opt-125m", "space.yaml"]))
+    config = build_base_config(parse_args(["facebook/opt-125m", "space.yaml", "vllm"]))
 
     assert config.container.target is None
     assert config.container.image is None
@@ -43,7 +42,7 @@ def test_defaults_produce_the_documented_base_config() -> None:
 
 
 def test_tunable_serving_parameters_are_left_unset_for_the_space() -> None:
-    config = build_base_config(parse_args(["facebook/opt-125m", "space.yaml"]))
+    config = build_base_config(parse_args(["facebook/opt-125m", "space.yaml", "vllm"]))
 
     assert config.llm.dtype is None
     assert config.llm.kv_cache_dtype is None
@@ -60,6 +59,7 @@ def test_explicit_flags_override_the_base_config() -> None:
             [
                 "facebook/opt-125m",
                 "space.yaml",
+                "vllm",
                 "--target",
                 "rocm",
                 "--image",
@@ -121,31 +121,37 @@ def test_explicit_flags_override_the_base_config() -> None:
 def test_out_of_range_measurement_controls_are_rejected() -> None:
     """A nonsensical control reaches ``BenchmarkConfig``'s own invariant check."""
     with pytest.raises(ValueError):
-        build_base_config(parse_args(["facebook/opt-125m", "space.yaml", "--repetitions", "0"]))
+        build_base_config(
+            parse_args(["facebook/opt-125m", "space.yaml", "vllm", "--repetitions", "0"])
+        )
 
     with pytest.raises(ValueError):
-        build_base_config(parse_args(["facebook/opt-125m", "space.yaml", "--warmup-runs", "-1"]))
+        build_base_config(
+            parse_args(["facebook/opt-125m", "space.yaml", "vllm", "--warmup-runs", "-1"])
+        )
 
     with pytest.raises(ValueError):
-        build_base_config(parse_args(["facebook/opt-125m", "space.yaml", "--startup-timeout", "0"]))
+        build_base_config(
+            parse_args(["facebook/opt-125m", "space.yaml", "vllm", "--startup-timeout", "0"])
+        )
 
 
 def test_an_existing_host_path_is_a_local_model(tmp_path: Path) -> None:
-    checkpoint = tmp_path / "Llama-3.1-8B"
-    checkpoint.mkdir()
-
-    assert is_local_model(str(checkpoint))
-
-
-def test_a_hugging_face_id_is_not_a_local_model() -> None:
-    assert not is_local_model("facebook/opt-125m")
-
-
-def test_a_missing_host_path_is_not_a_local_model(tmp_path: Path) -> None:
-    assert not is_local_model(str(tmp_path / "absent"))
-
-
-def test_a_local_model_argument_reaches_the_benchmark_config(tmp_path: Path) -> None:
-    config = build_base_config(parse_args([str(tmp_path), "space.yaml"]))
+    """A local checkpoint is carried through unresolved until preparation runs."""
+    config = build_base_config(parse_args([str(tmp_path), "space.yaml", "vllm"]))
 
     assert config.benchmark.model == str(tmp_path)
+    assert config.benchmark.resolved_path is None
+
+
+def test_a_hugging_face_id_is_left_unresolved(tmp_path: Path) -> None:
+    config = build_base_config(parse_args(["facebook/opt-125m", "space.yaml", "vllm"]))
+
+    assert config.benchmark.model == "facebook/opt-125m"
+    assert config.benchmark.resolved_path is None
+
+
+def test_a_missing_host_path_is_left_unresolved(tmp_path: Path) -> None:
+    config = build_base_config(parse_args([str(tmp_path / "absent"), "space.yaml", "vllm"]))
+
+    assert config.benchmark.resolved_path is None

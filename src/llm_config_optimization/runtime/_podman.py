@@ -4,13 +4,22 @@ This module is the only place that imports the ``podman`` bindings.
 """
 
 import contextlib
+from collections.abc import Mapping
+from types import MappingProxyType
 
 from podman import PodmanClient
 from podman.domain.containers import Container
 from podman.errors import APIError
 
 from ._selinux import selinux_enforcing
-from .types import ContainerConfig, ContainerResult, ContainerRunError, Mount, PullPolicy
+from .types import (
+    ContainerConfig,
+    ContainerResult,
+    ContainerRunError,
+    Mount,
+    PullPolicy,
+    RunningContainer,
+)
 
 
 def _volume_specs(volumes: tuple[Mount, ...]) -> dict[str, dict[str, object]]:
@@ -48,6 +57,40 @@ def _security_opt(config: ContainerConfig) -> list[str]:
     if opts is None:
         opts = ("disable",) if selinux_enforcing() and config.devices else ()
     return list(opts)
+
+
+def _normalize_port(spec: str) -> str:
+    """Normalise a container port specification to ``port/protocol``."""
+    return spec if "/" in spec else f"{spec}/tcp"
+
+
+def _host_port(entry: object) -> int | None:
+    """Extract the first resolved host port from an inspected port binding."""
+    if isinstance(entry, list):
+        for binding in entry:
+            if isinstance(binding, Mapping):
+                host_port = binding.get("HostPort")
+                if host_port:
+                    return int(host_port)
+    return None
+
+
+def _resolved_ports(
+    raw: Mapping[str, object], requested: Mapping[str, int | None]
+) -> dict[str, int]:
+    """Map each requested container port to the host port the runtime assigned.
+
+    The runtime reports bindings under a normalised ``port/protocol`` key, so
+    both sides are normalised before matching. A requested port that the
+    runtime did not publish (or published without a host port) is left out.
+    """
+    published = {_normalize_port(key): value for key, value in raw.items()}
+    resolved: dict[str, int] = {}
+    for spec in requested:
+        host_port = _host_port(published.get(_normalize_port(spec)))
+        if host_port is not None:
+            resolved[spec] = host_port
+    return resolved
 
 
 def _demux_logs(data: bytes) -> tuple[bytes, bytes]:
@@ -188,18 +231,19 @@ def run_container(
         return _run(config, owned_client)
 
 
-def _run(config: ContainerConfig, client: PodmanClient) -> ContainerResult:
-    """Execute ``config`` against ``client``, which remains owned by the caller."""
+def _create(config: ContainerConfig, client: PodmanClient) -> Container:
+    """Pull when needed and create ``config``'s container, leaving it unstarted."""
     if config.pull_policy in ("always", "newer"):
         _pull(config.image, config.pull_policy, client)
     try:
-        container = client.containers.create(
+        return client.containers.create(
             config.image,
             command=list(config.command) or None,
             entrypoint=list(config.entrypoint) if config.entrypoint is not None else None,
             environment=dict(config.env),
             volumes=_volume_specs(config.volumes),
             devices=list(config.devices),
+            ports=dict(config.ports),
             security_opt=_security_opt(config),
             mem_limit=config.mem_limit,
             shm_size=config.shm_size,
@@ -210,6 +254,11 @@ def _run(config: ContainerConfig, client: PodmanClient) -> ContainerResult:
         raise ContainerRunError(
             f"failed to create container from image {config.image!r}: {exc}"
         ) from exc
+
+
+def _run(config: ContainerConfig, client: PodmanClient) -> ContainerResult:
+    """Execute ``config`` against ``client``, which remains owned by the caller."""
+    container = _create(config, client)
     try:
         try:
             container.start()
@@ -251,3 +300,118 @@ def _run(config: ContainerConfig, client: PodmanClient) -> ContainerResult:
         return result
     finally:
         _force_remove(container)
+
+
+class _PodmanRunningContainer:
+    """Podman-backed :class:`~.types.RunningContainer`."""
+
+    def __init__(
+        self,
+        container: Container,
+        ports: Mapping[str, int],
+        owned_client: PodmanClient | None,
+    ) -> None:
+        self._container = container
+        self._ports = MappingProxyType(dict(ports))
+        self._owned_client = owned_client
+
+    @property
+    def container_id(self) -> str:
+        return self._container.id
+
+    @property
+    def ports(self) -> Mapping[str, int]:
+        return self._ports
+
+    def logs(self) -> tuple[bytes, bytes]:
+        return _read_logs(self._container)
+
+    def stop(self, timeout: float | None = None) -> ContainerResult:
+        try:
+            self._container.stop(timeout=timeout, ignore=True)
+        except APIError as exc:
+            _force_remove(self._container)
+            self._release()
+            raise ContainerRunError(
+                f"failed to stop container {self._container.id}: {exc}"
+            ) from exc
+        try:
+            exit_code = self._container.wait()
+        except APIError:
+            exit_code = -1
+        stdout, stderr = _read_partial_logs(self._container)
+        result = ContainerResult(
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            container_id=self._container.id,
+        )
+        _force_remove(self._container)
+        self._release()
+        return result
+
+    def remove(self) -> None:
+        _force_remove(self._container)
+        self._release()
+
+    def _release(self) -> None:
+        """Close the client this handle owns, if it owns one, exactly once."""
+        if self._owned_client is not None:
+            self._owned_client.close()
+            self._owned_client = None
+
+
+def start_container(
+    config: ContainerConfig, *, client: PodmanClient | None = None
+) -> RunningContainer:
+    """Create and start ``config`` without waiting for it to exit.
+
+    Unlike :func:`run_container`, which blocks until the container exits, this
+    returns as soon as the container is running, so a long-lived server can be
+    driven from outside it. The returned handle exposes the host ports the
+    runtime assigned and owns the container's teardown.
+
+    Args:
+        config: The declarative description of the run.
+        client: An optional pre-configured :class:`PodmanClient`. When omitted, a
+            client is discovered from the environment and kept open until the
+            handle is stopped or removed; an injected client is left open for
+            the caller to manage.
+
+    Raises:
+        ContainerRunError: If Podman fails to pull, create, or start the
+            container, or fails to report its ports (the original ``APIError``
+            is preserved as ``__cause__``). A partially created container is
+            removed before raising.
+    """
+    if client is not None:
+        return _start(config, client, owned_client=None)
+    owned_client = PodmanClient.from_env()
+    try:
+        return _start(config, owned_client, owned_client=owned_client)
+    except BaseException:
+        owned_client.close()
+        raise
+
+
+def _start(
+    config: ContainerConfig, client: PodmanClient, *, owned_client: PodmanClient | None
+) -> RunningContainer:
+    """Create and start ``config`` against ``client``, which the caller owns."""
+    container = _create(config, client)
+    try:
+        container.start()
+    except APIError as exc:
+        _force_remove(container)
+        raise ContainerRunError(f"failed to start container {container.id}: {exc}") from exc
+    ports: dict[str, int] = {}
+    if config.ports:
+        try:
+            container.reload()
+        except APIError as exc:
+            _force_remove(container)
+            raise ContainerRunError(
+                f"failed to read ports for container {container.id}: {exc}"
+            ) from exc
+        ports = _resolved_ports(container.ports, config.ports)
+    return _PodmanRunningContainer(container, ports, owned_client)

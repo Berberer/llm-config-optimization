@@ -14,15 +14,16 @@ import pytest
 from llm_config_optimization.cli.arguments import parse_args
 
 
-def test_the_two_positionals_are_parsed_as_model_and_space_path() -> None:
-    args = parse_args(["facebook/opt-125m", "space.yaml"])
+def test_the_three_positionals_are_parsed_as_model_space_and_engine() -> None:
+    args = parse_args(["facebook/opt-125m", "space.yaml", "vllm"])
 
     assert args.model == "facebook/opt-125m"
     assert args.space == Path("space.yaml")
+    assert args.engine == "vllm"
 
 
 def test_defaults_match_the_documented_settings() -> None:
-    args = parse_args(["facebook/opt-125m", "space.yaml"])
+    args = parse_args(["facebook/opt-125m", "space.yaml", "vllm"])
 
     assert args.target is None
     assert args.image is None
@@ -56,6 +57,7 @@ def test_explicit_flags_override_every_default() -> None:
         [
             "facebook/opt-125m",
             "space.yaml",
+            "vllm",
             "--target",
             "rocm",
             "--image",
@@ -139,11 +141,13 @@ def test_explicit_flags_override_every_default() -> None:
 @pytest.mark.parametrize(
     "argv",
     [
-        ["model", "space.yaml", "--target", "gpu"],
-        ["model", "space.yaml", "--pull-policy", "sometimes"],
-        ["model", "space.yaml", "--quantization", "int8"],
-        ["model", "space.yaml", "--output", "json"],
-        ["model", "space.yaml", "--unknown"],
+        ["model", "space.yaml", "vllm", "--target", "gpu"],
+        ["model", "space.yaml", "vllm", "--pull-policy", "sometimes"],
+        ["model", "space.yaml", "vllm", "--quantization", "int8"],
+        ["model", "space.yaml", "vllm", "--output", "json"],
+        ["model", "space.yaml", "vllm", "--unknown"],
+        ["model", "space.yaml", "tensorrt"],
+        ["model", "space.yaml"],
         ["model"],
         [],
     ],
@@ -153,6 +157,8 @@ def test_explicit_flags_override_every_default() -> None:
         "bad-quantization",
         "bad-output",
         "unknown-flag",
+        "unknown-engine",
+        "missing-engine",
         "missing-space",
         "empty",
     ],
@@ -167,7 +173,7 @@ def test_invalid_input_is_a_usage_error(argv: list[str]) -> None:
 def test_output_rejects_auto(capsys: pytest.CaptureFixture[str]) -> None:
     """There is no ``auto`` value: omission is how the mode is detected."""
     with pytest.raises(SystemExit) as excinfo:
-        parse_args(["model", "space.yaml", "--output", "auto"])
+        parse_args(["model", "space.yaml", "vllm", "--output", "auto"])
 
     assert excinfo.value.code == 2
     assert "invalid choice" in capsys.readouterr().err
@@ -183,6 +189,9 @@ def test_help_exits_zero_and_documents_the_invocation(
     text = capsys.readouterr().out
     assert "MODEL" in text
     assert "SPACE" in text
+    assert "ENGINE" in text
+    assert "vllm" in text
+    assert "llamacpp" in text
     for flag in (
         "--target",
         "--repetitions",

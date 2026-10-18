@@ -15,6 +15,7 @@ from llm_config_optimization.inference import (
     DType,
     KVCacheDType,
     LLMConfig,
+    VLLMBackend,
 )
 from llm_config_optimization.search_space.registry import TUNABLE_PARAMETERS, expected_kind
 
@@ -56,3 +57,8 @@ def test_registry_maps_every_tunable_to_an_llm_config_field() -> None:
 )
 def test_expected_kind_is_read_from_the_config_annotation(parameter: str, kind: type) -> None:
     assert expected_kind(TUNABLE_PARAMETERS[parameter]) is kind
+
+
+def test_the_vllm_backend_declares_every_registered_tunable_as_applicable() -> None:
+    """vLLM is the reference backend: its applicable set is the whole registry."""
+    assert VLLMBackend().applicable_parameters == frozenset(TUNABLE_PARAMETERS)

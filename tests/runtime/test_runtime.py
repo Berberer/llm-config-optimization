@@ -16,6 +16,7 @@ from llm_config_optimization.runtime import (
     Mount,
     pull_image,
     run_container,
+    start_container,
 )
 
 
@@ -129,6 +130,7 @@ def test_create_maps_config_fields_to_podman_arguments(
         "/host/models": {"bind": "/models", "mode": "ro", "extended_mode": ["z"]},
     }
     assert kwargs["devices"] == ["nvidia.com/gpu=all"]
+    assert kwargs["ports"] == {}
     assert kwargs["security_opt"] == []
     assert kwargs["mem_limit"] == "4g"
     assert kwargs["shm_size"] == "2g"
@@ -320,6 +322,19 @@ def test_config_env_is_immutable_and_config_is_hashable() -> None:
     assert hash(config) == hash(ContainerConfig(image="img", env={"BAZ": "qux", "FOO": "bar"}))
 
 
+def test_config_ports_are_immutable_and_affect_equality() -> None:
+    config = ContainerConfig(image="img", ports={"8000": None, "9000/tcp": 9001})
+
+    assert config.ports == {"8000": None, "9000/tcp": 9001}
+    with pytest.raises(TypeError):
+        config.ports["8000"] = 1234
+    assert config != ContainerConfig(image="img")
+    assert config == ContainerConfig(image="img", ports={"9000/tcp": 9001, "8000": None})
+    assert hash(config) == hash(
+        ContainerConfig(image="img", ports={"9000/tcp": 9001, "8000": None})
+    )
+
+
 def test_injected_client_is_left_open() -> None:
     client = FakePodmanClient()
 
@@ -399,4 +414,203 @@ def test_pull_image_self_created_client_is_closed(monkeypatch: pytest.MonkeyPatc
 
     assert len(created) == 1
     assert created[0].pull_calls == [("img", "missing")]
+    assert created[0].closed is True
+
+
+def test_start_container_forwards_ports_and_reads_back_resolved_host_ports() -> None:
+    client = FakePodmanClient(
+        resolved_ports={"8000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "32768"}]}
+    )
+
+    handle = start_container(
+        ContainerConfig(image="img", command=("serve",), ports={"8000": None}),
+        client=client,
+    )
+
+    _, kwargs = client.create_calls[0]
+    assert kwargs["ports"] == {"8000": None}
+    assert handle.container_id == "fake-container-id"
+    assert handle.ports == {"8000": 32768}
+    assert client.container is not None
+    assert client.container.started is True
+    assert client.container.reload_calls == 1
+
+
+def test_start_container_without_ports_does_not_reload() -> None:
+    client = FakePodmanClient()
+
+    handle = start_container(ContainerConfig(image="img"), client=client)
+
+    assert handle.ports == {}
+    assert client.container is not None
+    assert client.container.reload_calls == 0
+
+
+def test_start_container_with_a_fixed_port_reads_it_back() -> None:
+    client = FakePodmanClient(
+        resolved_ports={"9000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "9001"}]}
+    )
+
+    handle = start_container(ContainerConfig(image="img", ports={"9000/tcp": 9001}), client=client)
+
+    assert handle.ports == {"9000/tcp": 9001}
+
+
+def test_detached_logs_read_the_current_streams() -> None:
+    client = FakePodmanClient(logs=_frame(1, b"served") + _frame(2, b"warn"))
+
+    handle = start_container(ContainerConfig(image="img"), client=client)
+
+    assert handle.logs() == (b"served", b"warn")
+
+
+def test_detached_stop_captures_result_and_removes_container() -> None:
+    client = FakePodmanClient(exit_code=143, logs=_frame(1, b"served") + _frame(2, b"warn"))
+
+    handle = start_container(ContainerConfig(image="img"), client=client)
+    result = handle.stop(timeout=10.0)
+
+    assert isinstance(result, ContainerResult)
+    assert result.exit_code == 143
+    assert result.stdout == b"served"
+    assert result.stderr == b"warn"
+    assert result.container_id == "fake-container-id"
+    assert client.container is not None
+    assert client.container.stop_calls == [{"timeout": 10.0, "ignore": True}]
+    assert client.container.wait_calls == [None]
+    assert client.container.remove_calls == [True]
+
+
+def test_detached_stop_without_a_timeout_passes_none() -> None:
+    client = FakePodmanClient()
+
+    handle = start_container(ContainerConfig(image="img"), client=client)
+    handle.stop()
+
+    assert client.container is not None
+    assert client.container.stop_calls == [{"timeout": None, "ignore": True}]
+
+
+def test_detached_remove_force_removes_without_stopping() -> None:
+    client = FakePodmanClient()
+
+    handle = start_container(ContainerConfig(image="img"), client=client)
+    handle.remove()
+
+    assert client.container is not None
+    assert client.container.stopped is False
+    assert client.container.remove_calls == [True]
+
+
+def test_start_failure_removes_the_partial_container() -> None:
+    start_error = APIError("failed to start container")
+    client = FakePodmanClient(start_error=start_error)
+
+    with pytest.raises(ContainerRunError) as excinfo:
+        start_container(ContainerConfig(image="img"), client=client)
+
+    assert excinfo.value.__cause__ is start_error
+    assert client.container is not None
+    assert client.container.remove_calls == [True]
+
+
+def test_port_read_back_failure_removes_the_container_and_wraps_the_cause() -> None:
+    reload_error = APIError("inspect failed")
+    client = FakePodmanClient(reload_error=reload_error)
+
+    with pytest.raises(ContainerRunError) as excinfo:
+        start_container(ContainerConfig(image="img", ports={"8000": None}), client=client)
+
+    assert excinfo.value.__cause__ is reload_error
+    assert client.container is not None
+    assert client.container.remove_calls == [True]
+
+
+def test_stop_failure_removes_the_container_and_wraps_the_cause() -> None:
+    stop_error = APIError("stop failed")
+    client = FakePodmanClient(stop_error=stop_error)
+
+    handle = start_container(ContainerConfig(image="img"), client=client)
+
+    with pytest.raises(ContainerRunError) as excinfo:
+        handle.stop()
+
+    assert excinfo.value.__cause__ is stop_error
+    assert client.container is not None
+    assert client.container.remove_calls == [True]
+
+
+def test_detached_injected_client_is_left_open_after_stop_and_remove() -> None:
+    client = FakePodmanClient()
+
+    start_container(ContainerConfig(image="img"), client=client).stop()
+    start_container(ContainerConfig(image="img"), client=client).remove()
+
+    assert client.closed is False
+
+
+def test_detached_self_created_client_is_closed_by_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[FakePodmanClient] = []
+
+    class FromEnvClient(FakePodmanClient):
+        @classmethod
+        def from_env(cls):
+            instance = cls()
+            created.append(instance)
+            return instance
+
+    monkeypatch.setattr("llm_config_optimization.runtime._podman.PodmanClient", FromEnvClient)
+
+    handle = start_container(ContainerConfig(image="img"))
+    assert created[0].closed is False
+
+    handle.stop()
+
+    assert len(created) == 1
+    assert created[0].closed is True
+
+
+def test_detached_self_created_client_is_closed_when_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[FakePodmanClient] = []
+
+    class FromEnvClient(FakePodmanClient):
+        def __init__(self) -> None:
+            super().__init__(start_error=APIError("failed to start container"))
+
+        @classmethod
+        def from_env(cls):
+            instance = cls()
+            created.append(instance)
+            return instance
+
+    monkeypatch.setattr("llm_config_optimization.runtime._podman.PodmanClient", FromEnvClient)
+
+    with pytest.raises(ContainerRunError):
+        start_container(ContainerConfig(image="img"))
+
+    assert len(created) == 1
+    assert created[0].closed is True
+
+
+def test_detached_self_created_client_is_closed_by_remove(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[FakePodmanClient] = []
+
+    class FromEnvClient(FakePodmanClient):
+        @classmethod
+        def from_env(cls):
+            instance = cls()
+            created.append(instance)
+            return instance
+
+    monkeypatch.setattr("llm_config_optimization.runtime._podman.PodmanClient", FromEnvClient)
+
+    start_container(ContainerConfig(image="img")).remove()
+
+    assert len(created) == 1
     assert created[0].closed is True

@@ -23,8 +23,9 @@ from llm_config_optimization.inference import (
     HardwareTarget,
     LLMConfig,
     RunMetrics,
+    ServerSpec,
 )
-from llm_config_optimization.runtime import ContainerResult
+from llm_config_optimization.runtime import ContainerConfig, ContainerResult
 
 HUB_MODEL = "meta-llama/Llama-3.1-8B"
 
@@ -63,6 +64,20 @@ def _result() -> ExperimentResult:
     )
 
 
+def _server_spec() -> ServerSpec:
+    """Build a server spec whose container and reset paths are hashable."""
+    return ServerSpec(
+        container=ContainerConfig(
+            image="docker.io/vllm/vllm-openai:latest",
+            command=("serve",),
+            ports={"8000": None},
+        ),
+        health_path="/health",
+        health_timeout=600.0,
+        reset_paths=("/reset_prefix_cache",),
+    )
+
+
 @pytest.mark.parametrize(
     ("config", "attribute", "value"),
     [
@@ -72,8 +87,9 @@ def _result() -> ExperimentResult:
         (_experiment(), "llm", LLMConfig(dtype=DType.FLOAT16)),
         (_result(), "image", "other/image"),
         (_run(), "tokens_per_second", 1.0),
+        (_server_spec(), "health_path", "/ready"),
     ],
-    ids=["container", "benchmark", "llm", "experiment", "result", "run"],
+    ids=["container", "benchmark", "llm", "experiment", "result", "run", "server"],
 )
 def test_config_types_are_frozen_and_hashable(
     config: object, attribute: str, value: object
@@ -157,3 +173,32 @@ def test_replace_yields_a_distinct_hash() -> None:
 
     assert varied != experiment
     assert hash(varied) != hash(experiment)
+
+
+def test_server_spec_defaults_to_no_reset_paths() -> None:
+    spec = ServerSpec(
+        container=ContainerConfig(image="img"),
+        health_path="/health",
+        health_timeout=1.0,
+    )
+
+    assert spec.reset_paths == ()
+    assert spec.container.image == "img"
+    assert spec.health_path == "/health"
+    assert spec.health_timeout == 1.0
+
+
+def test_server_spec_hashes_regardless_of_container_env_order() -> None:
+    first = ServerSpec(
+        container=ContainerConfig(image="img", env={"A": "1", "B": "2"}),
+        health_path="/health",
+        health_timeout=1.0,
+    )
+    second = ServerSpec(
+        container=ContainerConfig(image="img", env={"B": "2", "A": "1"}),
+        health_path="/health",
+        health_timeout=1.0,
+    )
+
+    assert first == second
+    assert hash(first) == hash(second)

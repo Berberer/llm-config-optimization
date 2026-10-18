@@ -22,6 +22,7 @@ from podman import PodmanClient
 from podman.errors import APIError
 
 from llm_config_optimization.inference import (
+    BenchmarkClient,
     BenchmarkConfig,
     ContainerRuntimeConfig,
     DType,
@@ -43,7 +44,6 @@ _OUTPUT_LEN = 8
 _REPETITIONS = 2
 _WARMUP = 1
 _CONTAINER_TIMEOUT_SECONDS = 900.0
-_MANIFEST_FILENAME = "manifest.json"
 
 # opt-125m ships float16 weights, whose support on torch CPU is unstable; the
 # CPU backend asks for an explicit portable dtype instead. On CPU the
@@ -105,7 +105,7 @@ def test_hardware_detection_resolves_the_real_host() -> None:
     assert hardware.device_count >= 1
 
 
-def test_cpu_benchmark_runs_end_to_end(vllm_cpu_image: str, model: str, tmp_path: Path) -> None:
+def test_cpu_benchmark_runs_end_to_end(vllm_cpu_image: str, model: str) -> None:
     """A full experiment plans, runs, and parses against the real engine."""
     experiment = ExperimentConfig(
         container=ContainerRuntimeConfig(target=HardwareTarget.CPU, image=vllm_cpu_image),
@@ -122,7 +122,7 @@ def test_cpu_benchmark_runs_end_to_end(vllm_cpu_image: str, model: str, tmp_path
         llm=LLMConfig(dtype=_CPU_DTYPE, gpu_memory_utilization=_CPU_MEMORY_UTILIZATION),
     )
 
-    result = run_experiment(experiment, output_dir=tmp_path)
+    result = run_experiment(experiment, benchmark_client=BenchmarkClient())
 
     assert result.raw_result.exit_code == 0
     assert result.target == HardwareTarget.CPU
@@ -136,4 +136,3 @@ def test_cpu_benchmark_runs_end_to_end(vllm_cpu_image: str, model: str, tmp_path
     assert result.num_prompts == _NUM_PROMPTS * _REPETITIONS
     assert all(run.num_prompts == _NUM_PROMPTS for run in result.runs)
     assert len(result.raw_json) == _REPETITIONS
-    assert (tmp_path / _MANIFEST_FILENAME).is_file()

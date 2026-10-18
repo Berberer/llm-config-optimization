@@ -9,10 +9,13 @@ which turns it into a canonical-order
 The parser validates the definition engine-agnostically. It checks the top-level
 shape, that every declared parameter is a known tunable, that each dimension
 carries exactly one recognized spec tag, and that every value is of the kind its
-``LLMConfig`` field expects. It also requires every tunable parameter to be
-declared: a missing dimension is an error, so a value can never silently fall
-back to an engine default. Every problem found is collected and reported at
-once through
+``LLMConfig`` field expects. It also requires every parameter in the caller's
+required set to be declared: a missing dimension is an error, so a value can
+never silently fall back to an engine default. The required set defaults to
+every registered tunable, so engine-agnostic callers and tests are unchanged;
+the composition root passes the selected backend's applicable set instead, so a
+definition declares exactly the parameters that engine forwards. Every problem
+found is collected and reported at once through
 :class:`~llm_config_optimization.search_space.types.ExperimentDefinitionError`, so a
 broken definition is corrected in a single pass. Whether a backend actually
 supports the declared parameters and values is a separate, explicit check that
@@ -54,27 +57,42 @@ _POSITIVE_PARAMETERS = frozenset(
 )
 
 
-def load_experiment_space(path: Path) -> ExperimentSpace:
+def load_experiment_space(path: Path, *, required: Iterable[str] | None = None) -> ExperimentSpace:
     """Read a YAML definition from ``path`` and parse its search space.
 
     The file is decoded as UTF-8 and parsed with :func:`yaml.safe_load`, so no
     arbitrary YAML tags are constructed. Malformed YAML is reported through
     :class:`~llm_config_optimization.search_space.types.ExperimentDefinitionError`, the
     same error the structural checks raise, so a broken file fails uniformly.
+
+    ``required`` names the tunable parameters the caller's engine forwards and
+    is forwarded to :func:`parse_experiment_space`; it defaults to every
+    registered tunable.
     """
     try:
         document = yaml.safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError as error:
         raise ExperimentDefinitionError([f"malformed YAML: {error}"]) from error
-    return parse_experiment_space(document)
+    return parse_experiment_space(document, required=required)
 
 
-def parse_experiment_space(mapping: object) -> ExperimentSpace:
+def parse_experiment_space(
+    mapping: object, *, required: Iterable[str] | None = None
+) -> ExperimentSpace:
     """Parse and engine-agnostically validate an already-parsed definition.
 
     The document must be a mapping whose only key is ``space``, and ``space``
     must itself be a mapping. Every problem found anywhere in the definition is
     collected and reported at once.
+
+    ``required`` is the set of tunable parameters that must be declared. It
+    defaults to every registered tunable, so the total-space rule is unchanged
+    for engine-agnostic callers; passing a backend's applicable set makes the
+    rule total over exactly the parameters that engine forwards. A declared
+    parameter outside the set is not a problem here: whether the engine can
+    forward it is the backend's separate
+    :meth:`~llm_config_optimization.inference.types.InferenceBackend.validate`
+    check.
     """
     if not isinstance(mapping, Mapping):
         raise ExperimentDefinitionError(
@@ -91,10 +109,17 @@ def parse_experiment_space(mapping: object) -> ExperimentSpace:
     if problems:
         raise ExperimentDefinitionError(problems)
 
-    return _parse_dimensions(mapping[_SPACE_KEY])
+    return _parse_dimensions(mapping[_SPACE_KEY], _required_parameters(required))
 
 
-def _parse_dimensions(space: Mapping[object, object]) -> ExperimentSpace:
+def _required_parameters(required: Iterable[str] | None) -> frozenset[str]:
+    """Resolve the required tunable set, defaulting to the whole registry."""
+    if required is None:
+        return frozenset(TUNABLE_PARAMETERS)
+    return frozenset(required)
+
+
+def _parse_dimensions(space: Mapping[object, object], required: frozenset[str]) -> ExperimentSpace:
     """Parse every declared dimension, then emit them in canonical registry order."""
     problems: list[str] = []
     parsed: dict[object, Dimension] = {}
@@ -106,7 +131,7 @@ def _parse_dimensions(space: Mapping[object, object]) -> ExperimentSpace:
         f"{_SPACE_KEY}.{parameter}: missing required tunable parameter; "
         f"declare one of {_format_kinds()}"
         for parameter in TUNABLE_PARAMETERS
-        if parameter not in space
+        if parameter in required and parameter not in space
     )
     if problems:
         raise ExperimentDefinitionError(problems)

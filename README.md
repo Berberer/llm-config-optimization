@@ -12,17 +12,21 @@ ends.
 
 ![Screenshot of the optimization tool TUI showing a plot with number of trials on the X-axis and tokens per second on the y-axis.](./assets/optimization_plot_example.png)
 
-The inference engine is deliberately pluggable: the search-space and experiment
-layers are engine-neutral and name no engine, so the same definition and
-workflow can target a different backend later. **vLLM is currently the only
-backend implemented**.
+The inference engine is deliberately pluggable and chosen on the command line:
+the search-space and experiment layers are engine-neutral and name no engine, so
+the same definition and workflow can target a different backend later. **vLLM is
+currently the only backend implemented**. A trial starts the engine's server in
+a container and measures it from the host through one shared HTTP client, so the
+container carries only the server and every engine is measured by identical
+logic.
 
-The search space is deliberately explicit: every tunable parameter must be
-declared, so a result is always explainable from the definition alone. Nothing
-silently falls back to an engine default unless you write that decision down.
+The search space is deliberately explicit: every tunable the selected engine
+forwards must be declared, so a result is always explainable from the
+definition alone. Nothing silently falls back to an engine default unless you
+write that decision down.
 
 ```console
-$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml --n-trials 50 --output-config best.yaml
+$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml vllm --n-trials 50 --output-config best.yaml
 ```
 
 ---
@@ -62,17 +66,18 @@ shell; run `uv sync` inside it once to install the Python tooling.
 ### Synopsis
 
 ```
-llm-config-optimization MODEL SPACE [options]
+llm-config-optimization MODEL SPACE ENGINE [options]
 ```
 
-Two positional arguments are required:
+Three positional arguments are required:
 
 | Argument  | Description                                                              |
 | --------- | ------------------------------------------------------------------------ |
 | `MODEL`   | Model to benchmark: a Hugging Face id (`Qwen/Qwen3.8-27B`) or a host path to a local checkpoint. |
 | `SPACE`   | Path to the search-space YAML file (see [section 2](#2-search-space-yaml-format)). |
+| `ENGINE`  | Inference engine to benchmark; it selects the backend that plans the server and interprets the result. `vllm` is implemented today. |
 
-Everything else has a default, so the shortest invocation is just the two
+Everything else has a default, so the shortest invocation is just the three
 positionals. Run `llm-config-optimization --help` for the same documentation on the
 command line.
 
@@ -102,13 +107,22 @@ command line.
 | `--startup-timeout` | `600`        | Seconds to wait for the served model to become healthy.        |
 | `--timeout`         | `900`        | Overall time limit for a trial's container, covering startup, warmup, and every measured run, in seconds. |
 
-Each trial starts `vllm serve` once inside a single container and then drives
-that server with `vllm bench serve` — one discarded warmup run per
-`--warmup-runs`, then `--repetitions` measured runs. The model is loaded once,
-so repeating the benchmark does not repeat vLLM's startup cost. The trial's
-score is the **mean** of the successful measured runs' total token throughput,
-and a trial succeeds as long as a strict majority of its measured runs succeed,
-so a single failed run does not discard an otherwise valid configuration.
+`--dataset-path` reads a JSONL file, one JSON object per line, with a required
+string `prompt` and an optional positive integer `output_len` that falls back
+to `--output-len`. `--num-prompts` caps how many lines are used and
+`--input-len` is ignored, because the dataset carries the prompts. Combining a
+non-`random` `--dataset-name` with `--dataset-path` is a usage error, so a named
+dataset is never silently ignored.
+
+Each trial starts the engine's server once inside a single container and then
+drives it from the host with one shared HTTP client — one discarded warmup run
+per `--warmup-runs`, then `--repetitions` measured runs. The model is loaded
+once, so repeating the benchmark does not repeat the engine's startup cost, and
+the container runs only the server, so no engine image needs to carry a
+benchmark client. The trial's score is the **mean** of the successful measured
+runs' total token throughput, and a trial succeeds as long as a strict majority
+of its measured runs succeed, so a single failed run does not discard an
+otherwise valid configuration.
 
 Before every run the server's caches are reset through vLLM's dev-mode
 endpoints, and each measured run is seeded with its index `0 … N-1` (warmup
@@ -118,11 +132,11 @@ prompt set rather than replaying the one that warmed the cache. The per-run
 measurements and the failure count are kept on the result, so the spread behind
 the mean stays inspectable.
 
-> **Note:** measurement goes through the server's HTTP API (`vllm bench
-> serve`) rather than the offline engine path (`vllm bench throughput`). The
-> online numbers include tokenisation and request overhead, so they are
-> expected to be somewhat lower and are **not comparable** to numbers recorded
-> by earlier versions of this tool.
+> **Note:** measurement goes through the server's OpenAI-compatible HTTP API
+> rather than the offline engine path (`vllm bench throughput`). The online
+> numbers include tokenisation and request overhead, so they are expected to be
+> somewhat lower and are **not comparable** to numbers recorded by earlier
+> versions of this tool.
 
 #### Engine
 
@@ -221,13 +235,13 @@ mode with a single job when a clean record matters.
 **Simple sweep, search until interrupted, TUI in a terminal:**
 
 ```console
-$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml
+$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml vllm
 ```
 
 **Bounded sweep, write the winner, log mode for a file:**
 
 ```console
-$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml \
+$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml vllm \
     --n-trials 50 \
     --output log \
     --output-config best.yaml > run.log
@@ -236,7 +250,7 @@ $ llm-config-optimization Qwen/Qwen3.8-27B space.yaml \
 **Large local checkpoint on an explicit ROCm target with more memory headroom:**
 
 ```console
-$ llm-config-optimization /models/Qwen3.8-Flash-Next space.yaml \
+$ llm-config-optimization /models/Qwen3.8-Flash-Next space.yaml vllm \
     --target rocm \
     --mem-limit 400g \
     --shm-size 32g \
@@ -246,7 +260,7 @@ $ llm-config-optimization /models/Qwen3.8-Flash-Next space.yaml \
 **Reproducible, persisted, resumable sweep:**
 
 ```console
-$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml \
+$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml vllm \
     --sampler-seed 42 \
     --llm-seed 0 \
     --storage sqlite:///qwen3.8-27b.db \
@@ -258,7 +272,7 @@ $ llm-config-optimization Qwen/Qwen3.8-27B space.yaml \
 **Parallel trials across a multi-GPU host (each trial on a disjoint device):**
 
 ```console
-$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml \
+$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml vllm \
     --storage sqlite:///study.db \
     --n-jobs 2 \
     --n-trials 40
@@ -267,7 +281,7 @@ $ llm-config-optimization Qwen/Qwen3.8-27B space.yaml \
 **Quick CPU smoke test with a pinned image and no pull:**
 
 ```console
-$ llm-config-optimization Qwen/Qwen3.5-0.8B space.yaml \
+$ llm-config-optimization Qwen/Qwen3.5-0.8B space.yaml vllm \
     --target cpu \
     --image docker.io/vllm/vllm-openai-cpu:latest \
     --pull-policy never \
@@ -278,7 +292,7 @@ $ llm-config-optimization Qwen/Qwen3.5-0.8B space.yaml \
 **A representative workload shape:**
 
 ```console
-$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml \
+$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml vllm \
     --dataset-name random \
     --num-prompts 500 \
     --input-len 2048 \
@@ -303,7 +317,7 @@ ends (including on interrupt or failure). Nothing is left behind.
 
 The definition file has exactly one top-level key, `space`, mapping each tunable
 parameter name to its **spec**. Nothing else is allowed at the top level, and
-every tunable parameter must be declared.
+every parameter the selected engine forwards must be declared.
 
 ```yaml
 space:
@@ -356,9 +370,12 @@ sampled and the optimizer cannot interpolate between them.
 
 ### Tunable parameters
 
-All seven parameters below are **required** in every definition. Omitting one is
-an error naming the missing parameter, so a value can never silently fall back
-to an engine default. Write `default: true` for using that default value.
+The definition must declare every parameter the selected engine forwards — the
+search space is **total over that engine's applicable set**, so a value can
+never silently fall back to an engine default. Omitting one is an error naming
+the missing parameter. vLLM forwards all seven parameters below, so for a vLLM
+run every one is required; an engine that lacks a parameter may omit it. Write
+`default: true` for using an engine default.
 
 | Parameter                | Kind                                            | Accepted values                                       |
 | ------------------------ | ----------------------------------------------- | ----------------------------------------------------- |
@@ -470,7 +487,8 @@ space:
 | -------------------- | -------------------------------------------------------------------------- |
 | Language / packaging | Python **3.14**, `src/` layout, [uv](https://docs.astral.sh/uv/) with the `uv_build` backend |
 | Search / optimization| [Optuna](https://optuna.org/) TPE sampler, maximizing token throughput; SQLite or in-memory studies |
-| Inference engine     | **vLLM** (the only backend implemented so far), served once per trial with `vllm serve` and measured repeatedly by `vllm bench serve`; the layer above it is engine-neutral |
+| Inference engine     | **vLLM** (the only backend implemented so far), started once per trial with `vllm serve` and measured from the host by a shared HTTP client; the layer above it is engine-neutral |
+| Benchmark client     | **`httpx2`** async HTTP client, driving the server's OpenAI-compatible API from the host with an injectable transport and clock |
 | Container runtime    | **Podman** via the [`podman`](https://pypi.org/project/podman/) Python bindings (CDI for CUDA, device nodes for ROCm, none for CPU) |
 | Config format        | **PyYAML** (`yaml.safe_load`) for the search-space and output-config files |
 | Model fetching       | [`huggingface_hub`](https://pypi.org/project/huggingface-hub/) snapshot download for Hugging Face ids |
@@ -486,12 +504,16 @@ The codebase is layered so engine details stay at the edges:
 
 - `search_space/`: Engine-neutral definition types, the tunable registry, the
   YAML loader, and validation.
-- `inference/`: The engine-neutral experiment surface (a backend `Protocol`)
-  plus the `VLLMBackend` that validates a resolved checkpoint, maps an
-  experiment to a container run, and parses results. A second engine would be
-  another implementation of that protocol.
-- `runtime/`: Backend-agnostic container types and the Podman client (plus
-  SELinux auto-detection).
+- `inference/`: The engine-neutral experiment surface (the `InferenceBackend`
+  `Protocol` and the `ServerSpec` a backend plans) plus the `VLLMBackend`, the
+  host-side benchmark client, and hardware detection. A backend validates a
+  resolved checkpoint, plans a `ServerSpec`, and parses results; the client
+  waits for the server's health, takes the warmup and measured runs, and
+  aggregates the metrics. A second engine is another implementation of the
+  protocol.
+- `runtime/`: Backend-agnostic container types, the detached start/stop
+  lifecycle a host-driven run uses, and the Podman client (plus SELinux
+  auto-detection).
 - `optimization/`: The Optuna adapter that maps spec kinds to suggestions and
   drives a study.
 - `cli/`: The composition root: argument parsing, base-config construction,
@@ -499,4 +521,6 @@ The codebase is layered so engine details stay at the edges:
 
 Because the definition and experiment surfaces import no engine, the same
 search space and validation workflow can target a different inference backend
-later without changing the file format.
+later without changing the file format. The search space is total over the
+selected backend's applicable set, so the engine — not the file format —
+decides which parameters a definition must declare.

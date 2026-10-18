@@ -27,6 +27,7 @@ import pytest
 from fakes import FakeBackend, FakePodmanClient
 from llm_config_optimization.inference import (
     BenchmarkConfig,
+    BenchmarkOutcome,
     ContainerRuntimeConfig,
     DType,
     ExperimentConfig,
@@ -35,6 +36,7 @@ from llm_config_optimization.inference import (
     HardwareTarget,
     LLMConfig,
     RunMetrics,
+    ServerSpec,
 )
 from llm_config_optimization.optimization import (
     OptimizationError,
@@ -45,8 +47,12 @@ from llm_config_optimization.optimization import (
 from llm_config_optimization.runtime import ContainerConfig, ContainerResult
 from llm_config_optimization.search_space import Categorical, Dimension, ExperimentSpace, Interval
 
-PLAN = ContainerConfig(image="fake/engine:latest", command=("bench",))
-"""The canned container plan the fake backend returns."""
+PLAN = ServerSpec(
+    container=ContainerConfig(image="fake/engine:latest", command=("serve",), ports={"8000": None}),
+    health_path="/health",
+    health_timeout=600.0,
+)
+"""The canned server plan the fake backend returns."""
 
 RESULT = ExperimentResult(
     runs=(
@@ -60,7 +66,7 @@ RESULT = ExperimentResult(
     ),
     failed_runs=0,
     target=HardwareTarget.CPU,
-    image=PLAN.image,
+    image=PLAN.container.image,
     devices=(),
     raw_result=ContainerResult(exit_code=0, stdout=b"", stderr=b"", container_id="fake"),
 )
@@ -100,14 +106,14 @@ class FailsOnceBackend(FakeBackend):
 
     def parse_result(
         self,
+        outcome: BenchmarkOutcome,
+        spec: ServerSpec,
         result: ContainerResult,
-        plan: ContainerConfig,
-        output_dir: Path | None = None,
     ) -> ExperimentResult:
         self.parses += 1
         if self.parses == 1:
             raise ExperimentError("simulated out-of-memory")
-        return super().parse_result(result, plan, output_dir)
+        return super().parse_result(outcome, spec, result)
 
 
 class InterruptingBackend(FakeBackend):
@@ -127,14 +133,14 @@ class InterruptingBackend(FakeBackend):
 
     def parse_result(
         self,
+        outcome: BenchmarkOutcome,
+        spec: ServerSpec,
         result: ContainerResult,
-        plan: ContainerConfig,
-        output_dir: Path | None = None,
     ) -> ExperimentResult:
         self.parses += 1
         if self.parses > self.completed:
             raise KeyboardInterrupt
-        return super().parse_result(result, plan, output_dir)
+        return super().parse_result(outcome, spec, result)
 
 
 def test_optimize_returns_the_best_trial_reconstructed_into_a_config() -> None:
@@ -169,7 +175,7 @@ def test_a_successful_trial_records_a_serializable_result_projection() -> None:
         "requests_per_second": 4.0,
         "elapsed_time": 2.5,
         "target": "cpu",
-        "image": PLAN.image,
+        "image": PLAN.container.image,
         "devices": [],
         "failed_runs": 0,
         "runs": [{"tokens_per_second": 42.0, "requests_per_second": 4.0}],
@@ -198,7 +204,7 @@ def test_a_trial_projection_keeps_the_per_run_spread_and_failure_count() -> None
         ),
         failed_runs=1,
         target=HardwareTarget.CPU,
-        image=PLAN.image,
+        image=PLAN.container.image,
         devices=(),
         raw_result=RESULT.raw_result,
     )

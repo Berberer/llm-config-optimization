@@ -10,12 +10,15 @@ configuration writer.
 
 The package is driven through a single :func:`main` entry point that returns an
 integer exit code, so both the console script and ``python -m llm_config_optimization``
-can share one implementation. ``main`` is a pure composition root: it loads the
-search space, resolves the hardware target, validates the space against that
-target, builds the base configuration, resolves the model to a local directory,
-validates the model against that configuration, pulls the container image, and
-then calls the optimization adapter with the injected backend, client, and
-reporter. Nothing about the study itself is duplicated here.
+can share one implementation. The inference engine is chosen by the required
+``ENGINE`` positional and resolved through a small registry of backend factories,
+so the rest of the composition root never imports an engine class. ``main`` is a
+pure composition root: it loads the search space, resolves the hardware target,
+validates the space against that target, builds the base configuration, resolves
+the model to a local directory, validates the model against that configuration,
+pulls the container image, and then calls the optimization adapter with the
+injected backend, client, and reporter. Nothing about the study itself is
+duplicated here.
 
 Exit codes are distinct so scripts can react to each outcome: ``0`` success,
 ``2`` a usage error (including an explicit TUI request without a terminal),
@@ -29,14 +32,15 @@ to stderr.
 import argparse
 import sys
 import tempfile
-from collections.abc import Sequence
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator, Sequence
+from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 import optuna
 
-from ..inference import VLLMBackend, detect_hardware
+from ..inference import BenchmarkClient, LocalCheckpoint, VLLMBackend, detect_hardware
 from ..inference.types import DetectedHardware, ExperimentConfig, HardwareTarget, InferenceBackend
 from ..optimization import (
     OptimizationError,
@@ -52,7 +56,7 @@ from ..search_space import (
     validate_space,
 )
 from .arguments import parse_args
-from .config import build_base_config, is_local_model
+from .config import build_base_config
 from .download import download_model
 from .log import LogReporter
 from .summary import render_summary, write_config
@@ -70,6 +74,31 @@ _EXIT_DEFINITION = 3
 _EXIT_UNSUPPORTED = 4
 _EXIT_EMPTY_SWEEP = 5
 _EXIT_INTERRUPTED = 130
+
+
+@contextmanager
+def _vllm_backend() -> Generator[InferenceBackend]:
+    """Build the vLLM backend with a per-run compile cache.
+
+    The cache directory lives for the whole sweep, so the trials of one run
+    reuse the kernels the first one built, and is removed when the run ends.
+    """
+    with tempfile.TemporaryDirectory(
+        prefix="llm-config-optimization-cache-", ignore_cleanup_errors=True
+    ) as cache_directory:
+        yield VLLMBackend(cache_dir=Path(cache_directory))
+
+
+_ENGINE_FACTORIES: dict[str, Callable[[], AbstractContextManager[InferenceBackend]]] = {
+    "vllm": _vllm_backend,
+}
+"""Maps the CLI's ``ENGINE`` token to a backend factory.
+
+The registry is the only place that knows which engines exist; the rest of the
+composition root selects a backend by token and never imports an engine class.
+A factory is a context manager so it can own the resources a backend needs for
+the whole sweep (vLLM's compile cache) without leaking that detail into the CLI.
+"""
 
 
 class _CliFailure(Exception):
@@ -91,16 +120,19 @@ def main(
     *,
     backend: InferenceBackend | None = None,
     client: PodmanClient | None = None,
+    benchmark_client: BenchmarkClient | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
     """Run the command line and return the process exit code.
 
-    ``argv`` defaults to ``sys.argv[1:]``; ``backend`` and ``client`` are the
-    composition seams the optimizer and runtime are driven with, and default to
-    the vLLM backend and a client discovered from the environment. ``stdout``
-    and ``stderr`` default to the process streams and are injectable so the
-    entry point can be exercised as a string producer.
+    ``argv`` defaults to ``sys.argv[1:]``; ``backend``, ``client``, and
+    ``benchmark_client`` are the composition seams the optimizer, runtime, and
+    host benchmark client are driven with, and default to the backend selected by
+    the ``ENGINE`` positional, a client discovered from the environment, and the
+    default benchmark client. ``stdout`` and ``stderr`` default to the process
+    streams and are injectable so the entry point can be exercised as a string
+    producer.
 
     Optuna's own logging is silenced first, so the only output is the chosen
     reporter's. Argparse's own exits are folded into return values, so
@@ -120,7 +152,14 @@ def main(
         return int(exit.code or 0)
 
     try:
-        return _run(args, backend=backend, client=client, out=out, err=err)
+        return _run(
+            args,
+            backend=backend,
+            client=client,
+            benchmark_client=benchmark_client,
+            out=out,
+            err=err,
+        )
     except KeyboardInterrupt:
         print("interrupted", file=err)
         return _EXIT_INTERRUPTED
@@ -134,6 +173,7 @@ def _run(
     *,
     backend: InferenceBackend | None,
     client: PodmanClient | None,
+    benchmark_client: BenchmarkClient | None,
     out: TextIO,
     err: TextIO,
 ) -> int:
@@ -143,10 +183,11 @@ def _run(
     terminal is a usage error that must fail before any expensive work. The base
     configuration is built next, so a measurement control outside its valid
     range is reported as a usage error before the space is loaded, the hardware
-    is probed, or a container is pulled. A caller-supplied backend is used
-    as-is; the default vLLM backend is given a temporary compile cache for the
-    run, so the trials of one sweep reuse the kernels the first one built while
-    the directory is removed when the run ends.
+    is probed, or a container is pulled. The engine is then resolved through the
+    registry, so an engine that is not wired fails before the header is printed
+    or any preparation runs. A caller-supplied backend is used as-is; otherwise
+    the factory for ``--engine`` builds one for the duration of the sweep, so
+    resources such as vLLM's compile cache live exactly as long as the run.
     """
     mode = _output_mode(args, out)
     if mode is None:
@@ -159,16 +200,35 @@ def _run(
         print(f"error: {error}", file=err)
         return _EXIT_USAGE
 
+    if backend is None:
+        factory = _ENGINE_FACTORIES.get(args.engine)
+        if factory is None:
+            print(f"error: engine {args.engine!r} is not available", file=err)
+            return _EXIT_USAGE
+        _print_header(args, out)
+        with factory() as resolved_backend:
+            return _sweep(
+                args,
+                base,
+                resolved_backend,
+                mode=mode,
+                client=client,
+                benchmark_client=benchmark_client,
+                out=out,
+                err=err,
+            )
+
     _print_header(args, out)
-
-    if backend is not None:
-        return _sweep(args, base, backend, mode=mode, client=client, out=out, err=err)
-
-    with tempfile.TemporaryDirectory(
-        prefix="llm-config-optimization-cache-", ignore_cleanup_errors=True
-    ) as cache_directory:
-        resolved_backend = VLLMBackend(cache_dir=Path(cache_directory))
-        return _sweep(args, base, resolved_backend, mode=mode, client=client, out=out, err=err)
+    return _sweep(
+        args,
+        base,
+        backend,
+        mode=mode,
+        client=client,
+        benchmark_client=benchmark_client,
+        out=out,
+        err=err,
+    )
 
 
 def _sweep(
@@ -178,6 +238,7 @@ def _sweep(
     *,
     mode: str,
     client: PodmanClient | None,
+    benchmark_client: BenchmarkClient | None,
     out: TextIO,
     err: TextIO,
 ) -> int:
@@ -190,10 +251,11 @@ def _sweep(
     :func:`main` as an unexpected error.
     """
     try:
-        space = _load_space(args.space, out)
+        space = _load_space(args.space, resolved_backend, out)
         hardware = _detect_hardware(args, out)
         _check_supported(space, resolved_backend, hardware, out)
-        model = _prefetch_model(args.model, out)
+        model = _prefetch_model(args.model, resolved_backend, out)
+        base = replace(base, benchmark=replace(base.benchmark, resolved_path=model))
         _check_model(base, model, resolved_backend, out)
         image = _pull_image(args, hardware.target, resolved_backend, client, out)
         reporter = _make_reporter(mode, args, out)
@@ -209,6 +271,7 @@ def _sweep(
             study_name=args.study_name or _default_study_name(args.model),
             backend=resolved_backend,
             client=client,
+            benchmark_client=benchmark_client,
             n_jobs=args.n_jobs,
             callback=reporter,
             on_trial_start=reporter.trial_started if isinstance(reporter, TuiReporter) else None,
@@ -250,6 +313,7 @@ def _print_header(args: argparse.Namespace, out: TextIO) -> None:
     """
     print(f"model: {args.model}", file=out)
     print(f"space: {args.space}", file=out)
+    print(f"engine: {args.engine}", file=out)
     print(f"target: {args.target or 'auto'}", file=out)
     print(f"image: {args.image or 'default'}", file=out)
     print(f"budget: {_budget_text(args)}", file=out)
@@ -265,16 +329,19 @@ def _budget_text(args: argparse.Namespace) -> str:
     return ", ".join(bounds) if bounds else "unbounded"
 
 
-def _load_space(path: Path, out: TextIO) -> ExperimentSpace:
+def _load_space(path: Path, backend: InferenceBackend, out: TextIO) -> ExperimentSpace:
     """Load and parse the search space, mapping a bad file to the definition code.
 
-    A missing or unreadable file is reported as a definition failure rather than
-    a usage error, because the path was syntactically valid but the definition
-    behind it could not be read.
+    The selected backend's :attr:`applicable_parameters` is the required set, so
+    the definition is checked to be total over exactly the parameters the engine
+    forwards: a parameter it does not support may be omitted, and one it does
+    must be declared. A missing or unreadable file is reported as a definition
+    failure rather than a usage error, because the path was syntactically valid
+    but the definition behind it could not be read.
     """
     print(f"loading search space: {path}", file=out)
     try:
-        return load_experiment_space(path)
+        return load_experiment_space(path, required=backend.applicable_parameters)
     except (ExperimentDefinitionError, OSError) as error:
         raise _CliFailure(str(error), _EXIT_DEFINITION) from error
 
@@ -333,23 +400,24 @@ def _detect_hardware(args: argparse.Namespace, out: TextIO) -> DetectedHardware:
     return hardware
 
 
-def _prefetch_model(model: str, out: TextIO) -> Path:
-    """Resolve the model to a local directory, downloading a Hub id if needed.
+def _prefetch_model(model: str, backend: InferenceBackend, out: TextIO) -> Path:
+    """Resolve the model to a local path, downloading a Hub repository if needed.
 
-    A local checkpoint is used directly and the resolved host path is returned;
-    anything else is a Hugging Face id whose snapshot directory the download
-    returns, so a later model-aware check inspects the same checkpoint the run
-    reads through the mounted cache. The snapshot download is called without an
-    explicit token, so ``huggingface_hub``'s own credential resolution applies
-    and a gated model is fetched from ``HF_TOKEN`` or a stored login. A download
-    failure fails the run before any trial.
+    The backend's model-resolution hook decides what the model argument refers
+    to — a local checkpoint, or a Hub repository possibly narrowed to a single
+    file — and the shared download helper fetches anything not already on the
+    host. The resolved path is returned so a later model-aware check inspects
+    the same checkpoint the run mounts; the caller records it on the benchmark
+    config so the backend plans the run from the checkpoint it actually has. A
+    download failure fails the run before any trial.
     """
     print(f"resolving model: {model}", file=out)
-    if is_local_model(model):
-        print(f"using local model: {model}", file=out)
-        return Path(model).expanduser().resolve()
+    request = backend.model_request(model)
+    if isinstance(request, LocalCheckpoint):
+        print(f"using local model: {request.path}", file=out)
+        return request.path
     try:
-        return download_model(model, out)
+        return download_model(request.repo_id, out, filename=request.filename)
     except Exception as error:
         raise _CliFailure(f"failed to download model {model!r}: {error}", _EXIT_ERROR) from error
 

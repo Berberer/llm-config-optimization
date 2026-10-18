@@ -153,6 +153,42 @@ class ContainerRuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalCheckpoint:
+    """A model that already exists on the host.
+
+    A backend's model-resolution hook returns this when the model argument
+    names an existing path, so the composition root fetches nothing and the run
+    mounts the path directly.
+    """
+
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class HubCheckpoint:
+    """A model to fetch from the Hugging Face Hub.
+
+    ``repo_id`` names the repository and ``filename`` optionally restricts the
+    fetch to one file inside it — a single GGUF quant, for example — with
+    ``None`` fetching the whole snapshot. The backend decides which repository
+    and file a model argument refers to; the composition root performs the
+    download.
+    """
+
+    repo_id: str
+    filename: str | None = None
+
+
+type ModelRequest = LocalCheckpoint | HubCheckpoint
+"""An engine-neutral description of the checkpoint a run needs.
+
+A backend's :meth:`InferenceBackend.model_request` returns one of these, so the
+composition root can resolve it to a local path — downloading when necessary —
+without learning an engine's model-argument rules.
+"""
+
+
+@dataclass(frozen=True, slots=True)
 class BenchmarkConfig:
     """Engine-neutral description of the evaluation workload.
 
@@ -161,6 +197,13 @@ class BenchmarkConfig:
     is driven with, and how many times that workload is measured. ``model`` is
     required and accepts either a Hugging Face identifier or a host path to a
     local checkpoint.
+
+    ``resolved_path`` is where the composition root put the checkpoint after
+    asking the backend's model-resolution hook what to fetch; it is ``None``
+    until then, and a backend plans a run from ``model`` alone when it is
+    unset. It is kept separate from ``model`` so the user-facing identifier
+    still names the served model even when the weights were fetched into the
+    Hub cache.
 
     The workload-shape fields impose no defaults of their own: each is ``None``
     until the caller sets it, so a run never silently measures something other
@@ -180,6 +223,7 @@ class BenchmarkConfig:
     """
 
     model: str
+    resolved_path: Path | None = None
     dataset_name: str | None = None
     dataset_path: str | None = None
     num_prompts: int | None = None
@@ -204,6 +248,30 @@ class BenchmarkConfig:
             raise ValueError(f"warmup must be non-negative, got {self.warmup}")
         if self.startup_timeout <= 0:
             raise ValueError(f"startup_timeout must be positive, got {self.startup_timeout}")
+
+
+@dataclass(frozen=True, slots=True)
+class ServerSpec:
+    """Engine-neutral description of the server a trial measures against.
+
+    A trial no longer runs a self-contained benchmark container: it starts the
+    engine's server and drives it from the host. This type is the seam between
+    the two, so the orchestrator and the host client never learn an engine's
+    vocabulary. The backend plans the container the server runs in and
+    describes how the host reaches and resets it.
+
+    ``container`` carries the server's command, published ports, mounts,
+    environment, and devices. ``health_path`` is the HTTP path the client polls
+    until the server is ready, and ``health_timeout`` is how long it waits
+    before giving up, in seconds. ``reset_paths`` lists the endpoints the
+    client calls between measured runs to drop engine-side caches; an empty
+    tuple means the engine exposes none and the client skips resetting.
+    """
+
+    container: ContainerConfig
+    health_path: str
+    health_timeout: float
+    reset_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,9 +335,9 @@ def _hashable(value: object) -> object:
 
     The engine's payload is JSON, so it is built from mappings, lists, and
     scalars. A mapping becomes a tuple of its key/value pairs sorted by key, and
-    a list a tuple of its items, so nested structures — such as the percentile
-    lists ``vllm bench serve`` writes — are hashable and two payloads that
-    differ only in key order hash equally. Scalars pass through unchanged.
+    a list a tuple of its items, so nested structures — such as a list-valued
+    field in a client payload — are hashable and two payloads that differ only
+    in key order hash equally. Scalars pass through unchanged.
     """
     if isinstance(value, Mapping):
         return tuple(sorted((key, _hashable(item)) for key, item in value.items()))
@@ -291,8 +359,8 @@ class RunMetrics:
     ``tokens_per_second`` is the engine's *total* token throughput: prompt and
     generated tokens combined, divided by elapsed wall-clock time. It is not
     generation-only, so a workload with a large prompt-to-output ratio is
-    dominated by prefill. The name mirrors the engine's own result key, which
-    exposes no output-only throughput.
+    dominated by prefill. The host client computes it from the engine's usage
+    payload, which exposes no output-only throughput.
     """
 
     tokens_per_second: float
@@ -316,6 +384,30 @@ class RunMetrics:
                 _hashable(self.raw_json),
             )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class BenchmarkOutcome:
+    """The runs a host-side benchmark client produced for one trial.
+
+    The client measures the server from outside the container and hands back
+    what it observed, so the orchestrator can stop the server and let the
+    backend assemble the final :class:`ExperimentResult` from data that no
+    longer depends on a running container. ``runs`` holds one
+    :class:`RunMetrics` per successful measured run, in run order, and each
+    run's ``raw_json`` keeps the client payloads behind its typed metrics.
+    ``failed_runs`` counts the measured runs whose requests all failed; a run
+    that completed at least one request is successful even when some of its
+    requests failed, mirroring the engine's own client.
+    """
+
+    runs: tuple[RunMetrics, ...]
+    failed_runs: int
+
+    @property
+    def raw_payloads(self) -> tuple[Mapping[str, object], ...]:
+        """The raw client payload of each successful run, in run order."""
+        return tuple(run.raw_json for run in self.runs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,19 +514,43 @@ class InferenceBackend(Protocol):
 
     Before a series runs, :meth:`validate` checks a search-space definition
     against the backend, so a parameter or value the engine does not support is
-    rejected up front rather than midway through an expensive sweep. Once the
-    model has been resolved to a local directory, :meth:`validate_model` checks
-    it against the configuration, so a checkpoint that cannot serve the
-    experiment is rejected before anything is pulled or run.
+    rejected up front rather than midway through an expensive sweep. The
+    composition root asks :meth:`model_request` what the model argument refers
+    to, downloads it when necessary, and records the resolved path on the run's
+    :class:`BenchmarkConfig`. Once the model has been resolved to a local
+    directory, :meth:`validate_model` checks it against the configuration, so a
+    checkpoint that cannot serve the experiment is rejected before anything is
+    pulled or run.
 
-    An output directory is optional because not every engine writes a result
-    file. A backend that does not need one ignores the argument; a backend that
-    does is responsible for creating it when the caller supplies ``None`` and
-    for reading from the same directory in :meth:`parse_result`. The planned
-    container configuration is passed back into :meth:`parse_result` as well, so
-    a backend can record what actually ran (resolved image, devices, and so on)
-    without retaining state between the two calls.
+    A trial is host-driven: the backend plans a :class:`ServerSpec`, the
+    orchestrator starts that server container and drives it with the host
+    benchmark client, then hands the measured :class:`BenchmarkOutcome` and the
+    captured server result back to :meth:`parse_result`. The spec is passed back
+    into :meth:`parse_result` as well, so a backend can record what actually ran
+    (resolved image, devices, and so on) without retaining state between the two
+    calls, and the orchestrator never learns an engine's vocabulary.
+
+    The search space is total over the backend's *applicable* parameters rather
+    than over every tunable, so :attr:`applicable_parameters` tells the loader
+    which parameters the selected engine requires. A definition declares exactly
+    those, and a value can still never silently fall back to an engine default.
     """
+
+    @property
+    def applicable_parameters(self) -> frozenset[str]:
+        """The tunable parameter names this engine forwards.
+
+        The composition root passes this set to the search-space loader as the
+        required set, so a definition may omit a parameter the engine does not
+        support and must declare every one it does. The names are the engine-
+        neutral YAML names in
+        :data:`~llm_config_optimization.search_space.registry.TUNABLE_PARAMETERS`.
+        A backend that forwards the whole registry returns all of it; one that
+        lacks a parameter (llama.cpp has no tensor parallelism, for example)
+        omits it. Declaring a parameter outside this set is a separate,
+        backend-specific problem reported by :meth:`validate`.
+        """
+        ...
 
     def validate(
         self, space: ExperimentSpace, hardware: DetectedHardware | None = None
@@ -493,38 +609,55 @@ class InferenceBackend(Protocol):
         """
         ...
 
+    def model_request(self, model: str) -> ModelRequest:
+        """Describe what the composition root must resolve for ``model``.
+
+        The backend owns the engine's model-argument rules: whether ``model``
+        names a local checkpoint or a Hub repository, and — for an engine that
+        can fetch a single file — which file inside the repository is needed.
+        The composition root turns the returned request into a local path using
+        the shared download and progress machinery, and records it on the
+        run's :class:`BenchmarkConfig`, so no engine vocabulary leaks into the
+        CLI.
+        """
+        ...
+
     def plan(
         self,
         experiment: ExperimentConfig,
         hardware: DetectedHardware,
-        output_dir: Path | None = None,
-    ) -> ContainerConfig:
-        """Turn an experiment and the detected hardware into a container run.
+    ) -> ServerSpec:
+        """Turn an experiment and the detected hardware into a server run.
 
-        Returns a concrete
-        :class:`~llm_config_optimization.runtime.ContainerConfig` — the resolved image,
-        device mapping, mounts, and the engine's benchmark command — which the
-        orchestrator executes through the runtime layer unchanged.
+        Returns a :class:`ServerSpec` — the server's container configuration
+        (command, published ports, mounts, environment, devices), the health
+        path the host client polls until the server is ready, the cache-reset
+        paths it calls between measured runs, and how long to wait for health.
+        The orchestrator starts that container, measures it with the host
+        client, stops it, and passes the outcome to :meth:`parse_result`, so
+        neither the orchestrator nor the client learns an engine's vocabulary.
 
         Planning is not required to be side-effect free: a backend may create the
-        host directories it mounts (for example an output directory and a cache
-        directory) while planning, because they must exist before the run can be
-        planned to use them.
+        host directories it mounts (for example a model cache directory) while
+        planning, because they must exist before the run can be planned to use
+        them.
         """
         ...
 
     def parse_result(
         self,
+        outcome: BenchmarkOutcome,
+        spec: ServerSpec,
         result: ContainerResult,
-        plan: ContainerConfig,
-        output_dir: Path | None = None,
     ) -> ExperimentResult:
-        """Turn a captured container outcome into a typed benchmark result.
+        """Assemble a typed result from a measured outcome and the server run.
 
-        ``plan`` is the container configuration :meth:`plan` produced for the
-        run, so the result can record what actually ran rather than what was
-        requested. Raises :class:`ExperimentError` when the engine produced no
-        usable result, carrying the raw container result where one was
-        captured.
+        ``outcome`` is what the host benchmark client observed — the successful
+        measured runs, each carrying its raw payload, and the failed-run count —
+        ``spec`` is the server plan that ran, and ``result`` is the captured
+        server container outcome. The backend records what actually ran from
+        ``spec`` rather than what was requested. Raises :class:`ExperimentError`
+        when the outcome cannot describe a result, carrying the raw container
+        result.
         """
         ...

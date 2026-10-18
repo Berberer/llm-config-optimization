@@ -1,9 +1,10 @@
 """Command-line argument parser for the optimization runner.
 
-This module owns the CLI's entire flag surface. The command takes two
-positionals — a model (a Hugging Face id or a host path) and the search-space
-YAML file — and every other setting is a flag with a sensible default, so the
-simplest invocation is ``llm-config-optimization MODEL SPACE``.
+This module owns the CLI's entire flag surface. The command takes three
+positionals — a model (a Hugging Face id or a host path), the search-space YAML
+file, and the inference engine to benchmark — and every other setting is a flag
+with a sensible default, so the simplest invocation is
+``llm-config-optimization MODEL SPACE ENGINE``.
 
 The parser is deliberately a pure description of the command line: it loads no
 space, touches no hardware, and runs no sweep. :func:`parse_args` returns an
@@ -27,13 +28,13 @@ __all__ = ["build_parser", "parse_args"]
 _DISTRIBUTION_NAME = "llm-config-optimization"
 _PROG = "llm-config-optimization"
 
-_DESCRIPTION = "Search a vLLM serving configuration for the best throughput."
+_DESCRIPTION = "Search an LLM serving configuration for the best throughput."
 
 _EPILOG = """\
 examples:
-  llm-config-optimization facebook/opt-125m space.yaml
-  llm-config-optimization facebook/opt-125m space.yaml --n-trials 50 --output-config best.yaml
-  llm-config-optimization /models/Llama-3.1-8B space.yaml --target cuda --sweep-timeout 3600
+  llm-config-optimization facebook/opt-125m space.yaml vllm
+  llm-config-optimization facebook/opt-125m space.yaml vllm --n-trials 50 --output-config best.yaml
+  llm-config-optimization /models/Llama-3.1-8B space.yaml vllm --target cuda --sweep-timeout 3600
 """
 
 
@@ -71,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SPACE",
         type=Path,
         help="Path to the search-space YAML file describing the parameters to sweep.",
+    )
+    parser.add_argument(
+        "engine",
+        metavar="ENGINE",
+        choices=("vllm", "llamacpp"),
+        help="Inference engine to benchmark: vllm or llamacpp.",
     )
 
     container = parser.add_argument_group("container")

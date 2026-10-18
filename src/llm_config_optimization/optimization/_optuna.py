@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, cast
 
 import optuna
 
-from ..inference import run_experiment
+from ..inference import BenchmarkClient, run_experiment
 from ..inference.types import (
     ExperimentConfig,
     ExperimentError,
@@ -156,6 +156,7 @@ def make_objective(
     *,
     backend: InferenceBackend | None = None,
     client: PodmanClient | None = None,
+    benchmark_client: BenchmarkClient | None = None,
     on_trial_start: Callable[[], None] | None = None,
 ) -> Callable[[optuna.Trial], float]:
     """Build the Optuna objective that evaluates one point of ``space``.
@@ -164,8 +165,8 @@ def make_objective(
     from ``base``, and runs it through
     :func:`~llm_config_optimization.inference.run_experiment` with the injected backend
     and container client, returning the run's token throughput as the value to
-    maximize. ``backend`` and ``client`` may be ``None``, in which case the
-    orchestrator's own defaults apply.
+    maximize. ``backend``, ``client``, and ``benchmark_client`` may be ``None``,
+    in which case the orchestrator's own defaults apply.
 
     ``on_trial_start``, when given, is invoked once at the start of every trial
     — before the experiment runs — so a caller can observe an in-flight trial
@@ -189,7 +190,9 @@ def make_objective(
         parameters = suggest_parameters(trial, space)
         config = reconstruct_config(space, base, parameters)
         try:
-            result = run_experiment(config, backend, client=client)
+            result = run_experiment(
+                config, backend, client=client, benchmark_client=benchmark_client
+            )
         except ExperimentError as error:
             trial.set_user_attr(_ERROR_ATTRIBUTE, str(error))
             raise
@@ -210,6 +213,7 @@ def optimize(
     study_name: str | None = None,
     backend: InferenceBackend | None = None,
     client: PodmanClient | None = None,
+    benchmark_client: BenchmarkClient | None = None,
     n_jobs: int = 1,
     callback: Callable[[optuna.Study, optuna.trial.FrozenTrial], None] | None = None,
     on_trial_start: Callable[[], None] | None = None,
@@ -266,7 +270,12 @@ def optimize(
         load_if_exists=storage is not None,
     )
     objective = make_objective(
-        space, base, backend=backend, client=client, on_trial_start=on_trial_start
+        space,
+        base,
+        backend=backend,
+        client=client,
+        benchmark_client=benchmark_client,
+        on_trial_start=on_trial_start,
     )
     try:
         study.optimize(

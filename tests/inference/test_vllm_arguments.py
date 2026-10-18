@@ -2,15 +2,12 @@
 
 The backend's observable contract here is the argument list it assembles from an
 engine-neutral config: which flags appear, in what order, how each value is
-encoded, which enum members are rejected, and — after the assembly was split by
-destination — which command each flag reaches. Serving parameters
+encoded, and which enum members are rejected. Serving parameters
 (:class:`LLMConfig` and the backend's ``extra_args``) build the ``vllm serve``
-command through :func:`serve_arguments`; workload parameters
-(:class:`BenchmarkConfig`) build the ``vllm bench serve`` command through
-:func:`bench_arguments`. The typed config is used where it models a value, and
-the generic encoding primitive is exercised directly for value shapes it does
-not yet model (booleans, nested JSON), which is exactly the seam the backend's
-own assembly builds on.
+command through :func:`serve_arguments`. The typed config is used where it
+models a value, and the generic encoding primitive is exercised directly for
+value shapes it does not yet model (booleans, nested JSON), which is exactly the
+seam the backend's own assembly builds on.
 """
 
 from dataclasses import fields
@@ -21,7 +18,6 @@ import pytest
 
 from llm_config_optimization.inference import (
     AttentionBackend,
-    BenchmarkConfig,
     DType,
     ExperimentError,
     KVCacheDType,
@@ -32,12 +28,9 @@ from llm_config_optimization.inference._vllm import (
     PARAMETER_TARGETS,
     FlatFlag,
     JsonGroup,
-    bench_arguments,
     encode_arguments,
     serve_arguments,
 )
-
-HUB_MODEL = "meta-llama/Llama-3.1-8B"
 
 
 def test_every_llm_config_field_has_a_mapping_entry() -> None:
@@ -148,102 +141,6 @@ def test_extra_args_are_appended_verbatim_after_the_mapped_parameters() -> None:
         "--block-size",
         "32",
     ]
-
-
-def test_extra_args_reach_the_server_command_not_the_client() -> None:
-    """``extra_args`` are serving flags, so they never leak into the workload."""
-    backend_extra = ("--enforce-eager",)
-
-    serve = serve_arguments(LLMConfig(), extra_args=backend_extra)
-    bench = bench_arguments(BenchmarkConfig(model=HUB_MODEL), HUB_MODEL)
-
-    assert "--enforce-eager" in serve
-    assert "--enforce-eager" not in bench
-
-
-def test_workload_fields_assemble_for_the_client_command() -> None:
-    benchmark = BenchmarkConfig(
-        model=HUB_MODEL,
-        dataset_name="sharegpt",
-        dataset_path="/data/prompts.jsonl",
-        num_prompts=100,
-        input_len=128,
-        output_len=64,
-    )
-
-    assert bench_arguments(benchmark, HUB_MODEL) == [
-        "--model",
-        HUB_MODEL,
-        "--dataset-name",
-        "sharegpt",
-        "--dataset-path",
-        "/data/prompts.jsonl",
-        "--num-prompts",
-        "100",
-        "--input-len",
-        "128",
-        "--output-len",
-        "64",
-    ]
-
-
-def test_random_dataset_routes_lengths_to_the_random_flags() -> None:
-    """vLLM's random dataset reads ``--random-*-len`` and ignores the generic flags."""
-    benchmark = BenchmarkConfig(
-        model=HUB_MODEL,
-        dataset_name="random",
-        num_prompts=8,
-        input_len=32,
-        output_len=8,
-    )
-
-    assert bench_arguments(benchmark, HUB_MODEL) == [
-        "--model",
-        HUB_MODEL,
-        "--dataset-name",
-        "random",
-        "--num-prompts",
-        "8",
-        "--random-input-len",
-        "32",
-        "--random-output-len",
-        "8",
-    ]
-
-
-def test_omitted_dataset_name_routes_lengths_to_the_random_flags() -> None:
-    """vLLM defaults to the random dataset when no dataset name is given."""
-    benchmark = BenchmarkConfig(model=HUB_MODEL, input_len=32, output_len=8)
-
-    arguments = bench_arguments(benchmark, HUB_MODEL)
-
-    assert "--random-input-len" in arguments
-    assert "--random-output-len" in arguments
-    assert "--input-len" not in arguments
-    assert "--output-len" not in arguments
-
-
-def test_unset_workload_fields_are_omitted() -> None:
-    assert bench_arguments(BenchmarkConfig(model=HUB_MODEL), HUB_MODEL) == [
-        "--model",
-        HUB_MODEL,
-    ]
-
-
-def test_serving_and_workload_flags_do_not_cross_commands() -> None:
-    """A serving flag reaches the server, a workload flag reaches the client."""
-    serve = serve_arguments(LLMConfig(dtype=DType.FLOAT16, max_num_seqs=256))
-    bench = bench_arguments(BenchmarkConfig(model=HUB_MODEL, num_prompts=32), HUB_MODEL)
-
-    assert "--dtype" in serve
-    assert "--max-num-seqs" in serve
-    assert "--dtype" not in bench
-    assert "--max-num-seqs" not in bench
-
-    assert "--model" in bench
-    assert "--num-prompts" in bench
-    assert "--model" not in serve
-    assert "--num-prompts" not in serve
 
 
 class _ExtendedDType(StrEnum):

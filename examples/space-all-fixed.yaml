@@ -19,4 +19,4 @@ space:
     fixed: 1
   # flash_attention is CUDA-only; on ROCm or CPU use `default: true` instead.
   attention_backend:
-    default: flash_attention
+    fixed: flash_attention

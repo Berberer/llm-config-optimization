@@ -126,13 +126,19 @@ def _section(config: BenchmarkConfig | LLMConfig) -> dict[str, object]:
 
 
 def _scalar(value: object) -> object:
-    """Reduce an enum member to its engine-neutral string value.
+    """Reduce a config value to something PyYAML's safe dumper can represent.
 
-    A plain value passes through unchanged; only a :class:`~enum.StrEnum` member
-    is unwrapped, so the document carries ``cuda`` and ``float16`` rather than a
-    Python tag PyYAML's safe dumper could not represent.
+    A :class:`~enum.StrEnum` member is unwrapped to its engine-neutral string
+    value and a :class:`~pathlib.Path` is rendered as its string form; every
+    other value passes through unchanged. This keeps the document carrying
+    ``cuda``, ``float16``, and a plain path string rather than Python tags
+    PyYAML's safe dumper could not represent.
     """
-    return value.value if isinstance(value, StrEnum) else value
+    if isinstance(value, StrEnum):
+        return value.value
+    if isinstance(value, Path):
+        return str(value)
+    return value
 
 
 def _dump(document: dict[str, dict[str, object]]) -> str:

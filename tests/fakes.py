@@ -10,20 +10,26 @@ without an engine or GPU. Both live beside the root ``conftest.py`` so every
 test package can import them.
 """
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from podman.errors import APIError
 
 from llm_config_optimization.inference import (
+    BenchmarkConfig,
+    BenchmarkOutcome,
     DetectedHardware,
     ExperimentConfig,
     ExperimentResult,
     HardwareTarget,
+    HubCheckpoint,
+    LocalCheckpoint,
+    ModelRequest,
+    ServerSpec,
 )
-from llm_config_optimization.runtime import ContainerConfig, ContainerResult
-from llm_config_optimization.search_space import ExperimentSpace
+from llm_config_optimization.runtime import ContainerResult
+from llm_config_optimization.search_space import TUNABLE_PARAMETERS, ExperimentSpace
 
 
 def _frame(stream_type: int, payload: bytes) -> bytes:
@@ -59,14 +65,30 @@ class FakeContainer:
         self._wait_error = wait_error
         self._start_error = start_error
         self.started = False
+        self.stopped = False
         self.killed = False
+        self.ports: dict[str, object] = {}
         self.wait_calls: list[float | None] = []
         self.remove_calls: list[bool] = []
+        self.stop_calls: list[dict[str, object]] = []
+        self.reload_calls = 0
 
     def start(self) -> None:
         if self._start_error is not None:
             raise self._start_error
         self.started = True
+
+    def stop(self, **kwargs: object) -> None:
+        self.stop_calls.append(kwargs)
+        if self.client.stop_error is not None:
+            raise self.client.stop_error
+        self.stopped = True
+
+    def reload(self) -> None:
+        self.reload_calls += 1
+        if self.client.reload_error is not None:
+            raise self.client.reload_error
+        self.ports = dict(self.client.resolved_ports)
 
     def wait(self, timeout: float | None = None) -> int:
         self.wait_calls.append(timeout)
@@ -128,6 +150,9 @@ class FakePodmanClient:
         create_error: APIError | None = None,
         pull_error: APIError | None = None,
         get_error: APIError | None = None,
+        reload_error: APIError | None = None,
+        stop_error: APIError | None = None,
+        resolved_ports: dict[str, object] | None = None,
     ) -> None:
         self.exit_code = exit_code
         self.logs = logs
@@ -137,6 +162,13 @@ class FakePodmanClient:
         self.create_error = create_error
         self.pull_error = pull_error
         self.get_error = get_error
+        self.reload_error = reload_error
+        self.stop_error = stop_error
+        self.resolved_ports = (
+            resolved_ports
+            if resolved_ports is not None
+            else {"8000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8000"}]}
+        )
         self.images = FakeImageManager(self)
         self.containers = FakeContainerManager(self)
         self.pull_calls: list[tuple[str, str]] = []
@@ -165,28 +197,40 @@ class FakePodmanClient:
 class FakeBackend:
     """A recording stand-in for an inference backend.
 
-    It returns a canned container plan and a canned typed result, so an
-    experiment can be driven end to end without an engine: :meth:`plan` records
-    every experiment it is asked to plan and :meth:`parse_result` records the
-    captured container outcome, while ``parse_error`` makes every parse fail.
-    The inference orchestration tests and the optimization lifecycle tests share
-    it so neither needs a daemon or a GPU.
+    It returns a canned server plan and a canned typed result, so an experiment
+    can be driven end to end without an engine: :meth:`plan` records every
+    experiment it is asked to plan and :meth:`parse_result` records the measured
+    outcome and captured container outcome, while ``parse_error`` makes every
+    parse fail. The inference orchestration tests and the optimization lifecycle
+    tests share it so neither needs a daemon or a GPU.
     """
 
     def __init__(
         self,
-        plan_config: ContainerConfig,
+        plan_config: ServerSpec,
         result: ExperimentResult,
         events: list[str],
         *,
         parse_error: Exception | None = None,
+        applicable_parameters: Iterable[str] | None = None,
     ) -> None:
         self.plan_config = plan_config
         self.result = result
         self.events = events
         self.parse_error = parse_error
-        self.plan_calls: list[tuple[ExperimentConfig, DetectedHardware, Path | None]] = []
-        self.parse_calls: list[tuple[ContainerResult, ContainerConfig, Path | None]] = []
+        self._applicable_parameters = (
+            frozenset(TUNABLE_PARAMETERS)
+            if applicable_parameters is None
+            else frozenset(applicable_parameters)
+        )
+        self.plan_calls: list[tuple[ExperimentConfig, DetectedHardware]] = []
+        self.parse_calls: list[tuple[BenchmarkOutcome, ServerSpec, ContainerResult]] = []
+        self.model_request_calls: list[str] = []
+
+    @property
+    def applicable_parameters(self) -> frozenset[str]:
+        """The tunable names the fake declares, every registered one by default."""
+        return self._applicable_parameters
 
     def validate(
         self, space: ExperimentSpace, hardware: DetectedHardware | None = None
@@ -198,27 +242,71 @@ class FakeBackend:
         self.events.append("validate_model")
         return ()
 
+    def model_request(self, model: str) -> ModelRequest:
+        """Resolve an existing host path as local, anything else as a Hub id.
+
+        Records every model it is asked about, so a test can pin that the CLI
+        consulted the backend's resolution hook rather than deciding itself.
+        """
+        self.model_request_calls.append(model)
+        path = Path(model).expanduser()
+        if path.exists():
+            return LocalCheckpoint(path=path.resolve())
+        return HubCheckpoint(repo_id=model)
+
     def image_for(self, target: HardwareTarget) -> str:
-        return self.plan_config.image
+        return self.plan_config.container.image
 
     def plan(
         self,
         experiment: ExperimentConfig,
         hardware: DetectedHardware,
-        output_dir: Path | None = None,
-    ) -> ContainerConfig:
+    ) -> ServerSpec:
         self.events.append("plan")
-        self.plan_calls.append((experiment, hardware, output_dir))
+        self.plan_calls.append((experiment, hardware))
         return self.plan_config
 
     def parse_result(
         self,
+        outcome: BenchmarkOutcome,
+        spec: ServerSpec,
         result: ContainerResult,
-        plan: ContainerConfig,
-        output_dir: Path | None = None,
     ) -> ExperimentResult:
         self.events.append("parse_result")
-        self.parse_calls.append((result, plan, output_dir))
+        self.parse_calls.append((outcome, spec, result))
         if self.parse_error is not None:
             raise self.parse_error
         return self.result
+
+
+class FakeBenchmarkClient:
+    """A recording stand-in for the host benchmark client.
+
+    It returns a canned :class:`BenchmarkOutcome` and records every server it is
+    asked to measure, so the orchestrator's lifecycle can be driven without a
+    server, a daemon, or a GPU. ``measure_error`` makes every measurement fail.
+    """
+
+    def __init__(
+        self,
+        outcome: BenchmarkOutcome | None = None,
+        *,
+        measure_error: Exception | None = None,
+    ) -> None:
+        self.outcome = outcome if outcome is not None else BenchmarkOutcome(runs=(), failed_runs=0)
+        self.measure_error = measure_error
+        self.calls: list[tuple[str, str, ServerSpec, BenchmarkConfig]] = []
+
+    def measure_sync(
+        self,
+        base_url: str,
+        model: str,
+        spec: ServerSpec,
+        benchmark: BenchmarkConfig,
+        *,
+        concurrency: int | None = None,
+    ) -> BenchmarkOutcome:
+        self.calls.append((base_url, model, spec, benchmark))
+        if self.measure_error is not None:
+            raise self.measure_error
+        return self.outcome

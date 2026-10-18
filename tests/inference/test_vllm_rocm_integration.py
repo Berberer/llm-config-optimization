@@ -26,6 +26,7 @@ from podman import PodmanClient
 from podman.errors import APIError
 
 from llm_config_optimization.inference import (
+    BenchmarkClient,
     BenchmarkConfig,
     ContainerRuntimeConfig,
     ExperimentConfig,
@@ -46,7 +47,6 @@ _OUTPUT_LEN = 8
 _REPETITIONS = 2
 _WARMUP = 1
 _CONTAINER_TIMEOUT_SECONDS = 900.0
-_MANIFEST_FILENAME = "manifest.json"
 
 _MODEL_CACHE = Path.home() / ".cache" / "huggingface" / "hub" / "models--facebook--opt-125m"
 
@@ -109,7 +109,6 @@ def test_rocm_benchmark_runs_with_the_automatic_selinux_default(
     rocm_host: None,
     vllm_rocm_image: str,
     model: str,
-    tmp_path: Path,
 ) -> None:
     """A ROCm experiment with no SELinux option plans, runs, and parses.
 
@@ -132,7 +131,7 @@ def test_rocm_benchmark_runs_with_the_automatic_selinux_default(
         llm=LLMConfig(),
     )
 
-    result = run_experiment(experiment, client=podman_client, output_dir=tmp_path)
+    result = run_experiment(experiment, client=podman_client, benchmark_client=BenchmarkClient())
 
     assert result.raw_result.exit_code == 0
     assert result.target == HardwareTarget.ROCM
@@ -146,4 +145,3 @@ def test_rocm_benchmark_runs_with_the_automatic_selinux_default(
     assert result.num_prompts == _NUM_PROMPTS * _REPETITIONS
     assert all(run.num_prompts == _NUM_PROMPTS for run in result.runs)
     assert len(result.raw_json) == _REPETITIONS
-    assert (tmp_path / _MANIFEST_FILENAME).is_file()

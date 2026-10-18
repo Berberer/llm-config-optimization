@@ -108,6 +108,67 @@ def test_the_snapshot_directory_is_returned_as_a_path() -> None:
     assert result == Path("/cache/models--meta-llama--Llama-3-8B/snapshots/abc")
 
 
+def test_a_single_file_download_returns_the_file_path_and_names_it() -> None:
+    """A ``filename`` fetches one file and returns its path, not a snapshot dir."""
+    stream = io.StringIO()
+
+    def fake_file_download(repo_id: str, filename: str, *, tqdm_class: type[tqdm]) -> str:
+        assert repo_id == MODEL
+        assert filename == "model-Q4_K_M.gguf"
+        bar = tqdm_class(total=100, name="huggingface_hub.http_get", desc="Downloading bytes")
+        bar.update(40)
+        bar.close()
+        return "/cache/model-Q4_K_M.gguf"
+
+    result = download_model(
+        MODEL, stream, filename="model-Q4_K_M.gguf", download_file=fake_file_download
+    )
+
+    assert result == Path("/cache/model-Q4_K_M.gguf")
+    assert f"downloading {MODEL}/model-Q4_K_M.gguf" in stream.getvalue()
+
+
+def test_a_single_file_download_keeps_only_the_transfer_bar() -> None:
+    """The Xet reconstruction bar is disabled so the file transfer is one line."""
+    stream = io.StringIO()
+
+    def fake_file_download(repo_id: str, filename: str, *, tqdm_class: type[tqdm]) -> str:
+        reconstruction = tqdm_class(
+            total=100, name="huggingface_hub.xet_get", desc="reconstructing"
+        )
+        reconstruction.update(10)
+        reconstruction.close()
+        transfer = tqdm_class(
+            total=100, name="huggingface_hub.xet_get.transfer", desc="transfer bar"
+        )
+        transfer.update(50)
+        transfer.close()
+        return "/cache/file.gguf"
+
+    download_model(MODEL, stream, filename="file.gguf", download_file=fake_file_download)
+
+    output = stream.getvalue()
+    assert f"downloading {MODEL}/file.gguf" in output
+    assert "reconstructing" not in output
+    assert "transfer bar" not in output
+
+
+def test_a_snapshot_download_is_used_when_no_filename_is_given() -> None:
+    """The single-file callable is untouched unless a file was requested."""
+
+    def fake_download(model: str, *, tqdm_class: type[tqdm]) -> str:
+        return "/cache/snapshot"
+
+    def unexpected_file_download(*args: object, **kwargs: object) -> str:
+        raise AssertionError("the single-file download must not be used for a snapshot")
+
+    result = download_model(
+        MODEL, io.StringIO(), download=fake_download, download_file=unexpected_file_download
+    )
+
+    assert result == Path("/cache/snapshot")
+
+
 def test_the_hub_logger_is_restored_when_the_download_fails() -> None:
     """The temporary handler must not leak when the download raises."""
     logger = logging.getLogger("huggingface_hub")

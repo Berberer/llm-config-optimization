@@ -1,25 +1,27 @@
 """Unit tests for experiment orchestration.
 
 ``run_experiment``'s observable contract is the collaboration it drives: detect
-the host's hardware once, ask the backend to plan a run, execute that plan
-through the runtime layer, and hand the captured outcome back to the backend for
-parsing — in that order, with the detected hardware, the experiment, and the
-managed output directory passed through. A failed container run becomes an
-``ExperimentError`` that preserves the cause and the raw result, and its message
-keeps the engine's root-cause line alongside a bounded traceback tail.
+the host's hardware once, ask the backend to plan a server run, start that
+server container, measure it with the host benchmark client, stop it, and hand
+the measured outcome and captured server result back to the backend for parsing
+— in that order, with the detected hardware, the experiment, and the resolved
+host URL passed through. A failed start, measurement, or stop becomes an
+``ExperimentError`` that preserves the cause and the raw result, and a failed
+measurement keeps the engine's root-cause line alongside a bounded traceback
+tail.
 
-These tests inject a fake hardware detector, a fake backend, and the shared fake
-Podman client, so no daemon, inference engine, or specific hardware is required.
+These tests inject a fake hardware detector, a fake backend, a fake benchmark
+client, and the shared fake Podman client, so no daemon, inference engine, or
+specific hardware is required.
 """
-
-from pathlib import Path
 
 import pytest
 from podman.errors import APIError
 
-from fakes import FakeBackend, FakeContainer, FakePodmanClient, _frame
+from fakes import FakeBackend, FakeBenchmarkClient, FakePodmanClient, _frame
 from llm_config_optimization.inference import (
     BenchmarkConfig,
+    BenchmarkOutcome,
     ContainerRuntimeConfig,
     DetectedHardware,
     ExperimentConfig,
@@ -29,14 +31,21 @@ from llm_config_optimization.inference import (
     InferenceBackend,
     LLMConfig,
     RunMetrics,
+    ServerSpec,
     run_experiment,
 )
 from llm_config_optimization.runtime import ContainerConfig, ContainerResult, ContainerRunError
 
 HUB_MODEL = "meta-llama/Llama-3.1-8B"
-_PLAN = ContainerConfig(
-    image="fake/engine:latest",
-    command=("bench", "--model", HUB_MODEL),
+_SPEC = ServerSpec(
+    container=ContainerConfig(
+        image="fake/engine:latest",
+        command=("serve", "--model", HUB_MODEL),
+        ports={"8000": None},
+    ),
+    health_path="/health",
+    health_timeout=600.0,
+    reset_paths=("/reset_prefix_cache",),
 )
 
 _ROOT_CAUSE = "AssertionError: ChunkGatedDeltaRuleFunction does not support float32"
@@ -52,13 +61,16 @@ def _engine_output(root_cause: str, *, frames: int) -> bytes:
 
 
 def _failure_message(monkeypatch: pytest.MonkeyPatch, payload: bytes) -> str:
-    """Drive a failed run with synthetic engine output and return the error message."""
+    """Drive a failed measurement with synthetic engine output and return the error."""
     events: list[str] = []
-    client = RecordingPodmanClient(events, exit_code=1, logs=_frame(2, payload))
-    backend = FakeBackend(_PLAN, _result(), events)
+    client = RecordingPodmanClient(events, logs=_frame(2, payload))
+    backend = FakeBackend(_SPEC, _result(), events)
+    benchmark = FakeBenchmarkClient(
+        measure_error=ExperimentError("the server never became healthy")
+    )
     _detector(monkeypatch, events)
     with pytest.raises(ExperimentError) as excinfo:
-        run_experiment(_experiment(), backend, client=client)
+        run_experiment(_experiment(), backend, client=client, benchmark_client=benchmark)
     return str(excinfo.value)
 
 
@@ -71,9 +83,9 @@ def _experiment(*, target: HardwareTarget | None = None) -> ExperimentConfig:
     )
 
 
-def _result() -> ExperimentResult:
-    """Build the canned typed result the fake backend returns from parsing."""
-    return ExperimentResult(
+def _outcome() -> BenchmarkOutcome:
+    """Build the canned measured outcome the fake benchmark client returns."""
+    return BenchmarkOutcome(
         runs=(
             RunMetrics(
                 tokens_per_second=10.0,
@@ -84,8 +96,16 @@ def _result() -> ExperimentResult:
             ),
         ),
         failed_runs=0,
+    )
+
+
+def _result() -> ExperimentResult:
+    """Build the canned typed result the fake backend returns from parsing."""
+    return ExperimentResult(
+        runs=_outcome().runs,
+        failed_runs=0,
         target=HardwareTarget.CPU,
-        image=_PLAN.image,
+        image=_SPEC.container.image,
         devices=(),
         raw_result=ContainerResult(exit_code=0, stdout=b"", stderr=b"", container_id="fake"),
     )
@@ -105,30 +125,6 @@ class FakeDetector:
         return self.hardware
 
 
-class DirectoryAwareBackend(FakeBackend):
-    """A backend that fails unless the output directory exists when it is called."""
-
-    def plan(
-        self,
-        experiment: ExperimentConfig,
-        hardware: DetectedHardware,
-        output_dir: Path | None = None,
-    ) -> ContainerConfig:
-        assert output_dir is not None
-        assert output_dir.is_dir()
-        return super().plan(experiment, hardware, output_dir)
-
-    def parse_result(
-        self,
-        result: ContainerResult,
-        plan: ContainerConfig,
-        output_dir: Path | None = None,
-    ) -> ExperimentResult:
-        assert output_dir is not None
-        assert output_dir.is_dir()
-        return super().parse_result(result, plan, output_dir)
-
-
 class RecordingPodmanClient(FakePodmanClient):
     """A fake Podman client that timestamps container creation into ``events``."""
 
@@ -136,7 +132,7 @@ class RecordingPodmanClient(FakePodmanClient):
         super().__init__(**kwargs)
         create = self.containers.create
 
-        def recording_create(image: str, **create_kwargs: object) -> FakeContainer:
+        def recording_create(image: str, **create_kwargs: object) -> object:
             events.append("create")
             return create(image, **create_kwargs)
 
@@ -157,115 +153,144 @@ def _detector(
     return detector
 
 
-def test_detect_plan_run_and_parse_happen_in_order(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_detect_plan_start_measure_stop_and_parse_happen_in_order(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
     client = RecordingPodmanClient(events)
-    backend = FakeBackend(_PLAN, _result(), events)
+    backend = FakeBackend(_SPEC, _result(), events)
+    benchmark = FakeBenchmarkClient(_outcome())
     detector = _detector(monkeypatch, events)
     experiment = _experiment()
 
-    result = run_experiment(experiment, backend, client=client, output_dir=tmp_path)
+    result = run_experiment(experiment, backend, client=client, benchmark_client=benchmark)
 
     assert events == ["detect", "plan", "create", "parse_result"]
     assert detector.overrides == [None]
     assert result is backend.result
+    assert len(benchmark.calls) == 1
+    assert client.container is not None
+    assert client.container.stopped is True
+    assert client.container.remove_calls == [True]
 
 
-def test_each_stage_receives_the_previous_stage_output(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_each_stage_receives_the_previous_stage_output(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     client = RecordingPodmanClient(events)
-    backend = FakeBackend(_PLAN, _result(), events)
+    backend = FakeBackend(_SPEC, _result(), events)
+    benchmark = FakeBenchmarkClient(_outcome())
     _detector(monkeypatch, events, DetectedHardware(HardwareTarget.CUDA, 4))
     experiment = _experiment()
 
-    run_experiment(experiment, backend, client=client, output_dir=tmp_path)
+    run_experiment(experiment, backend, client=client, benchmark_client=benchmark)
 
-    assert backend.plan_calls == [(experiment, DetectedHardware(HardwareTarget.CUDA, 4), tmp_path)]
-    captured, planned, output_dir = backend.parse_calls[0]
+    assert backend.plan_calls == [(experiment, DetectedHardware(HardwareTarget.CUDA, 4))]
+    outcome, spec, captured = backend.parse_calls[0]
+    assert outcome is benchmark.outcome
+    assert spec is _SPEC
     assert isinstance(captured, ContainerResult)
     assert captured.exit_code == 0
-    assert planned is _PLAN
-    assert output_dir == tmp_path
-    assert client.create_calls[0][0] == _PLAN.image
-    assert client.create_calls[0][1]["command"] == list(_PLAN.command)
+    assert client.create_calls[0][0] == _SPEC.container.image
+    assert client.create_calls[0][1]["command"] == list(_SPEC.container.command)
+    assert client.create_calls[0][1]["ports"] == {"8000": None}
     assert client.closed is False
+    base_url, model, measured_spec, measured_benchmark = benchmark.calls[0]
+    assert base_url == "http://127.0.0.1:8000"
+    assert model == HUB_MODEL
+    assert measured_spec is _SPEC
+    assert measured_benchmark is experiment.benchmark
 
 
-def test_container_target_override_reaches_detection(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_container_target_override_reaches_detection(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     client = RecordingPodmanClient(events)
-    backend = FakeBackend(_PLAN, _result(), events)
-    detector = _detector(monkeypatch, events, DetectedHardware(HardwareTarget.CUDA, 4))
+    backend = FakeBackend(_SPEC, _result(), events)
+    _detector(monkeypatch, events, DetectedHardware(HardwareTarget.CUDA, 4))
 
     run_experiment(
-        _experiment(target=HardwareTarget.CPU), backend, client=client, output_dir=tmp_path
+        _experiment(target=HardwareTarget.CPU),
+        backend,
+        client=client,
+        benchmark_client=FakeBenchmarkClient(_outcome()),
     )
 
-    assert detector.overrides == [HardwareTarget.CPU]
-    assert len(detector.overrides) == 1
+    assert len(backend.plan_calls) == 1
     assert backend.plan_calls[0][1] == DetectedHardware(HardwareTarget.CUDA, 4)
 
 
-def test_container_failure_is_wrapped_with_cause_and_raw_result(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_a_server_without_a_published_port_cannot_be_measured(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
-    client = RecordingPodmanClient(events, exit_code=3, logs=_frame(1, b"boom"))
-    backend = FakeBackend(_PLAN, _result(), events)
+    client = RecordingPodmanClient(events)
+    spec = ServerSpec(
+        container=ContainerConfig(image="img"), health_path="/health", health_timeout=1.0
+    )
+    backend = FakeBackend(spec, _result(), events)
+    benchmark = FakeBenchmarkClient(_outcome())
+    _detector(monkeypatch, events)
+
+    with pytest.raises(ExperimentError, match="published no host port"):
+        run_experiment(_experiment(), backend, client=client, benchmark_client=benchmark)
+
+    assert benchmark.calls == []
+    assert backend.parse_calls == []
+    assert client.container is not None
+    assert client.container.remove_calls == [True]
+
+
+def test_container_start_failure_is_wrapped_without_a_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    start_error = APIError("failed to start container")
+    client = RecordingPodmanClient(events, start_error=start_error)
+    backend = FakeBackend(_SPEC, _result(), events)
+    benchmark = FakeBenchmarkClient(_outcome())
     _detector(monkeypatch, events)
 
     with pytest.raises(ExperimentError) as excinfo:
-        run_experiment(_experiment(), backend, client=client, output_dir=tmp_path)
+        run_experiment(_experiment(), backend, client=client, benchmark_client=benchmark)
 
     error = excinfo.value
     assert isinstance(error.__cause__, ContainerRunError)
-    assert error.raw_result is not None
-    assert error.raw_result.exit_code == 3
-    assert error.raw_result.stdout == b"boom"
-    assert HUB_MODEL in str(error)
-    assert "boom" in str(error)
+    assert error.__cause__.__cause__ is start_error
+    assert error.raw_result is None
+    assert benchmark.calls == []
     assert backend.parse_calls == []
-    assert events == ["detect", "plan", "create"]
 
 
-def test_container_failure_message_includes_the_engine_stderr(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_measurement_failure_is_wrapped_with_the_server_logs(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The engine's own diagnostic is surfaced, not just the exit code."""
     events: list[str] = []
     message = b"AssertionError: FlashAttention version not detected."
-    client = RecordingPodmanClient(events, exit_code=1, logs=_frame(2, message))
-    backend = FakeBackend(_PLAN, _result(), events)
+    client = RecordingPodmanClient(events, logs=_frame(2, message))
+    backend = FakeBackend(_SPEC, _result(), events)
+    benchmark = FakeBenchmarkClient(
+        measure_error=ExperimentError("the server never became healthy")
+    )
     _detector(monkeypatch, events)
 
     with pytest.raises(ExperimentError) as excinfo:
-        run_experiment(_experiment(), backend, client=client, output_dir=tmp_path)
+        run_experiment(_experiment(), backend, client=client, benchmark_client=benchmark)
 
-    assert "FlashAttention version not detected." in str(excinfo.value)
-    assert excinfo.value.raw_result is not None
-    assert excinfo.value.raw_result.stderr == message
+    error = excinfo.value
+    assert "the server never became healthy" in str(error)
+    assert "FlashAttention version not detected." in str(error)
+    assert error.raw_result is not None
+    assert error.raw_result.stderr == message
+    assert backend.parse_calls == []
+    assert client.container is not None
+    assert client.container.remove_calls == [True]
 
 
-def test_container_failure_output_is_bounded(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_measurement_failure_output_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     """A chatty engine cannot flood the error message with its whole log."""
-    events: list[str] = []
-    client = RecordingPodmanClient(events, exit_code=1, logs=_frame(2, b"x" * 10000))
-    backend = FakeBackend(_PLAN, _result(), events)
-    _detector(monkeypatch, events)
+    message = _failure_message(monkeypatch, b"x" * 10000)
 
-    with pytest.raises(ExperimentError) as excinfo:
-        run_experiment(_experiment(), backend, client=client, output_dir=tmp_path)
-
-    assert "…" in str(excinfo.value)
-    assert len(str(excinfo.value)) < 10000
+    assert "…" in message
+    assert len(message) < 10000
 
 
 def test_failure_excerpt_keeps_a_root_cause_before_a_long_traceback(
@@ -277,6 +302,29 @@ def test_failure_excerpt_keeps_a_root_cause_before_a_long_traceback(
     assert _ROOT_CAUSE in message
     assert "…" in message
     assert message.index(_ROOT_CAUSE) < message.index("…")
+
+
+def test_failure_excerpt_keeps_the_earliest_root_cause_across_tracebacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frontend wrapper traceback does not hide the engine core's real cause.
+
+    vLLM prints the engine core's traceback first and the frontend's last, with
+    the frontend only restating the failure ("Engine core initialization failed.
+    See root cause above"). The trailing window carries the wrapper, so the
+    excerpt must prepend the earliest exception line — the engine core's — or
+    the real cause is lost.
+    """
+    frames = "\n".join(f'  File "module_{i}.py", line {i}, in <module>' for i in range(80))
+    engine_core = f"{_ROOT_CAUSE}\nTraceback (most recent call last):\n{frames}"
+    wrapper = "RuntimeError: Engine core initialization failed. See root cause above"
+    frontend = f"Traceback (most recent call last):\n{frames}\n{wrapper}"
+    output = f"{engine_core}\n{frontend}".encode()
+
+    message = _failure_message(monkeypatch, output)
+
+    assert _ROOT_CAUSE in message
+    assert message.index(_ROOT_CAUSE) < message.index("RuntimeError: Engine core")
 
 
 def test_failure_excerpt_leaves_a_short_message_unchanged(
@@ -314,97 +362,66 @@ def test_failure_excerpt_stays_bounded_while_keeping_the_root_cause(
     assert len(message) < 3000
 
 
-def test_container_start_failure_is_wrapped_without_a_result(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_stop_failure_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
-    start_error = APIError("failed to start container")
-    client = RecordingPodmanClient(events, start_error=start_error)
-    backend = FakeBackend(_PLAN, _result(), events)
+    stop_error = APIError("stop failed")
+    client = RecordingPodmanClient(events, stop_error=stop_error)
+    backend = FakeBackend(_SPEC, _result(), events)
+    benchmark = FakeBenchmarkClient(_outcome())
     _detector(monkeypatch, events)
 
     with pytest.raises(ExperimentError) as excinfo:
-        run_experiment(_experiment(), backend, client=client, output_dir=tmp_path)
+        run_experiment(_experiment(), backend, client=client, benchmark_client=benchmark)
 
     error = excinfo.value
     assert isinstance(error.__cause__, ContainerRunError)
-    assert error.__cause__.__cause__ is start_error
-    assert error.raw_result is None
+    assert error.__cause__.__cause__ is stop_error
     assert backend.parse_calls == []
+    assert client.container is not None
+    assert client.container.remove_calls == [True]
 
 
-def test_parse_failure_propagates_unchanged(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_parse_failure_propagates_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     client = RecordingPodmanClient(events)
     parse_error = ExperimentError("engine wrote nothing")
-    backend = FakeBackend(_PLAN, _result(), events, parse_error=parse_error)
+    backend = FakeBackend(_SPEC, _result(), events, parse_error=parse_error)
     _detector(monkeypatch, events)
 
     with pytest.raises(ExperimentError) as excinfo:
-        run_experiment(_experiment(), backend, client=client, output_dir=tmp_path)
+        run_experiment(
+            _experiment(),
+            backend,
+            client=client,
+            benchmark_client=FakeBenchmarkClient(_outcome()),
+        )
 
     assert excinfo.value is parse_error
     assert events == ["detect", "plan", "create", "parse_result"]
 
 
-def test_explicit_output_directory_is_used_as_is_and_left_in_place(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_backend_defaults_to_vllm(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     client = RecordingPodmanClient(events)
-    backend = FakeBackend(_PLAN, _result(), events)
-    _detector(monkeypatch, events)
-    output_dir = tmp_path / "results"
-    output_dir.mkdir()
-
-    run_experiment(_experiment(), backend, client=client, output_dir=output_dir)
-
-    assert backend.plan_calls[0][2] == output_dir
-    assert backend.parse_calls[0][2] == output_dir
-    assert output_dir.is_dir()
-
-
-def test_omitted_output_directory_is_temporary_and_removed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-    client = RecordingPodmanClient(events)
-    backend = DirectoryAwareBackend(_PLAN, _result(), events)
-    _detector(monkeypatch, events)
-
-    run_experiment(_experiment(), backend, client=client)
-
-    planned_dir = backend.plan_calls[0][2]
-    assert planned_dir is not None
-    assert backend.parse_calls[0][2] == planned_dir
-    assert not planned_dir.exists()
-
-
-def test_backend_defaults_to_vllm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    events: list[str] = []
-    client = RecordingPodmanClient(events)
-    backend = FakeBackend(_PLAN, _result(), events)
+    backend = FakeBackend(_SPEC, _result(), events)
     _detector(monkeypatch, events)
     monkeypatch.setattr(
         "llm_config_optimization.inference._orchestrate.VLLMBackend", lambda: backend
     )
 
-    result = run_experiment(_experiment(), client=client, output_dir=tmp_path)
+    result = run_experiment(
+        _experiment(), client=client, benchmark_client=FakeBenchmarkClient(_outcome())
+    )
 
     assert result is backend.result
     assert events == ["detect", "plan", "create", "parse_result"]
 
 
-@pytest.mark.parametrize("backend_cls", [FakeBackend, DirectoryAwareBackend])
-def test_backend_doubles_conform_to_the_inference_protocol(
-    backend_cls: type[FakeBackend],
-) -> None:
+def test_backend_doubles_conform_to_the_inference_protocol() -> None:
     """Every backend double passed to ``run_experiment`` satisfies the protocol.
 
     ``run_experiment`` accepts any object with the ``InferenceBackend`` shape, so
-    the doubles must track the protocol as it grows; a missing method would
+    the double must track the protocol as it grows; a missing method would
     otherwise surface only when a test happened to call it.
     """
-    assert isinstance(backend_cls(_PLAN, _result(), []), InferenceBackend)
+    assert isinstance(FakeBackend(_SPEC, _result(), []), InferenceBackend)

@@ -1,17 +1,16 @@
-"""Unit tests for the vLLM container plan.
+"""Unit tests for the vLLM server plan.
 
 ``VLLMBackend.plan``'s observable contract is the
-:class:`~llm_config_optimization.runtime.types.ContainerConfig` it returns plus the
-generated ``runner.sh`` it writes into the output directory: the image and
-device mapping resolved for a target, the container defaults, the mounts the run
-needs, and the self-contained runner that starts the server and takes the
-repeated measurements. These tests assert that returned plan and the runner's
-content directly — no Podman daemon and no inference engine is involved —
-covering every accelerator target, both local and Hub models, the serve/bench
-split, and the measurement controls.
+:class:`~llm_config_optimization.inference.types.ServerSpec` it returns: the
+container configuration (image, device mapping, mounts, environment, published
+port, and the ``vllm serve`` command) plus the health path, cache-reset paths,
+and startup timeout the host client uses. These tests assert that spec directly
+— no Podman daemon and no inference engine is involved — covering every
+accelerator target, both local and Hub models, the serving parameters, and the
+measurement controls. The client command is deliberately absent: the host
+benchmark client owns the workload now.
 """
 
-import shlex
 from pathlib import Path
 
 import pytest
@@ -23,24 +22,20 @@ from llm_config_optimization.inference import (
     DType,
     ExperimentConfig,
     HardwareTarget,
+    HubCheckpoint,
     LLMConfig,
+    LocalCheckpoint,
+    ServerSpec,
     VLLMBackend,
 )
-from llm_config_optimization.runtime import ContainerConfig, Mount
+from llm_config_optimization.runtime import Mount
 
 HUB_MODEL = "meta-llama/Llama-3.1-8B"
 
 _HF_CACHE_HOST = Path.home() / ".cache" / "huggingface"
 _HF_CACHE_TARGET = "/root/.cache/huggingface"
 _MODEL_TARGET = "/model"
-_OUTPUT_TARGET = "/output"
 _CACHE_TARGET = "/vllm-cache"
-_RUNNER_FILENAME = "runner.sh"
-_MANIFEST_PATH = "/output/manifest.json"
-_RUNNER_PATH = "/output/runner.sh"
-_SERVER_LOG_PATH = "/output/server.log"
-_HEALTH_URL = "http://127.0.0.1:8000/health"
-_RESET_URL = "http://127.0.0.1:8000/reset_prefix_cache"
 
 
 def _experiment(
@@ -61,30 +56,20 @@ def _plan(
     experiment: ExperimentConfig,
     hardware: DetectedHardware,
     *,
-    output_dir: Path | None = None,
     backend: VLLMBackend | None = None,
-) -> ContainerConfig:
+) -> ServerSpec:
     """Plan a run with the default backend, or a supplied one."""
-    return (backend if backend is not None else VLLMBackend()).plan(
-        experiment, hardware, output_dir
-    )
+    return (backend if backend is not None else VLLMBackend()).plan(experiment, hardware)
 
 
-def _runner(config: ContainerConfig, output_dir: Path) -> str:
-    """Read the generated runner a plan wrote into ``output_dir``."""
-    return (output_dir / _RUNNER_FILENAME).read_text(encoding="utf-8")
+def _serve(spec: ServerSpec) -> list[str]:
+    """Recover the server command's arguments from the planned container."""
+    return list(spec.container.command)
 
 
-def _array(runner: str, name: str) -> list[str]:
-    """Recover one generated bash array as its list of arguments."""
-    start = runner.index(f"{name}=(\n") + len(f"{name}=(\n")
-    end = runner.index("\n)\n", start)
-    return shlex.split(runner[start:end])
-
-
-def _mount_for(config: ContainerConfig, target: str) -> Mount:
+def _mount_for(spec: ServerSpec, target: str) -> Mount:
     """Return the single mount at ``target``, failing if it is absent or doubled."""
-    matches = [mount for mount in config.volumes if mount.target == target]
+    matches = [mount for mount in spec.container.volumes if mount.target == target]
     assert len(matches) == 1, f"expected one mount at {target!r}, found {matches!r}"
     return matches[0]
 
@@ -98,22 +83,20 @@ def _mount_for(config: ContainerConfig, target: str) -> Mount:
     ],
 )
 def test_each_target_resolves_to_its_image_and_device_mapping(
-    target: HardwareTarget, image: str, devices: tuple[str, ...], tmp_path: Path
+    target: HardwareTarget, image: str, devices: tuple[str, ...]
 ) -> None:
-    config = _plan(_experiment(), DetectedHardware(target, 1), output_dir=tmp_path)
+    spec = _plan(_experiment(), DetectedHardware(target, 1))
 
-    assert config.image == image
-    assert config.devices == devices
+    assert spec.container.image == image
+    assert spec.container.devices == devices
 
 
-def test_cpu_image_is_configurable_for_pinning_a_build(tmp_path: Path) -> None:
+def test_cpu_image_is_configurable_for_pinning_a_build() -> None:
     backend = VLLMBackend(cpu_image="registry.example/vllm-cpu:2025.1")
 
-    config = _plan(
-        _experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path, backend=backend
-    )
+    spec = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), backend=backend)
 
-    assert config.image == "registry.example/vllm-cpu:2025.1"
+    assert spec.container.image == "registry.example/vllm-cpu:2025.1"
 
 
 @pytest.mark.parametrize(
@@ -137,108 +120,109 @@ def test_image_for_honours_a_configured_cpu_image() -> None:
     assert backend.image_for(HardwareTarget.CUDA) == "docker.io/vllm/vllm-openai:latest"
 
 
-def test_shared_memory_defaults_to_eight_gigabytes(tmp_path: Path) -> None:
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 1), output_dir=tmp_path)
+def test_shared_memory_defaults_to_eight_gigabytes() -> None:
+    spec = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 1))
 
-    assert config.shm_size == "8g"
+    assert spec.container.shm_size == "8g"
 
 
-def test_shared_memory_limit_can_be_overridden(tmp_path: Path) -> None:
+def test_shared_memory_limit_can_be_overridden() -> None:
     experiment = _experiment(container=ContainerRuntimeConfig(shm_size="16g"))
 
-    config = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1), output_dir=tmp_path)
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1))
 
-    assert config.shm_size == "16g"
+    assert spec.container.shm_size == "16g"
 
 
-def test_explicit_target_overrides_the_detected_target(tmp_path: Path) -> None:
+def test_explicit_target_overrides_the_detected_target() -> None:
     experiment = _experiment(container=ContainerRuntimeConfig(target=HardwareTarget.CPU))
 
-    config = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 4), output_dir=tmp_path)
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 4))
 
-    assert config.image == "docker.io/vllm/vllm-openai-cpu:latest"
-    assert config.devices == ()
+    assert spec.container.image == "docker.io/vllm/vllm-openai-cpu:latest"
+    assert spec.container.devices == ()
 
 
-def test_explicit_image_overrides_the_target_default(tmp_path: Path) -> None:
+def test_explicit_image_overrides_the_target_default() -> None:
     experiment = _experiment(container=ContainerRuntimeConfig(image="custom/vllm:dev"))
 
-    config = _plan(experiment, DetectedHardware(HardwareTarget.ROCM, 1), output_dir=tmp_path)
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.ROCM, 1))
 
-    assert config.image == "custom/vllm:dev"
-    assert config.devices == ("/dev/kfd", "/dev/dri")
+    assert spec.container.image == "custom/vllm:dev"
+    assert spec.container.devices == ("/dev/kfd", "/dev/dri")
 
 
-def test_tensor_parallel_size_defaults_to_the_detected_device_count(tmp_path: Path) -> None:
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 4), output_dir=tmp_path)
+def test_plan_publishes_the_server_port_and_keeps_the_image_entrypoint() -> None:
+    """The server must be reachable from the host, so its port is published.
 
-    serve = _array(_runner(config, tmp_path), "SERVE_ARGS")
+    vLLM's official image already starts ``vllm serve``, so the plan leaves the
+    entrypoint alone and only supplies the serve arguments as the command.
+    """
+    spec = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1))
+
+    assert spec.container.entrypoint is None
+    assert spec.container.ports == {"8000": None}
+    assert spec.container.command[0] == "--model"
+
+
+def test_tensor_parallel_size_defaults_to_the_detected_device_count() -> None:
+    spec = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 4))
+
+    serve = _serve(spec)
     assert serve[serve.index("--tensor-parallel-size") + 1] == "4"
 
 
-def test_explicit_tensor_parallel_size_is_left_alone(tmp_path: Path) -> None:
+def test_explicit_tensor_parallel_size_is_left_alone() -> None:
     experiment = _experiment(llm=LLMConfig(tensor_parallel_size=2))
 
-    config = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 4), output_dir=tmp_path)
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 4))
 
-    serve = _array(_runner(config, tmp_path), "SERVE_ARGS")
+    serve = _serve(spec)
     assert serve[serve.index("--tensor-parallel-size") + 1] == "2"
 
 
-def test_plan_runs_the_generated_runner_with_the_image_entrypoint_overridden(
-    tmp_path: Path,
-) -> None:
-    """vLLM images start ``vllm serve``; the plan must run the generated runner."""
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
+def test_dev_mode_is_enabled_so_the_cache_reset_endpoint_is_available() -> None:
+    spec = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1))
 
-    assert config.entrypoint == ("/bin/bash",)
-    assert config.command == (_RUNNER_PATH,)
-    assert (tmp_path / _RUNNER_FILENAME).is_file()
+    assert spec.container.env["VLLM_SERVER_DEV_MODE"] == "1"
 
 
-def test_dev_mode_is_enabled_so_the_cache_reset_endpoint_is_available(tmp_path: Path) -> None:
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
-
-    assert config.env["VLLM_SERVER_DEV_MODE"] == "1"
-
-
-def test_a_callers_dev_mode_choice_takes_precedence(tmp_path: Path) -> None:
+def test_a_callers_dev_mode_choice_takes_precedence() -> None:
     experiment = _experiment(container=ContainerRuntimeConfig(env={"VLLM_SERVER_DEV_MODE": "0"}))
 
-    config = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1))
 
-    assert config.env["VLLM_SERVER_DEV_MODE"] == "0"
-
-
-def test_serve_command_carries_the_model_and_loopback_binding(tmp_path: Path) -> None:
-    """The server is addressed on container loopback, never on a host port."""
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
-
-    serve = _array(_runner(config, tmp_path), "SERVE_ARGS")
-    assert serve[:6] == ["--model", HUB_MODEL, "--host", "127.0.0.1", "--port", "8000"]
+    assert spec.container.env["VLLM_SERVER_DEV_MODE"] == "0"
 
 
-def test_serve_and_bench_arguments_reach_their_own_command(tmp_path: Path) -> None:
-    experiment = _experiment(
-        benchmark=BenchmarkConfig(
-            model=HUB_MODEL,
-            dataset_name="sharegpt",
-            dataset_path="/data/prompts.jsonl",
-            num_prompts=100,
-            input_len=128,
-            output_len=64,
-        ),
-        llm=LLMConfig(dtype=DType.BFLOAT16, tensor_parallel_size=2),
-    )
+def test_serve_command_carries_the_model_served_name_and_host_binding() -> None:
+    """The server binds on every interface and is addressed by its served name."""
+    spec = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1))
 
-    config = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 2), output_dir=tmp_path)
-    runner = _runner(config, tmp_path)
-
-    assert _array(runner, "SERVE_ARGS") == [
+    assert _serve(spec)[:8] == [
         "--model",
         HUB_MODEL,
+        "--served-model-name",
+        HUB_MODEL,
         "--host",
-        "127.0.0.1",
+        "0.0.0.0",
+        "--port",
+        "8000",
+    ]
+
+
+def test_serving_parameters_reach_the_server_command() -> None:
+    experiment = _experiment(llm=LLMConfig(dtype=DType.BFLOAT16, tensor_parallel_size=2))
+
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 2))
+
+    assert _serve(spec) == [
+        "--model",
+        HUB_MODEL,
+        "--served-model-name",
+        HUB_MODEL,
+        "--host",
+        "0.0.0.0",
         "--port",
         "8000",
         "--dtype",
@@ -246,83 +230,21 @@ def test_serve_and_bench_arguments_reach_their_own_command(tmp_path: Path) -> No
         "--tensor-parallel-size",
         "2",
     ]
-    assert _array(runner, "BENCH_ARGS") == [
-        "--model",
-        HUB_MODEL,
-        "--dataset-name",
-        "sharegpt",
-        "--dataset-path",
-        "/data/prompts.jsonl",
-        "--num-prompts",
-        "100",
-        "--input-len",
-        "128",
-        "--output-len",
-        "64",
-    ]
 
 
-def test_random_dataset_uses_the_random_length_flags(tmp_path: Path) -> None:
-    """vLLM's random dataset reads --random-*-len and ignores the generic flags."""
-    experiment = _experiment(
-        benchmark=BenchmarkConfig(
-            model=HUB_MODEL,
-            dataset_name="random",
-            num_prompts=8,
-            input_len=32,
-            output_len=8,
-        ),
-    )
-
-    config = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
-
-    assert _array(_runner(config, tmp_path), "BENCH_ARGS") == [
-        "--model",
-        HUB_MODEL,
-        "--dataset-name",
-        "random",
-        "--num-prompts",
-        "8",
-        "--random-input-len",
-        "32",
-        "--random-output-len",
-        "8",
-    ]
-
-
-def test_omitted_dataset_name_uses_the_random_length_flags(tmp_path: Path) -> None:
-    """vLLM defaults to the random dataset when no dataset name is given."""
-    experiment = _experiment(benchmark=BenchmarkConfig(model=HUB_MODEL, input_len=32, output_len=8))
-
-    config = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
-
-    bench = _array(_runner(config, tmp_path), "BENCH_ARGS")
-    assert "--random-input-len" in bench
-    assert "--random-output-len" in bench
-    assert "--input-len" not in bench
-    assert "--output-len" not in bench
-
-
-def test_unset_workload_fields_are_omitted(tmp_path: Path) -> None:
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
-
-    assert _array(_runner(config, tmp_path), "BENCH_ARGS") == ["--model", HUB_MODEL]
-
-
-def test_extra_args_land_on_the_server_command(tmp_path: Path) -> None:
+def test_extra_args_land_on_the_server_command() -> None:
     backend = VLLMBackend(extra_args=("--enforce-eager",))
     experiment = _experiment(llm=LLMConfig(dtype=DType.FLOAT16))
 
-    config = _plan(
-        experiment, DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path, backend=backend
-    )
-    runner = _runner(config, tmp_path)
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1), backend=backend)
 
-    assert _array(runner, "SERVE_ARGS") == [
+    assert _serve(spec) == [
         "--model",
         HUB_MODEL,
+        "--served-model-name",
+        HUB_MODEL,
         "--host",
-        "127.0.0.1",
+        "0.0.0.0",
         "--port",
         "8000",
         "--dtype",
@@ -331,88 +253,109 @@ def test_extra_args_land_on_the_server_command(tmp_path: Path) -> None:
         "1",
         "--enforce-eager",
     ]
-    assert "--enforce-eager" not in _array(runner, "BENCH_ARGS")
 
 
-def test_runner_embeds_the_measurement_controls(tmp_path: Path) -> None:
+def test_health_reset_and_startup_timeout_come_from_the_benchmark() -> None:
     experiment = _experiment(
-        benchmark=BenchmarkConfig(
-            model=HUB_MODEL,
-            repetitions=5,
-            warmup=2,
-            startup_timeout=123.0,
-            timeout=456.0,
-        )
+        benchmark=BenchmarkConfig(model=HUB_MODEL, startup_timeout=123.0, timeout=456.0)
     )
 
-    config = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
-    runner = _runner(config, tmp_path)
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1))
 
-    assert "REPETITIONS=5" in runner
-    assert "WARMUP=2" in runner
-    assert "STARTUP_TIMEOUT=123" in runner
-    assert "OVERALL_TIMEOUT=456" in runner
-
-
-def test_runner_defaults_to_three_measured_and_one_warmup_run(tmp_path: Path) -> None:
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
-    runner = _runner(config, tmp_path)
-
-    assert "REPETITIONS=3" in runner
-    assert "WARMUP=1" in runner
-    assert "STARTUP_TIMEOUT=600" in runner
+    assert spec.health_path == "/health"
+    assert spec.health_timeout == 123.0
+    assert spec.reset_paths == (
+        "/reset_prefix_cache",
+        "/reset_mm_cache",
+        "/reset_encoder_cache",
+    )
 
 
-def test_unbounded_run_leaves_the_runner_without_a_deadline(tmp_path: Path) -> None:
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
+def test_hub_model_is_passed_through_without_a_model_mount() -> None:
+    spec = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 1))
 
-    assert "OVERALL_TIMEOUT=\n" in _runner(config, tmp_path)
-
-
-def test_runner_polls_health_and_resets_the_caches(tmp_path: Path) -> None:
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
-    runner = _runner(config, tmp_path)
-
-    assert _HEALTH_URL in runner
-    assert _RESET_URL in runner
-    assert _SERVER_LOG_PATH in runner
-    assert "vllm serve" in runner
-    assert "vllm bench serve" in runner
-
-
-def test_runner_writes_a_manifest_and_enforces_a_strict_majority(tmp_path: Path) -> None:
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
-    runner = _runner(config, tmp_path)
-
-    assert _MANIFEST_PATH in runner
-    assert '"failed_runs"' in runner
-    assert '"runs"' in runner
-    assert "successes * 2" in runner
-
-
-def test_runner_guards_the_empty_success_list_under_set_u(tmp_path: Path) -> None:
-    """A trial where every run failed still writes a manifest without tripping ``set -u``."""
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
-
-    assert '${success_files[@]+"${success_files[@]}"}' in _runner(config, tmp_path)
-
-
-def test_runner_saves_each_run_with_a_per_index_seed(tmp_path: Path) -> None:
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
-    runner = _runner(config, tmp_path)
-
-    assert "--save-result" in runner
-    assert "--result-filename" in runner
-    assert "run-${run_index}.json" in runner
-    assert '"${run_index}"' in runner
-
-
-def test_hub_model_is_passed_through_without_a_model_mount(tmp_path: Path) -> None:
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 1), output_dir=tmp_path)
-
-    serve = _array(_runner(config, tmp_path), "SERVE_ARGS")
+    serve = _serve(spec)
     assert serve[serve.index("--model") + 1] == HUB_MODEL
-    assert all(mount.target != _MODEL_TARGET for mount in config.volumes)
+    assert all(mount.target != _MODEL_TARGET for mount in spec.container.volumes)
+
+
+def test_model_request_resolves_an_existing_host_path(tmp_path: Path) -> None:
+    model_path = tmp_path / "checkpoint"
+    model_path.mkdir()
+
+    request = VLLMBackend().model_request(str(model_path))
+
+    assert request == LocalCheckpoint(path=model_path.resolve())
+
+
+def test_model_request_resolves_a_hub_id_to_a_snapshot_request() -> None:
+    request = VLLMBackend().model_request(HUB_MODEL)
+
+    assert request == HubCheckpoint(repo_id=HUB_MODEL)
+
+
+def test_a_resolved_path_is_mounted_and_the_served_name_is_kept(tmp_path: Path) -> None:
+    """The composition root's resolved snapshot is mounted without renaming the model."""
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    experiment = _experiment(benchmark=BenchmarkConfig(model=HUB_MODEL, resolved_path=snapshot))
+
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1))
+
+    mount = _mount_for(spec, _MODEL_TARGET)
+    assert mount.source == str(snapshot)
+    assert mount.read_only is True
+    serve = _serve(spec)
+    assert serve[serve.index("--model") + 1] == _MODEL_TARGET
+    assert serve[serve.index("--served-model-name") + 1] == HUB_MODEL
+
+
+def test_a_resolved_path_takes_precedence_over_the_model_string(tmp_path: Path) -> None:
+    """The resolved checkpoint is mounted even when the model string names a path."""
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    experiment = _experiment(benchmark=BenchmarkConfig(model=str(other), resolved_path=snapshot))
+
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1))
+
+    assert _mount_for(spec, _MODEL_TARGET).source == str(snapshot)
+
+
+def test_a_hub_snapshot_mounts_its_cache_root_so_symlinks_resolve(tmp_path: Path) -> None:
+    """An HF cache snapshot is mounted through its cache root, not on its own.
+
+    A snapshot's files are relative symlinks that can hop through the cache's
+    shared ``blobs`` store before reaching the real file (Xet-backed
+    downloads), so only mounting the model's repository would still leave the
+    weights dangling. The cache hub root must be the mount source, with the
+    server pointed at the snapshot inside it.
+    """
+    hub = tmp_path / "hub"
+    repo = hub / "models--org--name"
+    snapshot = repo / "snapshots" / "abc123"
+    repo_blobs = repo / "blobs"
+    shared_blobs = hub / "blobs" / "01"
+    snapshot.mkdir(parents=True)
+    repo_blobs.mkdir()
+    shared_blobs.mkdir(parents=True)
+    (shared_blobs / "deadbeef").write_text("{}")
+    (repo_blobs / "cafebabe").symlink_to("../../blobs/01/deadbeef")
+    (snapshot / "model.safetensors").symlink_to("../../blobs/cafebabe")
+    experiment = _experiment(benchmark=BenchmarkConfig(model=HUB_MODEL, resolved_path=snapshot))
+
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1))
+
+    mount = _mount_for(spec, _MODEL_TARGET)
+    assert mount.source == str(hub)
+    # Both hops of the weights symlink resolve inside the mounted tree.
+    assert (Path(mount.source) / "blobs" / "01" / "deadbeef").is_file()
+    serve = _serve(spec)
+    assert (
+        serve[serve.index("--model") + 1] == f"{_MODEL_TARGET}/models--org--name/snapshots/abc123"
+    )
+    assert serve[serve.index("--served-model-name") + 1] == HUB_MODEL
 
 
 def test_local_model_is_mounted_read_only_and_addressed_in_container(tmp_path: Path) -> None:
@@ -420,20 +363,20 @@ def test_local_model_is_mounted_read_only_and_addressed_in_container(tmp_path: P
     model_path.mkdir()
     experiment = _experiment(benchmark=BenchmarkConfig(model=str(model_path)))
 
-    config = _plan(experiment, DetectedHardware(HardwareTarget.ROCM, 1), output_dir=tmp_path)
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.ROCM, 1))
 
-    mount = _mount_for(config, _MODEL_TARGET)
+    mount = _mount_for(spec, _MODEL_TARGET)
     assert mount.source == str(model_path.resolve())
     assert mount.read_only is True
     assert mount.options == ("z",)
-    serve = _array(_runner(config, tmp_path), "SERVE_ARGS")
+    serve = _serve(spec)
     assert serve[serve.index("--model") + 1] == _MODEL_TARGET
 
 
-def test_hugging_face_cache_is_mounted_for_weight_reuse(tmp_path: Path) -> None:
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 1), output_dir=tmp_path)
+def test_hugging_face_cache_is_mounted_for_weight_reuse() -> None:
+    spec = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 1))
 
-    mount = _mount_for(config, _HF_CACHE_TARGET)
+    mount = _mount_for(spec, _HF_CACHE_TARGET)
     assert mount.source == str(_HF_CACHE_HOST)
     assert mount.read_only is False
     assert mount.options == ("z",)
@@ -444,47 +387,31 @@ def test_a_cache_directory_is_mounted_and_redirected(tmp_path: Path) -> None:
     cache = tmp_path / "cache"
     backend = VLLMBackend(cache_dir=cache)
 
-    config = _plan(
-        _experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path, backend=backend
-    )
+    spec = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), backend=backend)
 
-    mount = _mount_for(config, _CACHE_TARGET)
+    mount = _mount_for(spec, _CACHE_TARGET)
     assert mount.source == str(cache)
     assert mount.options == ("z",)
     assert cache.is_dir()
-    assert config.env["VLLM_CACHE_ROOT"] == "/vllm-cache/vllm"
-    assert config.env["TRITON_CACHE_DIR"] == "/vllm-cache/triton"
+    assert spec.container.env["VLLM_CACHE_ROOT"] == "/vllm-cache/vllm"
+    assert spec.container.env["TRITON_CACHE_DIR"] == "/vllm-cache/triton"
 
 
-def test_no_cache_directory_means_no_mount_or_cache_env(tmp_path: Path) -> None:
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
+def test_no_cache_directory_means_no_mount_or_cache_env() -> None:
+    spec = _plan(_experiment(), DetectedHardware(HardwareTarget.CPU, 1))
 
-    assert all(mount.target != _CACHE_TARGET for mount in config.volumes)
-    assert "VLLM_CACHE_ROOT" not in config.env
+    assert all(mount.target != _CACHE_TARGET for mount in spec.container.volumes)
+    assert "VLLM_CACHE_ROOT" not in spec.container.env
 
 
 def test_a_callers_cache_env_takes_precedence(tmp_path: Path) -> None:
     backend = VLLMBackend(cache_dir=tmp_path / "cache")
     experiment = _experiment(container=ContainerRuntimeConfig(env={"VLLM_CACHE_ROOT": "/custom"}))
 
-    config = _plan(
-        experiment, DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path, backend=backend
-    )
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1), backend=backend)
 
-    assert config.env["VLLM_CACHE_ROOT"] == "/custom"
-    assert config.env["TRITON_CACHE_DIR"] == "/vllm-cache/triton"
-
-
-def test_output_directory_is_created_and_mounted(tmp_path: Path) -> None:
-    output_dir = tmp_path / "results"
-
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 1), output_dir=output_dir)
-
-    assert output_dir.is_dir()
-    mount = _mount_for(config, _OUTPUT_TARGET)
-    assert mount.source == str(output_dir)
-    assert mount.options == ("z",)
-    assert (output_dir / _RUNNER_FILENAME).is_file()
+    assert spec.container.env["VLLM_CACHE_ROOT"] == "/custom"
+    assert spec.container.env["TRITON_CACHE_DIR"] == "/vllm-cache/triton"
 
 
 def test_caller_volumes_precede_the_backend_mounts(tmp_path: Path) -> None:
@@ -496,32 +423,31 @@ def test_caller_volumes_precede_the_backend_mounts(tmp_path: Path) -> None:
         benchmark=BenchmarkConfig(model=str(model_path)),
     )
 
-    config = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1), output_dir=tmp_path)
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1))
 
-    assert [mount.target for mount in config.volumes] == [
+    assert [mount.target for mount in spec.container.volumes] == [
         "/data",
         _HF_CACHE_TARGET,
         _MODEL_TARGET,
-        _OUTPUT_TARGET,
     ]
-    assert config.volumes[0] == caller_mount
+    assert spec.container.volumes[0] == caller_mount
 
 
-def test_selinux_options_are_copied_into_the_planned_container(tmp_path: Path) -> None:
+def test_selinux_options_are_copied_into_the_planned_container() -> None:
     experiment = _experiment(container=ContainerRuntimeConfig(selinux_opts=("disable",)))
 
-    config = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1), output_dir=tmp_path)
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1))
 
-    assert config.selinux_opts == ("disable",)
-
-
-def test_absent_selinux_options_stay_automatic_in_the_planned_container(tmp_path: Path) -> None:
-    config = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 1), output_dir=tmp_path)
-
-    assert config.selinux_opts is None
+    assert spec.container.selinux_opts == ("disable",)
 
 
-def test_container_limits_environment_and_pull_policy_are_forwarded(tmp_path: Path) -> None:
+def test_absent_selinux_options_stay_automatic_in_the_planned_container() -> None:
+    spec = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 1))
+
+    assert spec.container.selinux_opts is None
+
+
+def test_container_limits_environment_and_pull_policy_are_forwarded() -> None:
     experiment = _experiment(
         container=ContainerRuntimeConfig(
             mem_limit="16g",
@@ -531,9 +457,8 @@ def test_container_limits_environment_and_pull_policy_are_forwarded(tmp_path: Pa
         benchmark=BenchmarkConfig(model=HUB_MODEL, timeout=600.0),
     )
 
-    config = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1), output_dir=tmp_path)
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1))
 
-    assert config.mem_limit == "16g"
-    assert dict(config.env) == {"HF_TOKEN": "secret", "VLLM_SERVER_DEV_MODE": "1"}
-    assert config.pull_policy == "always"
-    assert config.timeout == 600.0
+    assert spec.container.mem_limit == "16g"
+    assert dict(spec.container.env) == {"HF_TOKEN": "secret", "VLLM_SERVER_DEV_MODE": "1"}
+    assert spec.container.pull_policy == "always"

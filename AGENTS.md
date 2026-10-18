@@ -15,10 +15,10 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
 | Package         | Owns                                                                                                 | Key files |
 | --------------- | ---------------------------------------------------------------------------------------------------- | --------- |
 | `search_space/` | Engine-neutral definition types, the tunable registry, the YAML loader, engine-agnostic and backend-support validation | `types.py`, `registry.py`, `loader.py`, `validation.py` |
-| `inference/`    | Engine-neutral experiment surface (the `InferenceBackend` protocol) plus the vLLM backend and hardware detection | `types.py`, `_orchestrate.py`, `_vllm.py`, `hardware.py` |
-| `runtime/`      | Backend-agnostic container types and the Podman client plus SELinux probe                            | `types.py`, `_podman.py`, `_selinux.py` |
+| `inference/`    | Engine-neutral experiment surface (the `InferenceBackend` protocol and `ServerSpec`) plus the vLLM backend, the host benchmark client, and hardware detection | `types.py`, `_orchestrate.py`, `_benchmark.py`, `_vllm.py`, `hardware.py` |
+| `runtime/`      | Backend-agnostic container types, the detached start/stop lifecycle, the Podman client, and the SELinux probe | `types.py`, `_podman.py`, `_selinux.py` |
 | `optimization/` | The Optuna adapter: maps spec kinds to suggestions and drives a study                                | `types.py`, `_optuna.py` |
-| `cli/`          | Composition root: argument parsing, base-config construction, model download progress, log/TUI reporters, summary/writer, exit codes | `arguments.py`, `config.py`, `download.py`, `log.py`, `tui.py`, `summary.py`, `__init__.py` |
+| `cli/`          | Composition root: argument parsing, the engine registry, base-config construction, model download progress, log/TUI reporters, summary/writer, exit codes | `arguments.py`, `config.py`, `download.py`, `log.py`, `tui.py`, `summary.py`, `__init__.py` |
 
 ### Invariants
 
@@ -38,28 +38,40 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
   checkpoint's metadata cannot be read. Reading the checkpoint and the
   method-to-spelling mapping live in `inference/_vllm.py`, so the
   engine-neutral surfaces carry no checkpoint vocabulary.
-- The search space is **total**: every tunable in `TUNABLE_PARAMETERS` must be
-  declared, so a value never silently falls back to an engine default.
+- The search space is **total over the backend's applicable set**: every
+  parameter the selected backend reports in `applicable_parameters` must be
+  declared, so a value never silently falls back to an engine default. The
+  registry itself stays engine-neutral; a backend that lacks a parameter (for
+  example llama.cpp has no `tensor_parallel_size`) simply omits it.
+- A trial is host-driven: the backend plans an engine-neutral `ServerSpec` and
+  the orchestrator starts the server container, drives it with the host
+  benchmark client, stops it, and hands the measured outcome to
+  `parse_result`. Neither the orchestrator nor the client learns an engine's
+  vocabulary — health and cache-reset paths come from the spec.
 
 ### Extension recipes
 
 - **New inference engine** — implement `InferenceBackend` (`inference/types.py`):
-  `validate`, `validate_model`, `image_for`, `plan`, `parse_result`. The file
+  `applicable_parameters`, `validate`, `validate_model`, `model_request`,
+  `image_for`, `plan`, `parse_result`. `plan` returns a `ServerSpec`, so the
+  shared host client and orchestrator need no engine-specific code. The file
   format and the layers above are unchanged, so a second engine is an addition,
   not a rewrite.
 - **New tunable parameter** — see the checklist below; the search space is
-  total, so this touches code, both example files, the README, and the tests in
-  one change.
-- **New container runtime** — implement `run_container`/`pull_image` against the
-  types in `runtime/types.py`; keep `_podman.py` engine-free.
+  total over a backend's applicable set, so this touches code, both example
+  files, the README, and the tests in one change.
+- **New container runtime** — implement `run_container`, `start_container`
+  (the detached lifecycle), and `pull_image` against the types in
+  `runtime/types.py`; keep `_podman.py` engine-free.
 
 ### Checklist: adding a new tunable parameter
 
 A tunable parameter is declared in the registry, must be declared in every
-space, and must be forwarded by the backend. Because the search space is
-**total**, adding one is not additive: every existing definition (examples,
-README snippets, test fixtures) becomes invalid until it declares the new
-parameter, and the loader will report it as a missing tunable.
+space whose backend forwards it, and must be forwarded by the backend. Because
+the search space is **total over a backend's applicable set**, adding one is
+not additive for a backend that forwards it: every existing definition for that
+backend (examples, README snippets, test fixtures) becomes invalid until it
+declares the new parameter, and the loader will report it as a missing tunable.
 
 Code:
 
@@ -91,8 +103,9 @@ Code:
 Docs and examples:
 
 - [ ] `README.md` — add a row to the *Tunable parameters* table, fix the
-  parameter count in the surrounding prose ("all seven parameters"), and add the
-  new dimension to the example YAML snippets so they stay complete.
+  parameter count in the surrounding prose ("vLLM forwards all seven parameters
+  below"), and add the new dimension to the example YAML snippets so they stay
+  complete.
 - [ ] `examples/space-full.yaml` — declare the new parameter over its full range.
 - [ ] `examples/space-all-fixed.yaml` — declare the new parameter pinned to one
   value.
@@ -116,13 +129,17 @@ Tests:
 
 ### Data flow
 
-`cli.main` loads and engine-agnostically validates the space, asks the backend to
-`validate` it against the resolved hardware, builds the base configuration,
-resolves the model to a local directory, asks the backend to `validate_model` it
-against that checkpoint, pulls the image, then calls `optimization.optimize`.
-Each trial: Optuna samples a point → `inference` plans a container run →
-`runtime` executes it → the backend parses the result → the reporter callback
-runs. `cli/__init__.py` maps outcomes onto exit codes.
+`cli.main` loads and engine-agnostically validates the space against the
+selected backend's `applicable_parameters`, asks the backend to `validate` it
+against the resolved hardware, builds the base configuration, asks the
+backend's `model_request` what to fetch, resolves that to a local path, asks the
+backend to `validate_model` it against that checkpoint, pulls the image, then
+calls `optimization.optimize`. Each trial: Optuna samples a point → `inference`
+plans a `ServerSpec` → `runtime` starts the server container detached and
+resolves its host port → the host benchmark client waits for health, takes the
+warmup and measured runs, and aggregates them → `runtime` stops the container →
+the backend parses the outcome into a result → the reporter callback runs.
+`cli/__init__.py` maps outcomes onto exit codes.
 
 ## Code style
 

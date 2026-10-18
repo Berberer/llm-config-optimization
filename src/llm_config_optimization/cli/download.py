@@ -1,18 +1,20 @@
-"""Hugging Face snapshot download with a single, legible progress line.
+"""Hugging Face download with a single, legible progress line.
 
-The preparation stage resolves a Hugging Face id to a local snapshot by calling
-:func:`huggingface_hub.snapshot_download`. Left to itself the Hub draws several
-bars — a per-file transfer bar, a reconstruction bar, and the file-count bar
-driven by its thread map — and writes them to stderr. The bars interleave, the
-generic descriptions never name the model being fetched, and a download that
-takes minutes looks the same as any other.
+The preparation stage resolves a model to a local path by calling
+:func:`huggingface_hub.snapshot_download` for a whole repository or
+:func:`huggingface_hub.hf_hub_download` for one file. Left to itself the Hub
+draws several bars — a per-file transfer bar, a reconstruction bar, and the
+file-count bar driven by its thread map — and writes them to stderr. The bars
+interleave, the generic descriptions never name the model being fetched, and a
+download that takes minutes looks the same as any other.
 
-This module replaces that rendering with exactly one line: the file-count bar
-created by the Hub's thread map, renamed to the model and written to the CLI's
-progress stream. The file bar is kept because it has a stable total from the
-first frame, so its percentage is honest; the Hub's byte-transfer bar has no
-total until each file begins and is therefore disabled. The named transfer and
-reconstruction bars are disabled so only the kept line renders.
+This module replaces that rendering with exactly one line. For a snapshot it
+keeps the file-count bar created by the Hub's thread map, renamed to the model
+and written to the CLI's progress stream; the file bar is kept because it has a
+stable total from the first frame, so its percentage is honest, while the Hub's
+byte-transfer bar has no total until each file begins. For a single file it
+keeps the byte-transfer bar instead, because the file-count bar does not exist
+then. In both cases the other bars are disabled so only the kept line renders.
 
 Hugging Face's progress internals are touched only here, so a future change to
 the Hub's bar layout is confined to this module. The same is true of the Hub's
@@ -27,7 +29,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TextIO
 
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from huggingface_hub.utils import tqdm
 
 __all__ = ["download_model"]
@@ -92,65 +94,100 @@ def _hub_warning_handler(stream: TextIO) -> Generator[None]:
         logger.propagate = previous_propagate
 
 
-def _single_line_progress(model: str, stream: TextIO) -> type[tqdm]:
-    """Build the ``tqdm`` subclass :func:`download_model` passes to the Hub.
+def _single_bar_progress(
+    desc: str, stream: TextIO, *, keep: Callable[[str | None], bool]
+) -> type[tqdm]:
+    """Build the ``tqdm`` subclass a download passes to the Hub.
 
-    ``snapshot_download`` creates its transfer and reconstruction bars with a
-    ``name`` while the thread map's file-count bar is created without one, so a
-    bar is identified by the presence of that keyword. A named bar is disabled
-    so it never renders; the unnamed file-count bar keeps its default rendering
-    but has its description rewritten to name the model, its output redirected
-    to ``stream``, and its rate-free :data:`_FILE_BAR_FORMAT` applied, which is
-    what makes it the only visible line.
+    The Hub creates one bar per role and identifies each with a ``name``
+    keyword: a snapshot's file-count bar is unnamed while its transfer and
+    reconstruction bars are named, and a single-file transfer names its bar
+    after the transfer. ``keep`` decides, from that name, which bar renders;
+    every other bar is disabled so exactly one line reaches ``stream``. The
+    kept bar is renamed to ``desc``, redirected to ``stream``, and given the
+    rate-free :data:`_FILE_BAR_FORMAT` unless the Hub already chose a format.
     """
 
-    class _SingleLineProgress(tqdm):
-        """A Hub progress bar that renders only the unnamed file-count bar."""
+    class _SingleBarProgress(tqdm):
+        """A Hub progress bar that renders only the bar ``keep`` selects."""
 
         def __init__(self, *args: object, **kwargs: object) -> None:
-            name = kwargs.pop("name", None)
-            if name is None:
-                kwargs["desc"] = f"downloading {model}"
+            raw_name = kwargs.pop("name", None)
+            name = raw_name if isinstance(raw_name, str) else None
+            if keep(name):
+                kwargs["desc"] = desc
                 kwargs["file"] = stream
                 kwargs.setdefault("bar_format", _FILE_BAR_FORMAT)
             else:
                 kwargs["disable"] = True
             super().__init__(*args, **kwargs)
 
-    return _SingleLineProgress
+    return _SingleBarProgress
+
+
+def _keep_snapshot_bar(name: str | None) -> bool:
+    """Select the snapshot download's unnamed file-count bar."""
+    return name is None
+
+
+def _keep_file_bar(name: str | None) -> bool:
+    """Select a single-file download's byte-transfer bar.
+
+    The Hub names the plain HTTP transfer ``huggingface_hub.http_get`` and the
+    Xet transfer ``<name>.transfer``; the Xet reconstruction bar shares the base
+    name and is disabled so only the transfer line renders.
+    """
+    return name is not None and (name == "huggingface_hub.http_get" or name.endswith(".transfer"))
 
 
 def download_model(
-    model: str,
+    repo_id: str,
     stream: TextIO,
     *,
+    filename: str | None = None,
     download: Callable[..., str] = snapshot_download,
+    download_file: Callable[..., str] = hf_hub_download,
 ) -> Path:
-    """Download ``model`` to the Hub cache, rendering one progress line.
+    """Download ``repo_id`` to the Hub cache, rendering one progress line.
 
-    The snapshot is fetched with a custom :class:`huggingface_hub.utils.tqdm`
-    subclass that shows a single line — ``downloading <model>: 40%|…| 4/10`` —
-    on ``stream``, so a long download names what it is fetching and does not
-    flood the terminal. A temporary logging handler on the Hub's logger writes
-    any warning it emits on its own line on ``stream``, terminated ahead of the
-    progress bar, so a mid-download warning survives the next refresh. The
-    resolved snapshot directory is returned as a path, ready to be mounted or
-    inspected.
+    With no ``filename`` the whole repository snapshot is fetched, and the
+    snapshot directory is returned. With a ``filename`` only that one file is
+    fetched — a single GGUF quant, for example — and its path in the cache is
+    returned, so a caller that needs one file never downloads its siblings.
+    Either way the transfer renders as a single line on ``stream`` —
+    ``downloading <repo>: 40%|…| 4/10`` for a snapshot, or
+    ``downloading <repo>/<file>: 40%|…| 1.2G/3.0G`` for one file — so a long
+    download names what it is fetching and does not flood the terminal. A
+    temporary logging handler on the Hub's logger writes any warning it emits
+    on its own line on ``stream``, terminated ahead of the progress bar, so a
+    mid-download warning survives the next refresh.
 
     Args:
-        model: The Hugging Face repository id to download.
+        repo_id: The Hugging Face repository id to download.
         stream: The CLI progress stream the single line is written to.
-        download: The download callable, injectable so tests can drive the
-            rendering without the network. Defaults to
+        filename: An optional single file to fetch from the repository; ``None``
+            fetches the whole snapshot.
+        download: The snapshot download callable, injectable so tests can drive
+            the rendering without the network. Defaults to
             :func:`huggingface_hub.snapshot_download`.
+        download_file: The single-file download callable, injectable for the
+            same reason. Defaults to :func:`huggingface_hub.hf_hub_download`.
 
     Returns:
-        The local snapshot directory the model was downloaded into.
+        The local snapshot directory, or the downloaded file's path when
+        ``filename`` was given.
 
     Raises:
         Exception: Whatever the download callable raises; the caller maps it to
             the CLI's failure contract.
     """
-    progress = _single_line_progress(model, stream)
     with _hub_warning_handler(stream):
-        return Path(download(model, tqdm_class=progress))
+        if filename is None:
+            progress = _single_bar_progress(
+                f"downloading {repo_id}", stream, keep=_keep_snapshot_bar
+            )
+            return Path(download(repo_id, tqdm_class=progress))
+        progress = _single_bar_progress(
+            f"downloading {repo_id}/{filename}", stream, keep=_keep_file_bar
+        )
+        return Path(download_file(repo_id, filename, tqdm_class=progress))

@@ -25,19 +25,25 @@ import yaml
 from fakes import FakeBackend, FakePodmanClient
 from llm_config_optimization.cli import main
 from llm_config_optimization.inference import (
+    BenchmarkOutcome,
     DetectedHardware,
     ExperimentConfig,
     ExperimentError,
     ExperimentResult,
     HardwareTarget,
     RunMetrics,
+    ServerSpec,
     VLLMBackend,
 )
 from llm_config_optimization.runtime import ContainerConfig, ContainerResult
 from llm_config_optimization.search_space import TUNABLE_PARAMETERS
 
-PLAN = ContainerConfig(image="fake/engine:latest", command=("bench",))
-"""The canned container plan the fake backend returns."""
+PLAN = ServerSpec(
+    container=ContainerConfig(image="fake/engine:latest", command=("serve",), ports={"8000": None}),
+    health_path="/health",
+    health_timeout=600.0,
+)
+"""The canned server plan the fake backend returns."""
 
 RESULT = ExperimentResult(
     runs=(
@@ -51,7 +57,7 @@ RESULT = ExperimentResult(
     ),
     failed_runs=0,
     target=HardwareTarget.CPU,
-    image=PLAN.image,
+    image=PLAN.container.image,
     devices=(),
     raw_result=ContainerResult(exit_code=0, stdout=b"", stderr=b"", container_id="fake"),
 )
@@ -132,14 +138,14 @@ class InterruptingBackend(FakeBackend):
 
     def parse_result(
         self,
+        outcome: BenchmarkOutcome,
+        spec: ServerSpec,
         result: ContainerResult,
-        plan: ContainerConfig,
-        output_dir: Path | None = None,
     ) -> ExperimentResult:
         self.parses += 1
         if self.parses > 1:
             raise KeyboardInterrupt
-        return super().parse_result(result, plan, output_dir)
+        return super().parse_result(outcome, spec, result)
 
 
 def _write_space(path: Path, **overrides: object) -> Path:
@@ -177,7 +183,7 @@ def _invoke(
     """
     out, err = StringIO(), StringIO()
     code = main(
-        [model, str(space), "--target", "cpu", *extra],
+        [model, str(space), "vllm", "--target", "cpu", *extra],
         backend=_backend() if backend is None else backend,
         client=FakePodmanClient() if client is None else client,
         stdout=out,
@@ -216,6 +222,7 @@ def test_a_successful_bounded_sweep_reports_progress_and_the_winner(
     assert err == ""
     assert f"model: {model}" in out
     assert f"space: {space}" in out
+    assert "engine: vllm" in out
     assert "target: cpu" in out
     assert "image: default" in out
     assert "budget: 2 trials" in out
@@ -223,7 +230,7 @@ def test_a_successful_bounded_sweep_reports_progress_and_the_winner(
     assert "validating search space" in out
     assert "resolved target: cpu" in out
     assert f"using local model: {model}" in out
-    assert f"pulling container image: {PLAN.image}" in out
+    assert f"pulling container image: {PLAN.container.image}" in out
     assert "preparing study" in out
     assert "trial 1/2  COMPLETE  42.00 tps  best 42.00" in out
     assert "trial 2/2  COMPLETE  42.00 tps  best 42.00" in out
@@ -232,7 +239,47 @@ def test_a_successful_bounded_sweep_reports_progress_and_the_winner(
     assert "trials run: 2" in out
     assert "winning configuration:" in out
     assert len(backend.plan_calls) == 2
-    assert (PLAN.image, "missing") in client.pull_calls
+    assert (PLAN.container.image, "missing") in client.pull_calls
+
+
+def test_an_engine_with_no_registered_backend_fails_before_preparation(
+    tmp_path: Path, model: str
+) -> None:
+    """``llamacpp`` is an accepted choice but is not wired until stage 2.
+
+    The failure is a usage error raised from the registry before the header is
+    printed or any preparation (space load, hardware probe, image pull) runs, so
+    a missing engine never costs a download. This test flips when ``llamacpp``
+    is registered in a later task.
+    """
+    space = _write_space(tmp_path / "space.yaml")
+    out, err = StringIO(), StringIO()
+
+    code = main(
+        [model, str(space), "llamacpp", "--target", "cpu", "--n-trials", "1"],
+        client=FakePodmanClient(),
+        stdout=out,
+        stderr=err,
+    )
+
+    assert code == 2
+    assert "llamacpp" in err.getvalue()
+    assert out.getvalue() == ""
+
+
+def test_the_resolved_checkpoint_reaches_the_planned_run(tmp_path: Path, model: str) -> None:
+    """The backend hook decides the local path, and the run is planned from it."""
+    space = _write_space(tmp_path / "space.yaml")
+    backend = _backend()
+
+    code, _, err = _invoke(model, space, "--n-trials", "1", backend=backend)
+
+    assert code == 0
+    assert err == ""
+    assert backend.model_request_calls == [model]
+    planned, _ = backend.plan_calls[0]
+    assert planned.benchmark.resolved_path == Path(model).expanduser().resolve()
+    assert planned.benchmark.model == model
 
 
 def test_the_cli_gives_the_default_backend_a_temporary_cache_directory(
@@ -252,7 +299,7 @@ def test_the_cli_gives_the_default_backend_a_temporary_cache_directory(
     out, err = StringIO(), StringIO()
 
     code = main(
-        [model, str(space), "--target", "cpu", "--n-trials", "1", "--output", "log"],
+        [model, str(space), "vllm", "--target", "cpu", "--n-trials", "1", "--output", "log"],
         client=FakePodmanClient(),
         stdout=out,
         stderr=err,
@@ -328,7 +375,7 @@ def test_the_never_pull_policy_skips_the_pull_and_says_so(tmp_path: Path, model:
     assert code == 0
     assert err == ""
     assert client.pull_calls == []
-    assert f"using container image: {PLAN.image} (pull policy never)" in out
+    assert f"using container image: {PLAN.container.image} (pull policy never)" in out
     assert "pulling container image" not in out
 
 
@@ -345,7 +392,7 @@ def test_a_successful_sweep_writes_the_winning_configuration(tmp_path: Path, mod
     document = yaml.safe_load(destination.read_text(encoding="utf-8"))
     assert set(document) == {"container", "benchmark", "llm"}
     assert document["container"]["target"] == "cpu"
-    assert document["container"]["image"] == PLAN.image
+    assert document["container"]["image"] == PLAN.container.image
 
 
 def test_a_space_the_backend_rejects_returns_the_unsupported_code(
@@ -359,6 +406,43 @@ def test_a_space_the_backend_rejects_returns_the_unsupported_code(
     assert code == 4
     assert "space.dtype" in err
     assert "best trial:" not in out
+    assert backend.plan_calls == []
+
+
+def test_the_loader_requires_only_the_backends_applicable_parameters(
+    tmp_path: Path, model: str
+) -> None:
+    """A space declaring exactly a reduced applicable set is accepted."""
+    required = {"max_model_len", "max_num_seqs"}
+    space = tmp_path / "space.yaml"
+    space.write_text(
+        yaml.safe_dump({"space": {name: {"default": True} for name in required}}),
+        encoding="utf-8",
+    )
+    backend = FakeBackend(PLAN, RESULT, [], applicable_parameters=required)
+
+    code, _, err = _invoke(model, space, "--n-trials", "1", backend=backend)
+
+    assert code == 0
+    assert err == ""
+
+
+def test_a_space_missing_a_backend_required_tunable_is_a_definition_error(
+    tmp_path: Path, model: str
+) -> None:
+    """A parameter the selected engine requires but the file omits fails before any trial."""
+    required = {"max_model_len", "max_num_seqs"}
+    space = tmp_path / "space.yaml"
+    space.write_text(
+        yaml.safe_dump({"space": {"max_model_len": {"default": True}}}),
+        encoding="utf-8",
+    )
+    backend = FakeBackend(PLAN, RESULT, [], applicable_parameters=required)
+
+    code, _, err = _invoke(model, space, "--n-trials", "1", backend=backend)
+
+    assert code == 3
+    assert "space.max_num_seqs" in err
     assert backend.plan_calls == []
 
 
@@ -475,8 +559,8 @@ def test_a_compatible_quantization_proceeds_to_the_image_pull(tmp_path: Path, mo
     assert code == 0
     assert err == ""
     assert "validating model compatibility" in out
-    assert f"pulling container image: {PLAN.image}" in out
-    assert (PLAN.image, "missing") in client.pull_calls
+    assert f"pulling container image: {PLAN.container.image}" in out
+    assert (PLAN.container.image, "missing") in client.pull_calls
 
 
 def test_an_omitted_quantization_accepts_a_mismatched_checkpoint(
@@ -559,7 +643,7 @@ def test_tui_mode_prints_preparation_before_the_first_frame(tmp_path: Path, mode
     out, err = TtyStringIO(), StringIO()
 
     code = main(
-        [model, str(space), "--target", "cpu", "--n-trials", "1", "--output", "tui"],
+        [model, str(space), "vllm", "--target", "cpu", "--n-trials", "1", "--output", "tui"],
         backend=_backend(),
         client=FakePodmanClient(),
         stdout=out,
@@ -601,7 +685,7 @@ def test_a_usage_error_is_reported_on_the_injected_stderr() -> None:
     out, err = StringIO(), StringIO()
 
     code = main(
-        ["model", "space.yaml", "--unknown"],
+        ["model", "space.yaml", "vllm", "--unknown"],
         backend=_backend(),
         client=FakePodmanClient(),
         stdout=out,

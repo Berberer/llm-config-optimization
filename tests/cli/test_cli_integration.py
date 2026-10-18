@@ -26,7 +26,7 @@ from podman import PodmanClient
 from podman.errors import APIError
 
 from llm_config_optimization.cli import main
-from llm_config_optimization.inference import HardwareTarget, VLLMBackend
+from llm_config_optimization.inference import BenchmarkClient, HardwareTarget, VLLMBackend
 
 pytestmark = pytest.mark.integration
 
@@ -123,6 +123,7 @@ def test_two_trial_cpu_sweep_reports_progress_and_writes_the_winner(
         [
             model,
             str(space_path),
+            "vllm",
             "--target",
             "cpu",
             "--n-trials",
@@ -154,6 +155,7 @@ def test_two_trial_cpu_sweep_reports_progress_and_writes_the_winner(
         ],
         backend=VLLMBackend(cpu_image=vllm_cpu_image),
         client=podman_client,
+        benchmark_client=BenchmarkClient(),
         stdout=out,
         stderr=err,
     )

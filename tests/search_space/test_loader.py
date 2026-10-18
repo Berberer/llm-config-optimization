@@ -120,6 +120,68 @@ def test_every_missing_tunable_is_named_with_its_accepted_spec_kinds() -> None:
     assert all("fixed, categorical, interval, default" in problem for problem in problems)
 
 
+def test_a_reduced_required_set_makes_a_declared_space_total_over_it() -> None:
+    required = {"max_model_len", "max_num_seqs"}
+    document = {"space": {"max_model_len": {"default": True}, "max_num_seqs": {"default": True}}}
+
+    space = parse_experiment_space(document, required=required)
+
+    assert tuple(dimension.name for dimension in space.dimensions) == (
+        "max_model_len",
+        "max_num_seqs",
+    )
+
+
+def test_a_reduced_required_set_reports_only_its_own_missing_members() -> None:
+    required = {"max_model_len", "max_num_seqs", "attention_backend"}
+
+    with pytest.raises(ExperimentDefinitionError) as excinfo:
+        parse_experiment_space({"space": {"max_model_len": {"default": True}}}, required=required)
+
+    problems = excinfo.value.problems
+    assert any("space.max_num_seqs: missing required tunable parameter" in p for p in problems)
+    assert any("space.attention_backend: missing required tunable parameter" in p for p in problems)
+    assert not any("space.dtype" in problem for problem in problems)
+    assert len(problems) == 2
+
+
+def test_a_declared_parameter_outside_the_required_set_is_not_a_loader_problem() -> None:
+    """Whether the engine forwards it is the backend's separate ``validate`` check."""
+    required = {"max_model_len", "max_num_seqs"}
+    document = {
+        "space": {
+            "max_model_len": {"default": True},
+            "max_num_seqs": {"default": True},
+            "dtype": {"fixed": "float16"},
+        }
+    }
+
+    space = parse_experiment_space(document, required=required)
+
+    assert tuple(dimension.name for dimension in space.dimensions) == (
+        "dtype",
+        "max_model_len",
+        "max_num_seqs",
+    )
+
+
+def test_the_file_loader_forwards_the_required_set(tmp_path: Path) -> None:
+    path = tmp_path / "space.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {"space": {"max_model_len": {"default": True}, "max_num_seqs": {"default": True}}}
+        ),
+        encoding="utf-8",
+    )
+
+    space = load_experiment_space(path, required={"max_model_len", "max_num_seqs"})
+
+    assert tuple(dimension.name for dimension in space.dimensions) == (
+        "max_model_len",
+        "max_num_seqs",
+    )
+
+
 def test_an_invalid_declared_tunable_is_not_also_reported_missing() -> None:
     with pytest.raises(ExperimentDefinitionError) as excinfo:
         parse_experiment_space(definition(dtype={"fixed": "int8"}))

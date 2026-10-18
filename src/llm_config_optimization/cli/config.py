@@ -14,16 +14,12 @@ hardware detection and default-image lookup apply at planning time, exactly as
 they do for a hand-written config. The preparation stage resolves and reports
 them separately rather than baking a guess into the base config.
 
-The module also owns the single test for whether the model argument names a
-local checkpoint: :func:`is_local_model` reports whether the argument is an
-existing host path, and anything else is treated as a Hugging Face id that the
-preparation stage must download. Existence is the only test, matching how the
-vLLM backend decides whether to bind-mount a checkpoint or pass the identifier
-through to the engine.
+The base config carries the user's model string unchanged. The backend decides
+what that string refers to through its model-resolution hook, and the
+preparation stage records the local path it resolved on the benchmark config.
 """
 
 import argparse
-from pathlib import Path
 
 from ..inference.types import (
     BenchmarkConfig,
@@ -34,7 +30,7 @@ from ..inference.types import (
     QuantizationMethod,
 )
 
-__all__ = ["build_base_config", "is_local_model"]
+__all__ = ["build_base_config"]
 
 
 def build_base_config(args: argparse.Namespace) -> ExperimentConfig:
@@ -75,14 +71,3 @@ def build_base_config(args: argparse.Namespace) -> ExperimentConfig:
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
     return ExperimentConfig(container=container, benchmark=benchmark, llm=llm)
-
-
-def is_local_model(model: str) -> bool:
-    """Return whether ``model`` names an existing host checkpoint.
-
-    An existing path is used directly and needs no download; anything else is
-    treated as a Hugging Face id and fetched by the preparation stage. The test
-    is existence only, matching the vLLM backend, so a Hugging Face identifier
-    that happens to resolve to a local file is treated as a checkpoint.
-    """
-    return Path(model).expanduser().exists()

@@ -1,31 +1,27 @@
 """vLLM backend for the inference experiment layer.
 
-This module is the only place that knows vLLM's benchmark CLI. It maps the
+This module is the only place that knows vLLM's serving CLI. It maps the
 engine-neutral :class:`~llm_config_optimization.inference.types.LLMConfig` fields onto
-``vllm serve`` arguments and the
-:class:`~llm_config_optimization.inference.types.BenchmarkConfig` workload onto
-``vllm bench serve`` arguments, plans a one-container/one-server run for an
-experiment, and parses the repeated measurements back into a typed
-:class:`~llm_config_optimization.inference.types.ExperimentResult`.
+``vllm serve`` arguments and plans the server container a trial is measured
+against: the host benchmark client drives the server's OpenAI-compatible API,
+so this backend never assembles a client command. The planned
+:class:`~llm_config_optimization.inference.types.ServerSpec` carries the serve
+command, the published port, the health and cache-reset endpoints, and the
+mounts the server needs.
 
-The online ``vllm bench serve`` path replaces the offline ``vllm bench
-throughput`` path entirely: one server is started per trial and measured
-several times, so the model is loaded once and each repetition is a cheap
-client pass. The change is one-way and the resulting numbers are not
-comparable to earlier offline measurements.
+Measurement is host-driven: one server is started per trial and measured
+several times by the shared client, so the model is loaded once and each
+repetition is a cheap client pass. The resulting numbers are not comparable to
+the earlier offline ``vllm bench throughput`` measurements.
 """
 
 import json
-import math
 import os
-import shlex
-import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import cast
 
 from ..runtime.types import ContainerConfig, ContainerResult, Mount
 from ..search_space.registry import TUNABLE_PARAMETERS
@@ -41,17 +37,20 @@ from ..search_space.types import (
 )
 from .types import (
     AttentionBackend,
-    BenchmarkConfig,
+    BenchmarkOutcome,
     DetectedHardware,
     DType,
     ExperimentConfig,
     ExperimentError,
     ExperimentResult,
     HardwareTarget,
+    HubCheckpoint,
     KVCacheDType,
     LLMConfig,
+    LocalCheckpoint,
+    ModelRequest,
     QuantizationMethod,
-    RunMetrics,
+    ServerSpec,
 )
 
 
@@ -252,8 +251,8 @@ def encode_arguments(
 ) -> list[str]:
     """Encode parameter values as vLLM CLI arguments according to ``targets``.
 
-    This is the generic serialisation primitive behind :func:`serve_arguments`
-    and :func:`bench_arguments`. It is exposed so the encoding rules — flat
+    This is the generic serialisation primitive behind :func:`serve_arguments`.
+    It is exposed so the encoding rules — flat
     flags, JSON groups, kebab-case names, boolean negation, and JSON encoding
     of nested values — can be exercised directly with values the typed config
     does not yet model.
@@ -318,9 +317,8 @@ def serve_arguments(
     categorical fields are translated from their engine-neutral enums into
     vLLM's spellings, and any ``extra_args`` are appended verbatim after the
     mapped parameters as the backend's escape hatch for unmodeled serving
-    flags. Workload parameters are assembled separately by
-    :func:`bench_arguments`, so a flag reaches the command that understands it
-    and the client command carries no serving flags.
+    flags. The workload is assembled separately by the host benchmark client,
+    so the server command carries no workload flags.
     """
     parameters = {
         field.name: _translate_value(field.name, getattr(config, field.name))
@@ -330,39 +328,24 @@ def serve_arguments(
     return [*encode_arguments(parameters), *extra_args]
 
 
-DEFAULT_OUTPUT_DIR = Path(tempfile.gettempdir()) / "llm-config-optimization"
-"""Where a run writes its result when the caller supplies no output directory.
-
-:meth:`VLLMBackend.plan` and :meth:`VLLMBackend.parse_result` both fall back to
-this path, so the directory mounted into the container is the one read back on
-the host. The orchestrator may pass an explicit directory instead.
-"""
-
-_OUTPUT_MOUNT_PATH = "/output"
 _MODEL_MOUNT_PATH = "/model"
-_RUNNER_FILENAME = "runner.sh"
-_MANIFEST_FILENAME = "manifest.json"
-_SERVER_LOG_FILENAME = "server.log"
-_SERVER_HOST = "127.0.0.1"
 _SERVER_PORT = 8000
-_RUNNER_ENTRYPOINT = ("/bin/bash",)
-"""The command the container starts with, replacing the image's own entrypoint.
+_SERVER_BIND_HOST = "0.0.0.0"
+"""Where the server binds inside the container.
 
-vLLM's official images set ``ENTRYPOINT ["vllm", "serve"]``, which is right
-for the serving image but wrong for a generated runner: the runtime's
-``command`` only replaces ``CMD``, so the runner path would be appended to
-``vllm serve``. The backend overrides the entrypoint with a shell, so the
-planned command runs the generated ``runner.sh`` instead.
+The host benchmark client reaches the server through the container's published
+port, so the server must accept connections on every interface rather than
+container loopback.
 """
 _RESET_CACHE_ENDPOINTS = (
     "/reset_prefix_cache",
     "/reset_mm_cache",
     "/reset_encoder_cache",
 )
-"""The dev-mode endpoints the runner calls to clear the server's caches.
+"""The dev-mode endpoints the host client calls to clear the server's caches.
 
 A repetition must not be flattered by prompts a previous run left cached, so
-the runner resets the caches before every run. ``/reset_prefix_cache`` is the
+the client resets the caches before every run. ``/reset_prefix_cache`` is the
 one that matters for text workloads; the multimodal and encoder caches are
 reset too so a run starts from a clean server regardless of the workload.
 """
@@ -370,7 +353,7 @@ _DEV_MODE_ENV: Mapping[str, str] = MappingProxyType({"VLLM_SERVER_DEV_MODE": "1"
 """Environment that enables vLLM's dev-mode endpoints.
 
 The cache-reset endpoints are development endpoints gated behind
-``VLLM_SERVER_DEV_MODE``; without it the runner's resets are rejected and a
+``VLLM_SERVER_DEV_MODE``; without it the client's resets are rejected and a
 run can benefit from its predecessor's cached prompts. A caller's own
 ``container.env`` entry still wins, so the gate can be forced off deliberately.
 """
@@ -453,354 +436,17 @@ def _target_for(
     )
 
 
-_WORKLOAD_TARGETS: Mapping[str, ParameterTarget] = MappingProxyType(
-    {
-        "model": FlatFlag(),
-        "dataset_name": FlatFlag(),
-        "dataset_path": FlatFlag(),
-        "num_prompts": FlatFlag(),
-        "input_len": FlatFlag(),
-        "output_len": FlatFlag(),
-        "random_input_len": FlatFlag(),
-        "random_output_len": FlatFlag(),
-    }
-)
-"""Where the benchmark workload is sent on the command line.
-
-Most keys mirror a :class:`BenchmarkConfig` field; the two ``random_*_len``
-keys carry the same configured lengths under vLLM's dataset-specific spelling
-(see :func:`_length_targets`), so the table lists both spellings and the caller
-sets only the one the dataset reads.
-"""
-
-_RANDOM_DATASETS = frozenset({"random", "random-mm", "random-rerank"})
-"""Datasets whose request lengths come from vLLM's ``--random-*-len`` flags.
-
-vLLM defines ``--random-input-len``/``--random-output-len`` with defaults of
-1024/128 and lets them take precedence over the generic
-``--input-len``/``--output-len``, which means the generic flags are silently
-ignored for the random dataset. The other datasets read the generic flags or
-take their input lengths from the dataset itself. An unset dataset name is
-included because vLLM then defaults to the random dataset.
-"""
-
-
-def _length_targets(dataset_name: str | None) -> tuple[str, str]:
-    """Return the workload keys the configured input and output lengths use.
-
-    The random dataset needs its own flags; every other dataset uses the
-    generic ones. Returning keys rather than flags keeps the choice in the
-    :data:`_WORKLOAD_TARGETS` table, which derives each flag from its key.
-    """
-    if dataset_name is None or dataset_name in _RANDOM_DATASETS:
-        return "random_input_len", "random_output_len"
-    return "input_len", "output_len"
-
-
-def bench_arguments(benchmark: BenchmarkConfig, model: str) -> list[str]:
-    """Turn a benchmark workload into the ``vllm bench serve`` arguments.
-
-    The workload keys mirror :class:`BenchmarkConfig` fields, and the request
-    lengths are routed to the dataset-specific flags through
-    :func:`_length_targets`. ``model`` is the
-    resolved model the server is addressed with — a local checkpoint's
-    container path, for example — not necessarily the string the caller
-    configured, so the client and the server agree on the model name.
-
-    The serving parameters are assembled separately by :func:`serve_arguments`,
-    so the client command is fully derived from the workload and has no escape
-    hatch.
-    """
-    input_key, output_key = _length_targets(benchmark.dataset_name)
-    workload = {
-        "model": model,
-        "dataset_name": benchmark.dataset_name,
-        "dataset_path": benchmark.dataset_path,
-        "num_prompts": benchmark.num_prompts,
-        input_key: benchmark.input_len,
-        output_key: benchmark.output_len,
-    }
-    return encode_arguments(workload, _WORKLOAD_TARGETS)
-
-
-def _bash_array_elements(values: Sequence[str]) -> str:
-    """Render ``values`` as the body of a bash array, one quoted element per line.
-
-    Each element is shell-quoted, so an argument containing whitespace, quotes,
-    or shell metacharacters is carried into the generated runner verbatim rather
-    than being word-split or expanded.
-    """
-    return "\n".join(f"    {shlex.quote(value)}" for value in values)
-
-
-_RUNNER_BODY = r"""log() {
-    echo "[runner] $*" >&2
-}
-
-cleanup() {
-    if [ -n "${SERVER_PID:-}" ] && kill -0 "${SERVER_PID}" 2>/dev/null; then
-        kill "${SERVER_PID}" 2>/dev/null || true
-        wait "${SERVER_PID}" 2>/dev/null || true
-    fi
-}
-
-reset_caches() {
-    for url in "${RESET_URLS[@]}"; do
-        curl -sf -X POST -o /dev/null "${url}" >/dev/null 2>&1 || true
-    done
-}
-
-run_benchmark() {
-    local filename="$1"
-    local seed="$2"
-    local runs_left=$((TOTAL_RUNS - run_number))
-    if [ "${runs_left}" -lt 1 ]; then
-        runs_left=1
-    fi
-    local bench_cmd=(vllm bench serve "${BENCH_ARGS[@]}" \
-        --seed "${seed}" \
-        --save-result \
-        --result-dir "${OUTPUT_DIR}" \
-        --result-filename "${filename}")
-    if [ -n "${OVERALL_TIMEOUT}" ]; then
-        local remaining=$((OVERALL_TIMEOUT - SECONDS))
-        if [ "${remaining}" -lt 1 ]; then
-            remaining=1
-        fi
-        local per_run=$((remaining / runs_left))
-        if [ "${per_run}" -lt 1 ]; then
-            per_run=1
-        fi
-        log "run ${run_number}: ${filename} (budget ${per_run}s)"
-        timeout --signal=TERM --kill-after=10 "${per_run}" "${bench_cmd[@]}" || return $?
-    else
-        log "run ${run_number}: ${filename}"
-        "${bench_cmd[@]}" || return $?
-    fi
-    return 0
-}
-
-log "starting vllm serve"
-vllm serve "${SERVE_ARGS[@]}" >"${SERVER_LOG}" 2>&1 &
-SERVER_PID=$!
-trap cleanup EXIT
-
-health_deadline=$((SECONDS + STARTUP_TIMEOUT))
-until curl -sf -o /dev/null "${HEALTH_URL}"; do
-    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-        log "vllm serve exited before becoming healthy; see ${SERVER_LOG}"
-        exit 1
-    fi
-    if [ "${SECONDS}" -ge "${health_deadline}" ]; then
-        log "vllm serve did not become healthy within ${STARTUP_TIMEOUT}s; see ${SERVER_LOG}"
-        exit 1
-    fi
-    sleep 1
-done
-log "vllm serve is healthy"
-
-successes=0
-failed=0
-success_files=()
-run_number=0
-
-warmup_index=0
-while [ "${warmup_index}" -lt "${WARMUP}" ]; do
-    reset_caches
-    # Warmup seeds are offset past the measured range so no measured run ever
-    # replays the prompt set a warmup run drew.
-    run_benchmark "warmup-${warmup_index}.json" "$((REPETITIONS + warmup_index))" || true
-    warmup_index=$((warmup_index + 1))
-    run_number=$((run_number + 1))
-done
-
-run_index=0
-while [ "${run_index}" -lt "${REPETITIONS}" ]; do
-    reset_caches
-    filename="run-${run_index}.json"
-    if run_benchmark "${filename}" "${run_index}"; then
-        if [ -s "${OUTPUT_DIR}/${filename}" ]; then
-            successes=$((successes + 1))
-            success_files+=("${filename}")
-        else
-            log "run ${run_index} exited zero but wrote no result"
-            failed=$((failed + 1))
-        fi
-    else
-        log "run ${run_index} failed"
-        failed=$((failed + 1))
-    fi
-    run_index=$((run_index + 1))
-    run_number=$((run_number + 1))
-done
-
-{
-    printf '{\n'
-    printf '  "repetitions": %s,\n' "${REPETITIONS}"
-    printf '  "warmup": %s,\n' "${WARMUP}"
-    printf '  "failed_runs": %s,\n' "${failed}"
-    printf '  "runs": ['
-    separator=''
-    for file in ${success_files[@]+"${success_files[@]}"}; do
-        printf '%s"%s"' "${separator}" "${file}"
-        separator=', '
-    done
-    printf ']\n'
-    printf '}\n'
-} > "${MANIFEST_PATH}"
-
-if [ $((successes * 2)) -le "${REPETITIONS}" ]; then
-    log "only ${successes}/${REPETITIONS} measured runs succeeded; a strict majority is required"
-    exit 1
-fi
-
-log "${successes}/${REPETITIONS} measured runs succeeded"
-exit 0
-"""
-"""The generated runner body, with the header's variables already in scope.
-
-Kept as a raw string so the shell's own backslashes and escape sequences reach
-``runner.sh`` unchanged. The header defines the argument arrays, the counts, and
-the URLs; the body starts the server, waits for health, takes the warmup and
-measured runs, writes the manifest, and enforces the strict majority.
-"""
-
-
-def _runner_script(
-    *,
-    serve_args: Sequence[str],
-    bench_args: Sequence[str],
-    repetitions: int,
-    warmup: int,
-    startup_timeout: int,
-    overall_timeout: int | None,
-) -> str:
-    """Build the self-contained runner the container executes for one trial.
-
-    The runner carries the resolved ``vllm serve`` and ``vllm bench serve``
-    argument lists, the repetition and warmup counts, the startup bound, and the
-    overall budget, so the container needs no configuration beyond the script
-    itself. It starts the server on container loopback, polls its health
-    endpoint, resets the caches and takes the warmup and measured runs (each with
-    its own seed and a share of the remaining budget), writes a manifest of the
-    successful runs, and exits non-zero unless a strict majority of the measured
-    runs succeeded. ``overall_timeout`` is ``None`` for an unbounded run, in
-    which case no per-run deadline is applied and the container's own timeout
-    (if any) remains the only guard.
-    """
-    reset_urls = " ".join(
-        shlex.quote(f"http://{_SERVER_HOST}:{_SERVER_PORT}{endpoint}")
-        for endpoint in _RESET_CACHE_ENDPOINTS
-    )
-    header = "\n".join(
-        (
-            "#!/usr/bin/env bash",
-            "# Generated by llm-config-optimization; do not edit.",
-            "set -u",
-            "",
-            f"OUTPUT_DIR={shlex.quote(_OUTPUT_MOUNT_PATH)}",
-            f"MANIFEST_PATH={shlex.quote(f'{_OUTPUT_MOUNT_PATH}/{_MANIFEST_FILENAME}')}",
-            f"SERVER_LOG={shlex.quote(f'{_OUTPUT_MOUNT_PATH}/{_SERVER_LOG_FILENAME}')}",
-            f"HEALTH_URL={shlex.quote(f'http://{_SERVER_HOST}:{_SERVER_PORT}/health')}",
-            f"RESET_URLS=({reset_urls})",
-            f"REPETITIONS={repetitions}",
-            f"WARMUP={warmup}",
-            f"STARTUP_TIMEOUT={startup_timeout}",
-            f"OVERALL_TIMEOUT={overall_timeout if overall_timeout is not None else ''}",
-            "",
-            "SERVE_ARGS=(",
-            _bash_array_elements(serve_args),
-            ")",
-            "",
-            "BENCH_ARGS=(",
-            _bash_array_elements(bench_args),
-            ")",
-            "",
-            "TOTAL_RUNS=$((WARMUP + REPETITIONS))",
-            "",
-        )
-    )
-    return f"{header}\n{_RUNNER_BODY}"
-
-
-def _read_json_object(path: Path, result: ContainerResult, *, what: str) -> Mapping[str, object]:
-    """Read a JSON object from ``path`` or raise :class:`ExperimentError`.
-
-    The three ways a file the parser needs can be unusable — missing/unreadable,
-    not valid JSON, or valid JSON that is not an object — all surface as an
-    :class:`ExperimentError` carrying ``result``, so a parse failure is uniform
-    regardless of which file went wrong. ``what`` names the file in the message
-    (for example ``"benchmark manifest"`` or ``"benchmark run result"``).
-    """
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise ExperimentError(
-            f"could not read the vLLM {what} at {path}",
-            raw_result=result,
-        ) from exc
-    except json.JSONDecodeError as exc:
-        raise ExperimentError(
-            f"vLLM {what} at {path} is not valid JSON",
-            raw_result=result,
-        ) from exc
-    if not isinstance(payload, Mapping):
-        raise ExperimentError(
-            f"vLLM {what} at {path} is not a JSON object",
-            raw_result=result,
-        )
-    return payload
-
-
-def _as_float(value: object) -> float:
-    """Coerce a JSON scalar to ``float``; a bad value raises for the caller to report."""
-    return float(cast("str | int | float", value))
-
-
-def _as_int(value: object) -> int:
-    """Coerce a JSON scalar to ``int``; a bad value raises for the caller to report."""
-    return int(cast("str | int | float", value))
-
-
-def _parse_run(path: Path, result: ContainerResult) -> RunMetrics:
-    """Parse one measured run's online benchmark payload into :class:`RunMetrics`.
-
-    vLLM's ``vllm bench serve`` result carries ``total_token_throughput``,
-    ``request_throughput``, ``duration``, and ``completed`` (the number of
-    successful requests), which map onto the typed metrics. A missing or
-    non-numeric key is a malformed run and raises :class:`ExperimentError` with
-    the raw container result attached.
-    """
-    payload = _read_json_object(path, result, what="benchmark run result")
-    try:
-        return RunMetrics(
-            tokens_per_second=_as_float(payload["total_token_throughput"]),
-            requests_per_second=_as_float(payload["request_throughput"]),
-            elapsed_time=_as_float(payload["duration"]),
-            num_prompts=_as_int(payload["completed"]),
-            raw_json=payload,
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ExperimentError(
-            f"vLLM benchmark run result at {path} is missing or malformed: {exc}",
-            raw_result=result,
-        ) from exc
-
-
 def _ensure_directory(path: Path) -> Path:
     """Create ``path`` if needed and return it, so it can be bind-mounted."""
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def _resolve_model(model: str) -> tuple[str, tuple[Mount, ...]]:
-    """Resolve the model argument and any mount it needs.
+def _model_request(model: str) -> ModelRequest:
+    """Return the neutral request for vLLM's ``--model`` argument.
 
-    A model that exists on the host is a local checkpoint: it is bind-mounted
-    read-only at a fixed container path and the container is pointed at that
-    path. Anything else — a Hugging Face identifier — is passed through
-    unchanged and downloaded into the mounted Hugging Face cache.
-
+    An existing host path is a local checkpoint and is returned resolved;
+    anything else is a Hugging Face repository id fetched as a whole snapshot.
     Existence is the only test, so a Hugging Face identifier that happens to
     resolve to a local file or directory — for example a repository whose owner
     name matches a directory in the working tree — is treated as a local
@@ -808,15 +454,70 @@ def _resolve_model(model: str) -> tuple[str, tuple[Mount, ...]]:
     to find the model it was asked for.
     """
     path = Path(model).expanduser()
-    if not path.exists():
-        return model, ()
-    mount = Mount(
-        source=str(path.resolve()),
+    if path.exists():
+        return LocalCheckpoint(path=path.resolve())
+    return HubCheckpoint(repo_id=model)
+
+
+def _hub_cache_root(path: Path) -> Path | None:
+    """Return the Hugging Face cache hub root that contains ``path``.
+
+    ``snapshot_download`` returns a snapshot directory whose files are relative
+    symlinks into the cache's ``blobs`` directory, and those links can hop more
+    than once — a Xet-backed download stores the real file in the cache's
+    *shared* ``hub/blobs`` store, so a snapshot file points at the repository's
+    ``blobs`` entry which in turn points at ``../../blobs/<hash>``. Mounting
+    only the snapshot, or only the model's repository, would leave those links
+    dangling inside the container. The whole hub directory — the parent of
+    ``models--*`` and the shared ``blobs`` — must be mounted for every link to
+    resolve. Returns ``None`` when ``path`` is not laid out as
+    ``<hub>/models--*/snapshots/<rev>`` with a sibling ``blobs`` directory, so a
+    plain local checkpoint is mounted directly.
+    """
+    repo = path.parent.parent
+    if (
+        path.parent.name == "snapshots"
+        and repo.name.startswith("models--")
+        and (repo.parent / "blobs").is_dir()
+    ):
+        return repo.parent
+    return None
+
+
+def _model_mount(path: Path) -> Mount:
+    """Build the read-only mount that exposes a resolved checkpoint to the server."""
+    return Mount(
+        source=str(path),
         target=_MODEL_MOUNT_PATH,
         read_only=True,
         options=_SELINUX_OPTIONS,
     )
-    return _MODEL_MOUNT_PATH, (mount,)
+
+
+def _resolve_model(model: str, resolved_path: Path | None) -> tuple[str, tuple[Mount, ...]]:
+    """Resolve the model argument and any mount it needs.
+
+    A ``resolved_path`` — the checkpoint the composition root already fetched —
+    is mounted read-only at a fixed container path and the container is pointed
+    at that path. A Hugging Face snapshot is special: its files are relative
+    symlinks that may hop through the cache's shared ``blobs`` store, so the
+    whole cache hub root is mounted instead and the container is pointed at the
+    snapshot inside it, keeping every symlink resolvable. Without a
+    ``resolved_path``, the backend's own model-resolution hook decides: an
+    existing host path is a local checkpoint and is mounted the same way, while
+    anything else — a Hugging Face identifier — is passed through unchanged and
+    downloaded into the mounted Hugging Face cache.
+    """
+    if resolved_path is not None:
+        hub_root = _hub_cache_root(resolved_path)
+        if hub_root is not None:
+            relative = resolved_path.relative_to(hub_root)
+            return f"{_MODEL_MOUNT_PATH}/{relative}", (_model_mount(hub_root),)
+        return _MODEL_MOUNT_PATH, (_model_mount(resolved_path),)
+    request = _model_request(model)
+    if isinstance(request, LocalCheckpoint):
+        return _MODEL_MOUNT_PATH, (_model_mount(request.path),)
+    return request.repo_id, ()
 
 
 _ENGINE_BOUNDS: tuple[tuple[str, str], ...] = (("max_num_batched_tokens", "max_num_seqs"),)
@@ -1005,14 +706,9 @@ class VLLMBackend:
 
     ``extra_args`` is the single escape hatch for vLLM flags the engine-neutral
     config does not model. The sequence is appended verbatim to the assembled
-    benchmark command, after the mapped parameters, so a caller can experiment
-    without widening :class:`LLMConfig`; values passed this way are the caller's
-    responsibility.
-
-    The layer appends its own ``--output-json`` after the mapped parameters and
-    after ``extra_args``, so an ``extra_args`` entry that also sets
-    ``--output-json`` is overridden by the layer's value and result routing
-    stays under the backend's control.
+    ``vllm serve`` command, after the mapped parameters, so a caller can
+    experiment without widening :class:`LLMConfig`; values passed this way are
+    the caller's responsibility.
 
     ``cpu_image`` is the base image used for CPU runs. vLLM publishes an
     official CPU image, but it is configurable so a caller can pin a different
@@ -1031,6 +727,18 @@ class VLLMBackend:
     extra_args: tuple[str, ...] = ()
     cpu_image: str = "docker.io/vllm/vllm-openai-cpu:latest"
     cache_dir: Path | None = None
+
+    @property
+    def applicable_parameters(self) -> frozenset[str]:
+        """Every registered tunable: vLLM forwards all seven.
+
+        vLLM is the reference backend and models the whole registry, so its
+        applicable set is exactly
+        :data:`~llm_config_optimization.search_space.registry.TUNABLE_PARAMETERS`.
+        A space must therefore declare every one of them, and each value is
+        still support-checked by :meth:`validate`.
+        """
+        return frozenset(TUNABLE_PARAMETERS)
 
     def validate(
         self,
@@ -1106,69 +814,66 @@ class VLLMBackend:
             f"quantization to let vLLM auto-detect"
         ]
 
+    def model_request(self, model: str) -> ModelRequest:
+        """Decide whether ``model`` is a local checkpoint or a Hub repository.
+
+        The composition root calls this before downloading, so the engine's
+        model-argument rules — existence means a local path, anything else a
+        Hugging Face id — stay here rather than in the CLI. vLLM fetches whole
+        snapshots, so the request never selects a single file.
+        """
+        return _model_request(model)
+
     def plan(
         self,
         experiment: ExperimentConfig,
         hardware: DetectedHardware,
-        output_dir: Path | None = None,
-    ) -> ContainerConfig:
-        """Turn an experiment and the detected hardware into a container run.
+    ) -> ServerSpec:
+        """Turn an experiment and the detected hardware into a server run.
 
         The accelerator class resolves from the container config's override or,
         failing that, the detected hardware, and selects the base image, the
         device mapping, and — when the LLM config leaves it unset — the
-        tensor-parallel size. The Hugging Face cache, the model itself when it
-        is a host path, the result directory, and — when ``cache_dir`` is set —
-        the compile cache are bind-mounted.
+        tensor-parallel size. The Hugging Face cache, the checkpoint itself —
+        the resolved path when the composition root set one, otherwise a host
+        path — and, when ``cache_dir`` is set, the compile cache are
+        bind-mounted.
 
-        A generated ``runner.sh`` is written into the output directory and the
-        container command runs it, with the image's own ``vllm serve``
-        entrypoint overridden by a shell. The runner starts one server, waits for
-        its health endpoint within the benchmark's ``startup_timeout``, resets
-        the caches, and takes ``warmup`` discarded and ``repetitions`` measured
-        ``vllm bench serve`` runs against it, each with its own seed and a share
-        of the overall budget, before writing the manifest and enforcing the
-        strict majority. The serving parameters and ``extra_args`` build the
-        server command; the benchmark workload builds the client command. The
-        dev-mode environment that the cache reset requires is added to the
-        container environment.
+        The planned container keeps the image's own ``vllm serve`` entrypoint and
+        runs it with ``--model``, the published port, and the serving parameters
+        and ``extra_args``; the served model name is pinned to the configured
+        model string so the host client addresses the server with the same name
+        it was configured with. The dev-mode environment that the cache reset
+        requires is added to the container environment. The returned
+        :class:`ServerSpec` describes the health endpoint, the cache-reset
+        endpoints, and the startup timeout the host client uses.
 
-        Planning is not side-effect free: the output directory, the host
-        Hugging Face cache directory, the compile cache directory, and the
-        generated runner are written on the host when planning, because each must
-        exist before it can be bind-mounted or executed. Merely planning a run —
-        as the unit tests do — therefore still touches the host filesystem.
+        Planning is not side-effect free: the host Hugging Face cache directory
+        and the compile cache directory are created on the host when planning,
+        because each must exist before it can be bind-mounted. Merely planning a
+        run — as the unit tests do — therefore still touches the host
+        filesystem.
         """
         container = experiment.container
         target = container.target or hardware.target
-        output_dir = _ensure_directory(output_dir or DEFAULT_OUTPUT_DIR)
         _ensure_directory(_HF_CACHE_HOST)
-        model, model_mounts = _resolve_model(experiment.benchmark.model)
+        model, model_mounts = _resolve_model(
+            experiment.benchmark.model, experiment.benchmark.resolved_path
+        )
         llm = experiment.llm
         if llm.tensor_parallel_size is None:
             llm = replace(llm, tensor_parallel_size=hardware.device_count)
-        benchmark = experiment.benchmark
         serve_args = (
             "--model",
             model,
+            "--served-model-name",
+            experiment.benchmark.model,
             "--host",
-            _SERVER_HOST,
+            _SERVER_BIND_HOST,
             "--port",
             str(_SERVER_PORT),
             *serve_arguments(llm, extra_args=self.extra_args),
         )
-        runner = _runner_script(
-            serve_args=serve_args,
-            bench_args=bench_arguments(benchmark, model),
-            repetitions=benchmark.repetitions,
-            warmup=benchmark.warmup,
-            startup_timeout=math.ceil(benchmark.startup_timeout),
-            overall_timeout=(
-                math.ceil(benchmark.timeout) if benchmark.timeout is not None else None
-            ),
-        )
-        (output_dir / _RUNNER_FILENAME).write_text(runner, encoding="utf-8")
-        command = (f"{_OUTPUT_MOUNT_PATH}/{_RUNNER_FILENAME}",)
         volumes = [
             *container.volumes,
             Mount(
@@ -1185,21 +890,22 @@ class VLLMBackend:
                 Mount(source=str(cache_dir), target=_CACHE_MOUNT_PATH, options=_SELINUX_OPTIONS)
             )
             env = {**_CACHE_ENV, **env}
-        volumes.append(
-            Mount(source=str(output_dir), target=_OUTPUT_MOUNT_PATH, options=_SELINUX_OPTIONS)
-        )
-        return ContainerConfig(
-            image=container.image or self.image_for(target),
-            command=command,
-            entrypoint=_RUNNER_ENTRYPOINT,
-            env=env,
-            volumes=tuple(volumes),
-            devices=_DEVICE_MAPPINGS[target],
-            mem_limit=container.mem_limit,
-            shm_size=container.shm_size,
-            selinux_opts=container.selinux_opts,
-            pull_policy=container.pull_policy,
-            timeout=experiment.benchmark.timeout,
+        return ServerSpec(
+            container=ContainerConfig(
+                image=container.image or self.image_for(target),
+                command=serve_args,
+                env=env,
+                volumes=tuple(volumes),
+                devices=_DEVICE_MAPPINGS[target],
+                ports={str(_SERVER_PORT): None},
+                mem_limit=container.mem_limit,
+                shm_size=container.shm_size,
+                selinux_opts=container.selinux_opts,
+                pull_policy=container.pull_policy,
+            ),
+            health_path="/health",
+            health_timeout=experiment.benchmark.startup_timeout,
+            reset_paths=_RESET_CACHE_ENDPOINTS,
         )
 
     def image_for(self, target: HardwareTarget) -> str:
@@ -1217,71 +923,27 @@ class VLLMBackend:
 
     def parse_result(
         self,
+        outcome: BenchmarkOutcome,
+        spec: ServerSpec,
         result: ContainerResult,
-        plan: ContainerConfig,
-        output_dir: Path | None = None,
     ) -> ExperimentResult:
-        """Read the run's manifest and per-run JSON into a typed result.
+        """Assemble a typed result from the host client's measured runs.
 
-        The files are read from the same directory :meth:`plan` mounted (or the
-        module default when the caller supplies none). The generated runner
-        writes a ``manifest.json`` naming the successful ``run-<i>.json`` files
-        and the number of failed measured runs; this method reads that manifest,
-        parses each named run's online benchmark payload into a
-        :class:`RunMetrics`, and aggregates them into an
-        :class:`ExperimentResult`. The manifest is the parser's contract, so the
-        parser need not know how many runs were configured and cannot disagree
-        with the runner about which succeeded.
-
-        The accelerator class, image, and device mapping are recovered from
-        ``plan``, so the result records what ran rather than what was requested.
-        A missing or malformed manifest, a run name that is not a bare filename,
-        a manifest whose failure count does not agree with the runs it names, a
-        referenced run file that is missing or malformed, or a run set that is
-        not a strict majority of the configured repetitions raises
-        :class:`ExperimentError` with the raw container result attached. The
-        majority is enforced here as well as in the runner, so a container that
-        somehow exited zero with too few successes still fails the trial.
+        The runs and the failed-run count come straight from the host benchmark
+        client, which already enforced the strict majority, so this method only
+        records what actually ran: the accelerator class, image, and device
+        mapping are recovered from the planned :class:`ServerSpec`, and the
+        captured server container outcome is kept as ``raw_result``. An outcome
+        with no successful run raises :class:`ExperimentError` rather than
+        letting :class:`ExperimentResult` reject it with a bare ``ValueError``.
         """
-        output_dir = output_dir or DEFAULT_OUTPUT_DIR
-        manifest_path = output_dir / _MANIFEST_FILENAME
-        manifest = _read_json_object(manifest_path, result, what="benchmark manifest")
-        try:
-            repetitions = _as_int(manifest["repetitions"])
-            failed_runs = _as_int(manifest["failed_runs"])
-            run_files = manifest["runs"]
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ExperimentError(
-                f"vLLM benchmark manifest at {manifest_path} is missing or malformed: {exc}",
-                raw_result=result,
-            ) from exc
-        if not isinstance(run_files, list) or not all(
-            isinstance(name, str) and name and Path(name).name == name for name in run_files
-        ):
-            raise ExperimentError(
-                f"vLLM benchmark manifest at {manifest_path} is missing or malformed: "
-                f"'runs' must be a list of filenames",
-                raw_result=result,
-            )
-        runs = tuple(_parse_run(output_dir / name, result) for name in run_files)
-        if failed_runs != repetitions - len(runs):
-            raise ExperimentError(
-                f"vLLM benchmark manifest at {manifest_path} is inconsistent: "
-                f"{failed_runs} failed runs but {len(runs)} of {repetitions} runs succeeded",
-                raw_result=result,
-            )
-        if len(runs) * 2 <= repetitions:
-            raise ExperimentError(
-                f"only {len(runs)}/{repetitions} measured runs succeeded; "
-                f"a strict majority is required",
-                raw_result=result,
-            )
-        target = _target_for(plan.devices, raw_result=result)
+        if not outcome.runs:
+            raise ExperimentError("the benchmark produced no successful run", raw_result=result)
         return ExperimentResult(
-            runs=runs,
-            failed_runs=failed_runs,
-            target=target,
-            image=plan.image,
-            devices=plan.devices,
+            runs=outcome.runs,
+            failed_runs=outcome.failed_runs,
+            target=_target_for(spec.container.devices, raw_result=result),
+            image=spec.container.image,
+            devices=spec.container.devices,
             raw_result=result,
         )

@@ -9,12 +9,14 @@ vLLM) live alongside them and are re-exported here so callers need not know the
 module layout.
 """
 
+from ._benchmark import BenchmarkClient
 from ._orchestrate import run_experiment
 from ._vllm import VLLMBackend
 from .hardware import detect_hardware
 from .types import (
     AttentionBackend,
     BenchmarkConfig,
+    BenchmarkOutcome,
     ContainerRuntimeConfig,
     DetectedHardware,
     DType,
@@ -22,16 +24,22 @@ from .types import (
     ExperimentError,
     ExperimentResult,
     HardwareTarget,
+    HubCheckpoint,
     InferenceBackend,
     KVCacheDType,
     LLMConfig,
+    LocalCheckpoint,
+    ModelRequest,
     QuantizationMethod,
     RunMetrics,
+    ServerSpec,
 )
 
 __all__ = [
     "AttentionBackend",
+    "BenchmarkClient",
     "BenchmarkConfig",
+    "BenchmarkOutcome",
     "ContainerRuntimeConfig",
     "DType",
     "DetectedHardware",
@@ -39,11 +47,15 @@ __all__ = [
     "ExperimentError",
     "ExperimentResult",
     "HardwareTarget",
+    "HubCheckpoint",
     "InferenceBackend",
     "KVCacheDType",
     "LLMConfig",
+    "LocalCheckpoint",
+    "ModelRequest",
     "QuantizationMethod",
     "RunMetrics",
+    "ServerSpec",
     "VLLMBackend",
     "detect_hardware",
     "run_experiment",
