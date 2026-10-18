@@ -157,17 +157,26 @@ class BenchmarkConfig:
     """Engine-neutral description of the evaluation workload.
 
     This domain covers *what* is measured independently of the serving
-    parameters being varied: the model under test and the shape of the workload
-    it is driven with. ``model`` is required and accepts either a Hugging Face
-    identifier or a host path to a local checkpoint.
+    parameters being varied: the model under test, the shape of the workload it
+    is driven with, and how many times that workload is measured. ``model`` is
+    required and accepts either a Hugging Face identifier or a host path to a
+    local checkpoint.
 
-    The layer deliberately imposes no workload defaults of its own: every
-    optional field is ``None`` until the caller sets it, so a run never silently
-    measures something other than what was configured. The backend decides how
+    The workload-shape fields impose no defaults of their own: each is ``None``
+    until the caller sets it, so a run never silently measures something other
+    than what was configured. The measurement controls are different: a trial
+    takes several measurements so its objective reflects the configuration
+    rather than a single noisy sample, so ``repetitions``, ``warmup``, and
+    ``startup_timeout`` carry the documented defaults. The backend decides how
     these fields reach the engine and which engine flag each one targets.
 
-    ``timeout`` is a wall-clock limit for the whole run, in seconds; ``None``
-    leaves the run unbounded.
+    ``repetitions`` is the number of measured runs taken after warmup, and
+    ``warmup`` the number of discarded runs taken first. ``startup_timeout``
+    bounds the wait for the served model to become healthy, in seconds.
+    ``timeout`` is the overall wall-clock limit for the whole run — startup,
+    warmup, and every measured run together — in seconds; ``None`` leaves the
+    run unbounded. The constructor rejects a ``repetitions`` below one, a
+    negative ``warmup``, and a non-positive ``startup_timeout``.
     """
 
     model: str
@@ -176,7 +185,25 @@ class BenchmarkConfig:
     num_prompts: int | None = None
     input_len: int | None = None
     output_len: int | None = None
+    repetitions: int = 3
+    warmup: int = 1
+    startup_timeout: float = 600.0
     timeout: float | None = None
+
+    def __post_init__(self) -> None:
+        """Reject measurement controls outside their valid range.
+
+        A repetition count below one would leave a trial with no measured run,
+        a negative warmup is meaningless, and a non-positive startup timeout
+        could never see a model load. These are configuration errors rather
+        than runtime ones, so they raise ``ValueError`` at construction time.
+        """
+        if self.repetitions < 1:
+            raise ValueError(f"repetitions must be at least 1, got {self.repetitions}")
+        if self.warmup < 0:
+            raise ValueError(f"warmup must be non-negative, got {self.warmup}")
+        if self.startup_timeout <= 0:
+            raise ValueError(f"startup_timeout must be positive, got {self.startup_timeout}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,52 +262,130 @@ class ExperimentConfig:
     llm: LLMConfig
 
 
-@dataclass(frozen=True, slots=True)
-class ExperimentResult:
-    """The typed outcome of one benchmark run.
+def _hashable(value: object) -> object:
+    """Return a hashable canonical form of one engine payload value.
 
-    The metrics are parsed into first-class fields so experiments can be
-    compared directly, while ``raw_json`` keeps the engine's full result payload
-    and ``raw_result`` keeps the container's raw output, so details the typed
-    result omits remain inspectable.
+    The engine's payload is JSON, so it is built from mappings, lists, and
+    scalars. A mapping becomes a tuple of its key/value pairs sorted by key, and
+    a list a tuple of its items, so nested structures — such as the percentile
+    lists ``vllm bench serve`` writes — are hashable and two payloads that
+    differ only in key order hash equally. Scalars pass through unchanged.
+    """
+    if isinstance(value, Mapping):
+        return tuple(sorted((key, _hashable(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable(item) for item in value)
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class RunMetrics:
+    """The typed metrics of one measured benchmark run.
+
+    One trial takes several measured runs; each becomes a :class:`RunMetrics`
+    and the trial's :class:`ExperimentResult` aggregates them. ``raw_json``
+    keeps the engine's full payload for that run, so details the typed metrics
+    omit remain inspectable, and it is stored as a read-only view so a run is
+    immutable and hashable like the result that holds it.
 
     ``tokens_per_second`` is the engine's *total* token throughput: prompt and
     generated tokens combined, divided by elapsed wall-clock time. It is not
     generation-only, so a workload with a large prompt-to-output ratio is
     dominated by prefill. The name mirrors the engine's own result key, which
     exposes no output-only throughput.
-
-    ``target``, ``image``, and ``devices`` record what actually ran rather than
-    what was requested, so a result is reproducible even when the image or
-    device mapping was resolved by default.
     """
 
     tokens_per_second: float
     requests_per_second: float
     elapsed_time: float
     num_prompts: int
-    target: HardwareTarget
-    image: str
-    devices: tuple[str, ...]
     raw_json: Mapping[str, object]
-    raw_result: ContainerResult
 
     def __post_init__(self) -> None:
-        """Store ``raw_json`` as a read-only view so the result is immutable."""
+        """Store ``raw_json`` as a read-only view so the run is immutable."""
         object.__setattr__(self, "raw_json", MappingProxyType(dict(self.raw_json)))
 
     def __hash__(self) -> int:
-        """Hash the result, ordering ``raw_json`` so equal results hash equally."""
+        """Hash the run, canonicalising ``raw_json`` so equal runs hash equally."""
         return hash(
             (
                 self.tokens_per_second,
                 self.requests_per_second,
                 self.elapsed_time,
                 self.num_prompts,
+                _hashable(self.raw_json),
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentResult:
+    """The typed outcome of one benchmark trial.
+
+    A trial takes one or more measured runs, so the result stores the
+    successful runs as ``runs`` and the number that failed as ``failed_runs``.
+    ``runs`` is the single source of truth: the scalar metrics are derived from
+    it rather than stored alongside it, so the aggregate cannot drift from the
+    runs it summarizes. ``tokens_per_second``, ``requests_per_second``, and
+    ``elapsed_time`` are the means over the successful runs, ``num_prompts`` is
+    their summed measured prompt count, and ``raw_json`` is the tuple of
+    per-run payloads.
+
+    ``raw_result`` keeps the container's raw output, so details the typed
+    result omits remain inspectable. ``target``, ``image``, and ``devices``
+    record what actually ran rather than what was requested, so a result is
+    reproducible even when the image or device mapping was resolved by default.
+
+    A result must carry at least one successful run: an empty ``runs`` tuple
+    cannot describe a trial, so the constructor rejects it.
+    """
+
+    runs: tuple[RunMetrics, ...]
+    failed_runs: int
+    target: HardwareTarget
+    image: str
+    devices: tuple[str, ...]
+    raw_result: ContainerResult
+
+    def __post_init__(self) -> None:
+        """Reject a result that carries no successful run."""
+        if not self.runs:
+            raise ValueError("an experiment result requires at least one successful run")
+
+    @property
+    def tokens_per_second(self) -> float:
+        """Mean total token throughput over the successful runs."""
+        return sum(run.tokens_per_second for run in self.runs) / len(self.runs)
+
+    @property
+    def requests_per_second(self) -> float:
+        """Mean request throughput over the successful runs."""
+        return sum(run.requests_per_second for run in self.runs) / len(self.runs)
+
+    @property
+    def elapsed_time(self) -> float:
+        """Mean elapsed wall-clock time over the successful runs."""
+        return sum(run.elapsed_time for run in self.runs) / len(self.runs)
+
+    @property
+    def num_prompts(self) -> int:
+        """Total measured prompt count across the successful runs."""
+        return sum(run.num_prompts for run in self.runs)
+
+    @property
+    def raw_json(self) -> tuple[Mapping[str, object], ...]:
+        """The engine payload of each successful run, in run order."""
+        return tuple(run.raw_json for run in self.runs)
+
+    def __hash__(self) -> int:
+        """Hash the result, so equal results hash equally."""
+        return hash(
+            (
+                self.runs,
+                self.failed_runs,
                 self.target,
                 self.image,
                 self.devices,
-                tuple(sorted(self.raw_json.items())),
                 self.raw_result,
             )
         )

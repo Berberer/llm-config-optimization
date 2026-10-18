@@ -137,34 +137,43 @@ def _run(
     out: TextIO,
     err: TextIO,
 ) -> int:
-    """Resolve the output mode and cache, then run one invocation.
+    """Resolve the output mode and the base config, then run one invocation.
 
     The output mode is resolved first, because an explicit TUI request without a
-    terminal is a usage error that must fail before any expensive work. A
-    caller-supplied backend is used as-is; the default vLLM backend is given a
-    temporary compile cache for the run, so the trials of one sweep reuse the
-    kernels the first one built while the directory is removed when the run
-    ends.
+    terminal is a usage error that must fail before any expensive work. The base
+    configuration is built next, so a measurement control outside its valid
+    range is reported as a usage error before the space is loaded, the hardware
+    is probed, or a container is pulled. A caller-supplied backend is used
+    as-is; the default vLLM backend is given a temporary compile cache for the
+    run, so the trials of one sweep reuse the kernels the first one built while
+    the directory is removed when the run ends.
     """
     mode = _output_mode(args, out)
     if mode is None:
         print("error: --output tui requires a terminal", file=err)
         return _EXIT_USAGE
 
+    try:
+        base = build_base_config(args)
+    except ValueError as error:
+        print(f"error: {error}", file=err)
+        return _EXIT_USAGE
+
     _print_header(args, out)
 
     if backend is not None:
-        return _sweep(args, backend, mode=mode, client=client, out=out, err=err)
+        return _sweep(args, base, backend, mode=mode, client=client, out=out, err=err)
 
     with tempfile.TemporaryDirectory(
         prefix="llm-config-optimization-cache-", ignore_cleanup_errors=True
     ) as cache_directory:
         resolved_backend = VLLMBackend(cache_dir=Path(cache_directory))
-        return _sweep(args, resolved_backend, mode=mode, client=client, out=out, err=err)
+        return _sweep(args, base, resolved_backend, mode=mode, client=client, out=out, err=err)
 
 
 def _sweep(
     args: argparse.Namespace,
+    base: ExperimentConfig,
     resolved_backend: InferenceBackend,
     *,
     mode: str,
@@ -174,7 +183,8 @@ def _sweep(
 ) -> int:
     """Run the preparation sequence and the sweep, mapping outcomes to exit codes.
 
-    The preparation steps run in order and announce themselves, and the sweep is
+    The base configuration was already built and validated by :func:`_run`; the
+    preparation steps run in order and announce themselves, and the sweep is
     driven through the optimizer with the chosen reporter. Every outcome the
     plan assigns an exit code to is mapped here; anything else propagates to
     :func:`main` as an unexpected error.
@@ -183,7 +193,6 @@ def _sweep(
         space = _load_space(args.space, out)
         hardware = _detect_hardware(args, out)
         _check_supported(space, resolved_backend, hardware, out)
-        base = build_base_config(args)
         model = _prefetch_model(args.model, out)
         _check_model(base, model, resolved_backend, out)
         image = _pull_image(args, hardware.target, resolved_backend, client, out)
@@ -194,7 +203,7 @@ def _sweep(
             space,
             base,
             n_trials=args.n_trials,
-            timeout=args.timeout,
+            timeout=args.sweep_timeout,
             seed=args.sampler_seed,
             storage=args.storage,
             study_name=args.study_name or _default_study_name(args.model),
@@ -251,8 +260,8 @@ def _budget_text(args: argparse.Namespace) -> str:
     bounds: list[str] = []
     if args.n_trials is not None:
         bounds.append(f"{args.n_trials} trials")
-    if args.timeout is not None:
-        bounds.append(f"{args.timeout:g}s")
+    if args.sweep_timeout is not None:
+        bounds.append(f"{args.sweep_timeout:g}s")
     return ", ".join(bounds) if bounds else "unbounded"
 
 

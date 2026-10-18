@@ -1,13 +1,14 @@
 """Integration test for the vLLM ROCm backend on a real AMD GPU.
 
 This runs a small benchmark end to end on a host with an AMD ROCm stack: the
-layer detects the host, plans a ROCm container run, executes it through Podman
-against vLLM's official ROCm image, and parses the engine's result JSON. The
-experiment sets no SELinux option, so the run exercises the runtime's automatic
-default: on an SELinux-enforcing host labeling is disabled for the
-device-mapping container, while on any other host the option resolves to
-nothing. The same assertions hold either way, so the test protects the
-zero-config path without depending on the host's SELinux state.
+layer detects the host, plans a one-container/one-server ROCm run, executes it
+through Podman against vLLM's official ROCm image, and parses the repeated
+online benchmark runs into a typed result. The experiment sets no SELinux
+option, so the run exercises the runtime's automatic default: on an
+SELinux-enforcing host labeling is disabled for the device-mapping container,
+while on any other host the option resolves to nothing. The same assertions
+hold either way, so the test protects the zero-config path without depending on
+the host's SELinux state.
 
 The test is marked ``integration`` and deselected by default; run it with
 ``uv run pytest -m integration``. The module skips when Podman is unavailable,
@@ -42,8 +43,10 @@ MODEL = "facebook/opt-125m"
 _NUM_PROMPTS = 4
 _INPUT_LEN = 32
 _OUTPUT_LEN = 8
-_RUN_TIMEOUT_SECONDS = 900.0
-_RESULT_FILENAME = "result.json"
+_REPETITIONS = 2
+_WARMUP = 1
+_CONTAINER_TIMEOUT_SECONDS = 900.0
+_MANIFEST_FILENAME = "manifest.json"
 
 _MODEL_CACHE = Path.home() / ".cache" / "huggingface" / "hub" / "models--facebook--opt-125m"
 
@@ -122,7 +125,9 @@ def test_rocm_benchmark_runs_with_the_automatic_selinux_default(
             num_prompts=_NUM_PROMPTS,
             input_len=_INPUT_LEN,
             output_len=_OUTPUT_LEN,
-            timeout=_RUN_TIMEOUT_SECONDS,
+            repetitions=_REPETITIONS,
+            warmup=_WARMUP,
+            timeout=_CONTAINER_TIMEOUT_SECONDS,
         ),
         llm=LLMConfig(),
     )
@@ -133,9 +138,12 @@ def test_rocm_benchmark_runs_with_the_automatic_selinux_default(
     assert result.target == HardwareTarget.ROCM
     assert result.image == vllm_rocm_image
     assert result.devices == ("/dev/kfd", "/dev/dri")
+    assert len(result.runs) == _REPETITIONS
+    assert result.failed_runs == 0
     assert result.tokens_per_second > 0
     assert result.requests_per_second > 0
     assert result.elapsed_time > 0
-    assert result.num_prompts == _NUM_PROMPTS
-    assert result.raw_json["model_id"] == model
-    assert (tmp_path / _RESULT_FILENAME).is_file()
+    assert result.num_prompts == _NUM_PROMPTS * _REPETITIONS
+    assert all(run.num_prompts == _NUM_PROMPTS for run in result.runs)
+    assert len(result.raw_json) == _REPETITIONS
+    assert (tmp_path / _MANIFEST_FILENAME).is_file()

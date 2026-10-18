@@ -12,6 +12,8 @@ the parser and the builder are exercised together without a backend.
 
 from pathlib import Path
 
+import pytest
+
 from llm_config_optimization.cli.arguments import parse_args
 from llm_config_optimization.cli.config import build_base_config, is_local_model
 from llm_config_optimization.inference import HardwareTarget, QuantizationMethod
@@ -31,6 +33,9 @@ def test_defaults_produce_the_documented_base_config() -> None:
     assert config.benchmark.num_prompts == 200
     assert config.benchmark.input_len == 1024
     assert config.benchmark.output_len == 128
+    assert config.benchmark.repetitions == 3
+    assert config.benchmark.warmup == 1
+    assert config.benchmark.startup_timeout == 600
     assert config.benchmark.timeout == 900
     assert config.llm.seed == 0
     assert config.llm.quantization is None
@@ -75,7 +80,13 @@ def test_explicit_flags_override_the_base_config() -> None:
                 "512",
                 "--output-len",
                 "64",
-                "--run-timeout",
+                "--repetitions",
+                "5",
+                "--warmup-runs",
+                "2",
+                "--startup-timeout",
+                "300",
+                "--timeout",
                 "120",
                 "--llm-seed",
                 "7",
@@ -98,10 +109,25 @@ def test_explicit_flags_override_the_base_config() -> None:
     assert config.benchmark.num_prompts == 64
     assert config.benchmark.input_len == 512
     assert config.benchmark.output_len == 64
+    assert config.benchmark.repetitions == 5
+    assert config.benchmark.warmup == 2
+    assert config.benchmark.startup_timeout == 300
     assert config.benchmark.timeout == 120
     assert config.llm.seed == 7
     assert config.llm.quantization is QuantizationMethod.AWQ
     assert config.llm.gpu_memory_utilization == 0.9
+
+
+def test_out_of_range_measurement_controls_are_rejected() -> None:
+    """A nonsensical control reaches ``BenchmarkConfig``'s own invariant check."""
+    with pytest.raises(ValueError):
+        build_base_config(parse_args(["facebook/opt-125m", "space.yaml", "--repetitions", "0"]))
+
+    with pytest.raises(ValueError):
+        build_base_config(parse_args(["facebook/opt-125m", "space.yaml", "--warmup-runs", "-1"]))
+
+    with pytest.raises(ValueError):
+        build_base_config(parse_args(["facebook/opt-125m", "space.yaml", "--startup-timeout", "0"]))
 
 
 def test_an_existing_host_path_is_a_local_model(tmp_path: Path) -> None:

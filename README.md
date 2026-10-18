@@ -90,14 +90,39 @@ command line.
 
 #### Benchmark workload
 
-| Flag               | Default      | Description                                                    |
-| ------------------ | ------------ | -------------------------------------------------------------- |
-| `--dataset-name`   | `random`     | Benchmark dataset to serve prompts from.                       |
-| `--dataset-path`   | unset        | Host path to a custom dataset file; the built-in dataset when omitted. |
-| `--num-prompts`    | `200`        | Number of prompts to send per benchmark run.                   |
-| `--input-len`      | `1024`       | Input prompt length, in tokens.                                |
-| `--output-len`     | `128`        | Number of tokens to generate per prompt.                       |
-| `--run-timeout`    | `900`        | Per-run benchmark timeout, in seconds.                         |
+| Flag                | Default      | Description                                                    |
+| ------------------- | ------------ | -------------------------------------------------------------- |
+| `--dataset-name`    | `random`     | Benchmark dataset to serve prompts from.                       |
+| `--dataset-path`    | unset        | Host path to a custom dataset file; the built-in dataset when omitted. |
+| `--num-prompts`     | `200`        | Number of prompts to send per benchmark run.                   |
+| `--input-len`       | `1024`       | Input prompt length, in tokens.                                |
+| `--output-len`      | `128`        | Number of tokens to generate per prompt.                       |
+| `--repetitions`     | `3`          | Measured benchmark runs taken per trial.                       |
+| `--warmup-runs`     | `1`          | Discarded warmup runs taken before the measured runs.          |
+| `--startup-timeout` | `600`        | Seconds to wait for the served model to become healthy.        |
+| `--timeout`         | `900`        | Overall time limit for a trial's container, covering startup, warmup, and every measured run, in seconds. |
+
+Each trial starts `vllm serve` once inside a single container and then drives
+that server with `vllm bench serve` — one discarded warmup run per
+`--warmup-runs`, then `--repetitions` measured runs. The model is loaded once,
+so repeating the benchmark does not repeat vLLM's startup cost. The trial's
+score is the **mean** of the successful measured runs' total token throughput,
+and a trial succeeds as long as a strict majority of its measured runs succeed,
+so a single failed run does not discard an otherwise valid configuration.
+
+Before every run the server's caches are reset through vLLM's dev-mode
+endpoints, and each measured run is seeded with its index `0 … N-1` (warmup
+runs are seeded past that range). The reset keeps a run from being flattered by
+prompts a previous run left cached, and the per-run seed makes it draw a fresh
+prompt set rather than replaying the one that warmed the cache. The per-run
+measurements and the failure count are kept on the result, so the spread behind
+the mean stays inspectable.
+
+> **Note:** measurement goes through the server's HTTP API (`vllm bench
+> serve`) rather than the offline engine path (`vllm bench throughput`). The
+> online numbers include tokenisation and request overhead, so they are
+> expected to be somewhat lower and are **not comparable** to numbers recorded
+> by earlier versions of this tool.
 
 #### Engine
 
@@ -110,10 +135,10 @@ command line.
 
 #### Budget
 
-| Flag          | Default   | Description                                                                 |
-| ------------- | --------- | --------------------------------------------------------------------------- |
-| `--n-trials`  | unbounded | Maximum number of trials to run; unbounded when omitted.                     |
-| `--timeout`   | unbounded | Wall-clock time limit for the sweep, in seconds; unbounded when omitted.     |
+| Flag              | Default   | Description                                                                 |
+| ----------------- | --------- | --------------------------------------------------------------------------- |
+| `--n-trials`      | unbounded | Maximum number of trials to run; unbounded when omitted.                     |
+| `--sweep-timeout` | unbounded | Wall-clock time limit for the sweep, in seconds; unbounded when omitted.     |
 
 With neither bound the sweep runs until you press <kbd>Ctrl-C</kbd>; with both it
 stops at whichever is reached first. An interrupt is not a failure. Instead the best
@@ -215,7 +240,7 @@ $ llm-config-optimization /models/Qwen3.8-Flash-Next space.yaml \
     --target rocm \
     --mem-limit 400g \
     --shm-size 32g \
-    --timeout 7200
+    --sweep-timeout 7200
 ```
 
 **Reproducible, persisted, resumable sweep:**
@@ -258,7 +283,7 @@ $ llm-config-optimization Qwen/Qwen3.8-27B space.yaml \
     --num-prompts 500 \
     --input-len 2048 \
     --output-len 256 \
-    --run-timeout 1800
+    --timeout 1800
 ```
 
 > **Requirement:** runs execute through Podman, so a running Podman daemon is
@@ -358,7 +383,12 @@ a value the host can run. Either problem is rejected up front (exit code `4`).
 tunable. `seed` and `gpu_memory_utilization` are reproducibility and fit knobs
 set on the command line (`--llm-seed`, `--gpu-memory-utilization`);
 `quantization` describes how the checkpoint was produced, so it is a model
-property rather than a runtime choice and is set with `--quantization`.
+property rather than a runtime choice and is set with `--quantization`. The
+measurement controls — `repetitions`, `warmup`, `startup_timeout`, and the
+overall container `timeout` — are non-tunables too: they configure *how* a
+point is measured, not which point is tried, so they are set on the command
+line (`--repetitions`, `--warmup-runs`, `--startup-timeout`, `--timeout`) and
+never enter the search space.
 
 Because it is a checkpoint property, `--quantization` is validated against the
 resolved checkpoint before the image is pulled: a quantized checkpoint accepts
@@ -437,7 +467,7 @@ space:
 | -------------------- | -------------------------------------------------------------------------- |
 | Language / packaging | Python **3.14**, `src/` layout, [uv](https://docs.astral.sh/uv/) with the `uv_build` backend |
 | Search / optimization| [Optuna](https://optuna.org/) TPE sampler, maximizing token throughput; SQLite or in-memory studies |
-| Inference engine     | **vLLM** (the only backend implemented so far) via `vllm bench throughput`; the layer above it is engine-neutral |
+| Inference engine     | **vLLM** (the only backend implemented so far), served once per trial with `vllm serve` and measured repeatedly by `vllm bench serve`; the layer above it is engine-neutral |
 | Container runtime    | **Podman** via the [`podman`](https://pypi.org/project/podman/) Python bindings (CDI for CUDA, device nodes for ROCm, none for CPU) |
 | Config format        | **PyYAML** (`yaml.safe_load`) for the search-space and output-config files |
 | Model fetching       | [`huggingface_hub`](https://pypi.org/project/huggingface-hub/) snapshot download for Hugging Face ids |

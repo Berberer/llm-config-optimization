@@ -28,6 +28,7 @@ from llm_config_optimization.inference import (
     HardwareTarget,
     InferenceBackend,
     LLMConfig,
+    RunMetrics,
     run_experiment,
 )
 from llm_config_optimization.runtime import ContainerConfig, ContainerResult, ContainerRunError
@@ -73,14 +74,19 @@ def _experiment(*, target: HardwareTarget | None = None) -> ExperimentConfig:
 def _result() -> ExperimentResult:
     """Build the canned typed result the fake backend returns from parsing."""
     return ExperimentResult(
-        tokens_per_second=10.0,
-        requests_per_second=1.0,
-        elapsed_time=2.0,
-        num_prompts=5,
+        runs=(
+            RunMetrics(
+                tokens_per_second=10.0,
+                requests_per_second=1.0,
+                elapsed_time=2.0,
+                num_prompts=5,
+                raw_json={},
+            ),
+        ),
+        failed_runs=0,
         target=HardwareTarget.CPU,
         image=_PLAN.image,
         devices=(),
-        raw_json={},
         raw_result=ContainerResult(exit_code=0, stdout=b"", stderr=b"", container_id="fake"),
     )
 

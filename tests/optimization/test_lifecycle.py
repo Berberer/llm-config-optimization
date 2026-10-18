@@ -34,6 +34,7 @@ from llm_config_optimization.inference import (
     ExperimentResult,
     HardwareTarget,
     LLMConfig,
+    RunMetrics,
 )
 from llm_config_optimization.optimization import (
     OptimizationError,
@@ -48,14 +49,19 @@ PLAN = ContainerConfig(image="fake/engine:latest", command=("bench",))
 """The canned container plan the fake backend returns."""
 
 RESULT = ExperimentResult(
-    tokens_per_second=42.0,
-    requests_per_second=4.0,
-    elapsed_time=2.5,
-    num_prompts=8,
+    runs=(
+        RunMetrics(
+            tokens_per_second=42.0,
+            requests_per_second=4.0,
+            elapsed_time=2.5,
+            num_prompts=8,
+            raw_json={"tokens_per_second": 42.0},
+        ),
+    ),
+    failed_runs=0,
     target=HardwareTarget.CPU,
     image=PLAN.image,
     devices=(),
-    raw_json={"tokens_per_second": 42.0},
     raw_result=ContainerResult(exit_code=0, stdout=b"", stderr=b"", container_id="fake"),
 )
 """The canned typed result the fake backend returns from parsing."""
@@ -165,7 +171,51 @@ def test_a_successful_trial_records_a_serializable_result_projection() -> None:
         "target": "cpu",
         "image": PLAN.image,
         "devices": [],
+        "failed_runs": 0,
+        "runs": [{"tokens_per_second": 42.0, "requests_per_second": 4.0}],
     }
+    assert json.loads(json.dumps(recorded)) == recorded
+
+
+def test_a_trial_projection_keeps_the_per_run_spread_and_failure_count() -> None:
+    """The projection explains a marginal pass, not only the mean it scored."""
+    spread = ExperimentResult(
+        runs=(
+            RunMetrics(
+                tokens_per_second=40.0,
+                requests_per_second=3.5,
+                elapsed_time=2.0,
+                num_prompts=8,
+                raw_json={"run": 0},
+            ),
+            RunMetrics(
+                tokens_per_second=50.0,
+                requests_per_second=4.5,
+                elapsed_time=3.0,
+                num_prompts=8,
+                raw_json={"run": 1},
+            ),
+        ),
+        failed_runs=1,
+        target=HardwareTarget.CPU,
+        image=PLAN.image,
+        devices=(),
+        raw_result=RESULT.raw_result,
+    )
+    backend = FakeBackend(PLAN, spread, [])
+
+    result = optimize(SPACE, BASE, n_trials=1, seed=0, backend=backend, client=FakePodmanClient())
+
+    (trial,) = result.study.trials
+    recorded = trial.user_attrs["result"]
+
+    assert recorded["failed_runs"] == 1
+    assert recorded["runs"] == [
+        {"tokens_per_second": 40.0, "requests_per_second": 3.5},
+        {"tokens_per_second": 50.0, "requests_per_second": 4.5},
+    ]
+    assert recorded["tokens_per_second"] == 45.0
+    assert trial.value == result.best_value == 45.0
     assert json.loads(json.dumps(recorded)) == recorded
 
 

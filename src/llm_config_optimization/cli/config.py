@@ -41,12 +41,12 @@ def build_base_config(args: argparse.Namespace) -> ExperimentConfig:
     """Build the fixed experiment the search space is varied around.
 
     The container domain takes the target, image, shared-memory size, memory
-    limit, and pull policy; the benchmark domain takes the model and the
-    workload shape; and the LLM domain takes only the non-tunable serving
-    values, the quantization method, engine seed, and GPU memory utilization.
-    Every tunable serving parameter is left ``None`` so the space supplies it,
-    and an omitted ``--target`` or ``--image`` stays ``None`` so the backend
-    resolves it.
+    limit, and pull policy; the benchmark domain takes the model, the workload
+    shape, and the measurement controls; and the LLM domain takes only the
+    non-tunable serving values, the quantization method, engine seed, and GPU
+    memory utilization. Every tunable serving parameter is left ``None`` so the
+    space supplies it, and an omitted ``--target`` or ``--image`` stays ``None``
+    so the backend resolves it.
     """
     container = ContainerRuntimeConfig(
         target=HardwareTarget(args.target) if args.target is not None else None,
@@ -62,7 +62,10 @@ def build_base_config(args: argparse.Namespace) -> ExperimentConfig:
         num_prompts=args.num_prompts,
         input_len=args.input_len,
         output_len=args.output_len,
-        timeout=args.run_timeout,
+        repetitions=args.repetitions,
+        warmup=args.warmup_runs,
+        startup_timeout=args.startup_timeout,
+        timeout=args.timeout,
     )
     llm = LLMConfig(
         quantization=(

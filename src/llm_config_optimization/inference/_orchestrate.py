@@ -53,7 +53,8 @@ def run_experiment(
     When ``output_dir`` is supplied it is used as-is and left in place. When it
     is omitted a unique temporary directory is created for the run and removed
     once the result has been parsed, so concurrent runs never share a result
-    file; the parsed JSON remains available on the result as ``raw_json``.
+    file; the parsed JSON remains available on the result as the per-run
+    ``raw_json`` payloads.
 
     Raises:
         ExperimentError: If the container run fails — the underlying

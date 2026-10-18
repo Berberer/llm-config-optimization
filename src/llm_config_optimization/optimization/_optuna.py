@@ -325,6 +325,11 @@ def _project_result(result: ExperimentResult) -> dict[str, object]:
     stored because its raw container output is not JSON-serializable; the typed
     metrics and the resolved target, image, and devices are, so the study keeps
     an inspectable record of what actually ran.
+
+    The aggregate metrics alone would hide how a trial's measured runs were
+    spread, so the projection also carries each successful run's throughputs and
+    the count of runs that failed. That makes a persisted study explain a
+    marginal pass as clearly as a clean one, without re-running anything.
     """
     return {
         "tokens_per_second": result.tokens_per_second,
@@ -333,6 +338,14 @@ def _project_result(result: ExperimentResult) -> dict[str, object]:
         "target": result.target.value,
         "image": result.image,
         "devices": list(result.devices),
+        "failed_runs": result.failed_runs,
+        "runs": [
+            {
+                "tokens_per_second": run.tokens_per_second,
+                "requests_per_second": run.requests_per_second,
+            }
+            for run in result.runs
+        ],
     }
 
 

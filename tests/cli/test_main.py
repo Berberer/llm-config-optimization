@@ -30,6 +30,7 @@ from llm_config_optimization.inference import (
     ExperimentError,
     ExperimentResult,
     HardwareTarget,
+    RunMetrics,
     VLLMBackend,
 )
 from llm_config_optimization.runtime import ContainerConfig, ContainerResult
@@ -39,14 +40,19 @@ PLAN = ContainerConfig(image="fake/engine:latest", command=("bench",))
 """The canned container plan the fake backend returns."""
 
 RESULT = ExperimentResult(
-    tokens_per_second=42.0,
-    requests_per_second=4.0,
-    elapsed_time=2.5,
-    num_prompts=8,
+    runs=(
+        RunMetrics(
+            tokens_per_second=42.0,
+            requests_per_second=4.0,
+            elapsed_time=2.5,
+            num_prompts=8,
+            raw_json={"tokens_per_second": 42.0},
+        ),
+    ),
+    failed_runs=0,
     target=HardwareTarget.CPU,
     image=PLAN.image,
     devices=(),
-    raw_json={"tokens_per_second": 42.0},
     raw_result=ContainerResult(exit_code=0, stdout=b"", stderr=b"", container_id="fake"),
 )
 """The canned typed result the fake backend returns from parsing every trial."""
@@ -269,6 +275,45 @@ def test_the_output_mode_defaults_to_log_without_a_terminal(tmp_path: Path, mode
     assert code == 0
     assert err == ""
     assert "trial 1/1  COMPLETE  42.00 tps" in out
+
+
+def test_the_budget_reports_the_sweep_timeout(tmp_path: Path, model: str) -> None:
+    """The renamed ``--sweep-timeout`` flag is the budget the header reports."""
+    space = _write_space(tmp_path / "space.yaml")
+
+    code, out, err = _invoke(model, space, "--n-trials", "2", "--sweep-timeout", "30")
+
+    assert code == 0
+    assert err == ""
+    assert "budget: 2 trials, 30s" in out
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--repetitions", "0"],
+        ["--warmup-runs", "-1"],
+        ["--startup-timeout", "0"],
+    ],
+    ids=["repetitions", "warmup", "startup-timeout"],
+)
+def test_an_out_of_range_measurement_control_is_a_usage_error(
+    tmp_path: Path, model: str, extra: list[str]
+) -> None:
+    """A bad measurement control fails before the space is loaded or a trial runs."""
+    space = _write_space(tmp_path / "space.yaml")
+    backend = _backend()
+    client = FakePodmanClient()
+
+    code, out, err = _invoke(
+        model, space, "--n-trials", "1", *extra, backend=backend, client=client
+    )
+
+    assert code == 2
+    assert out == ""
+    assert "error:" in err
+    assert backend.plan_calls == []
+    assert client.pull_calls == []
 
 
 def test_the_never_pull_policy_skips_the_pull_and_says_so(tmp_path: Path, model: str) -> None:

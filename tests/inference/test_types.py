@@ -22,6 +22,7 @@ from llm_config_optimization.inference import (
     ExperimentResult,
     HardwareTarget,
     LLMConfig,
+    RunMetrics,
 )
 from llm_config_optimization.runtime import ContainerResult
 
@@ -37,17 +38,27 @@ def _experiment() -> ExperimentConfig:
     )
 
 
+def _run(**overrides: object) -> RunMetrics:
+    """Build a measured run whose ``raw_json`` is a mapping, so hashing is exercised."""
+    fields: dict[str, object] = {
+        "tokens_per_second": 1234.5,
+        "requests_per_second": 12.25,
+        "elapsed_time": 8.5,
+        "num_prompts": 100,
+        "raw_json": {"tokens_per_second": 1234.5, "num_requests": 100},
+    }
+    fields.update(overrides)
+    return RunMetrics(**fields)  # type: ignore[arg-type]
+
+
 def _result() -> ExperimentResult:
-    """Build a result carrying a mapping for ``raw_json`` and a container outcome."""
+    """Build a result carrying one measured run and a container outcome."""
     return ExperimentResult(
-        tokens_per_second=1234.5,
-        requests_per_second=12.25,
-        elapsed_time=8.5,
-        num_prompts=100,
+        runs=(_run(),),
+        failed_runs=0,
         target=HardwareTarget.CUDA,
         image="docker.io/vllm/vllm-openai:latest",
         devices=("nvidia.com/gpu=all",),
-        raw_json={"tokens_per_second": 1234.5, "num_requests": 100},
         raw_result=ContainerResult(exit_code=0, stdout=b"benchmark log\n", stderr=b""),
     )
 
@@ -60,8 +71,9 @@ def _result() -> ExperimentResult:
         (LLMConfig(), "dtype", DType.FLOAT16),
         (_experiment(), "llm", LLMConfig(dtype=DType.FLOAT16)),
         (_result(), "image", "other/image"),
+        (_run(), "tokens_per_second", 1.0),
     ],
-    ids=["container", "benchmark", "llm", "experiment", "result"],
+    ids=["container", "benchmark", "llm", "experiment", "result", "run"],
 )
 def test_config_types_are_frozen_and_hashable(
     config: object, attribute: str, value: object
@@ -82,11 +94,60 @@ def test_container_config_env_is_immutable_and_hashes_regardless_of_order() -> N
 
 
 def test_result_hashes_regardless_of_raw_json_order() -> None:
-    first = replace(_result(), raw_json={"a": 1, "b": 2})
-    second = replace(_result(), raw_json={"b": 2, "a": 1})
+    first = replace(_result(), runs=(_run(raw_json={"a": 1, "b": 2}),))
+    second = replace(_result(), runs=(_run(raw_json={"b": 2, "a": 1}),))
 
     assert first == second
     assert hash(first) == hash(second)
+
+
+def test_result_hashes_the_nested_payload_the_engine_writes() -> None:
+    """``vllm bench serve`` writes list-valued percentile fields, not only scalars."""
+    run = _run(
+        raw_json={
+            "total_token_throughput": 1234.5,
+            "completed": 100,
+            "percentiles_ttft_ms": [[50, 12.3], [99, 45.6]],
+        }
+    )
+
+    assert isinstance(hash(replace(_result(), runs=(run,))), int)
+
+
+def test_run_hashes_regardless_of_nested_mapping_order() -> None:
+    first = _run(raw_json={"stats": {"a": 1, "b": [1, 2]}})
+    second = _run(raw_json={"stats": {"b": [1, 2], "a": 1}})
+
+    assert first == second
+    assert hash(first) == hash(second)
+
+
+def test_result_derives_its_metrics_from_the_successful_runs() -> None:
+    runs = (
+        _run(tokens_per_second=10.0, requests_per_second=1.0, elapsed_time=2.0, num_prompts=4),
+        _run(tokens_per_second=20.0, requests_per_second=3.0, elapsed_time=4.0, num_prompts=6),
+    )
+
+    result = replace(_result(), runs=runs, failed_runs=1)
+
+    assert result.tokens_per_second == 15.0
+    assert result.requests_per_second == 2.0
+    assert result.elapsed_time == 3.0
+    assert result.num_prompts == 10
+    assert result.raw_json == tuple(run.raw_json for run in runs)
+    assert result.failed_runs == 1
+
+
+def test_result_rejects_an_empty_run_set() -> None:
+    with pytest.raises(ValueError):
+        ExperimentResult(
+            runs=(),
+            failed_runs=0,
+            target=HardwareTarget.CPU,
+            image="fake/engine:latest",
+            devices=(),
+            raw_result=ContainerResult(exit_code=0, stdout=b"", stderr=b""),
+        )
 
 
 def test_replace_yields_a_distinct_hash() -> None:

@@ -34,13 +34,16 @@ def test_defaults_match_the_documented_settings() -> None:
     assert args.num_prompts == 200
     assert args.input_len == 1024
     assert args.output_len == 128
-    assert args.run_timeout == 900
+    assert args.repetitions == 3
+    assert args.warmup_runs == 1
+    assert args.startup_timeout == 600
+    assert args.timeout == 900
     assert args.llm_seed == 0
     assert args.quantization is None
     assert args.gpu_memory_utilization is None
     assert args.sampler_seed is None
     assert args.n_trials is None
-    assert args.timeout is None
+    assert args.sweep_timeout is None
     assert args.storage is None
     assert args.study_name is None
     assert args.n_jobs == 1
@@ -73,7 +76,13 @@ def test_explicit_flags_override_every_default() -> None:
             "512",
             "--output-len",
             "64",
-            "--run-timeout",
+            "--repetitions",
+            "5",
+            "--warmup-runs",
+            "2",
+            "--startup-timeout",
+            "300",
+            "--timeout",
             "120",
             "--llm-seed",
             "7",
@@ -85,7 +94,7 @@ def test_explicit_flags_override_every_default() -> None:
             "42",
             "--n-trials",
             "10",
-            "--timeout",
+            "--sweep-timeout",
             "600",
             "--storage",
             "sqlite:///study.db",
@@ -110,13 +119,16 @@ def test_explicit_flags_override_every_default() -> None:
     assert args.num_prompts == 64
     assert args.input_len == 512
     assert args.output_len == 64
-    assert args.run_timeout == 120
+    assert args.repetitions == 5
+    assert args.warmup_runs == 2
+    assert args.startup_timeout == 300
+    assert args.timeout == 120
     assert args.llm_seed == 7
     assert args.quantization == "awq"
     assert args.gpu_memory_utilization == 0.9
     assert args.sampler_seed == 42
     assert args.n_trials == 10
-    assert args.timeout == 600
+    assert args.sweep_timeout == 600
     assert args.storage == "sqlite:///study.db"
     assert args.study_name == "sweep"
     assert args.n_jobs == 2
@@ -171,10 +183,21 @@ def test_help_exits_zero_and_documents_the_invocation(
     text = capsys.readouterr().out
     assert "MODEL" in text
     assert "SPACE" in text
-    for flag in ("--target", "--n-trials", "--output", "--output-config"):
+    for flag in (
+        "--target",
+        "--repetitions",
+        "--warmup-runs",
+        "--startup-timeout",
+        "--timeout",
+        "--sweep-timeout",
+        "--n-trials",
+        "--output",
+        "--output-config",
+    ):
         assert flag in text, flag
     assert "(default: 8g)" in text
     assert "(default: 1024)" in text
+    assert "--sweep-timeout 3600" in text
     assert "examples:" in text
 
 

@@ -1,11 +1,12 @@
 """Integration test for the optimization adapter's real sweep path.
 
 This runs a real two-trial sweep end to end: ``optimize`` samples a
-mostly-fixed space, rebuilds an experiment per trial, executes each through the
-real vLLM CPU backend and Podman, records the outcome on the study, and returns
-the winning configuration. It asserts the result and study shape — the trial
-count, that every trial completed, and that the returned configuration carries
-the fixed and inherited values it should — rather than the throughput, which is
+mostly-fixed space, rebuilds an experiment per trial, executes each as a
+one-container/one-server run through the real vLLM CPU backend and Podman,
+records the repeated-run outcome on the study, and returns the winning
+configuration. It asserts the result and study shape — the trial count, that
+every trial completed, and that the returned configuration carries the fixed
+and inherited values it should — rather than the throughput, which is
 hardware-dependent.
 
 The test is marked ``integration`` and deselected by default; run it with
@@ -51,7 +52,9 @@ MODEL = "facebook/opt-125m"
 _NUM_PROMPTS = 4
 _INPUT_LEN = 32
 _OUTPUT_LEN = 8
-_RUN_TIMEOUT_SECONDS = 900.0
+_REPETITIONS = 2
+_WARMUP = 1
+_CONTAINER_TIMEOUT_SECONDS = 900.0
 _N_TRIALS = 2
 
 # opt-125m ships float16 weights, whose support on torch CPU is unstable; the
@@ -73,7 +76,9 @@ BASE = ExperimentConfig(
         num_prompts=_NUM_PROMPTS,
         input_len=_INPUT_LEN,
         output_len=_OUTPUT_LEN,
-        timeout=_RUN_TIMEOUT_SECONDS,
+        repetitions=_REPETITIONS,
+        warmup=_WARMUP,
+        timeout=_CONTAINER_TIMEOUT_SECONDS,
     ),
     llm=LLMConfig(
         dtype=_CPU_DTYPE,
@@ -184,3 +189,9 @@ def test_two_trial_sweep_returns_a_usable_best_configuration(
     assert recorded["target"] == HardwareTarget.CPU.value
     assert recorded["image"] == vllm_cpu_image
     assert recorded["devices"] == []
+    assert recorded["failed_runs"] == 0
+    per_run = recorded["runs"]
+    assert len(per_run) == _REPETITIONS
+    assert recorded["tokens_per_second"] == pytest.approx(
+        sum(run["tokens_per_second"] for run in per_run) / len(per_run)
+    )

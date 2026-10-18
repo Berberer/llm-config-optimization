@@ -26,6 +26,7 @@ from .types import (
     KVCacheDType,
     LLMConfig,
     QuantizationMethod,
+    RunMetrics,
 )
 
 __all__ = [
@@ -42,6 +43,7 @@ __all__ = [
     "KVCacheDType",
     "LLMConfig",
     "QuantizationMethod",
+    "RunMetrics",
     "VLLMBackend",
     "detect_hardware",
     "run_experiment",

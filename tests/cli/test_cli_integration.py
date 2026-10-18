@@ -3,10 +3,11 @@
 This drives the real command-line entry point end to end: ``main`` parses an
 argument vector, loads and validates the search-space file, resolves the CPU
 target and the vLLM CPU image, prefetches the model, pulls the image, runs a
-two-trial sweep through the real vLLM CPU backend and Podman, prints one log
-line per completed trial, and writes the winning configuration. It asserts the
-observable contract — the exit code, the log lines, and the written YAML —
-rather than the throughput, which is hardware-dependent.
+two-trial sweep as one-container/one-server runs through the real vLLM CPU
+backend and Podman, prints one log line per completed trial, and writes the
+winning configuration. It asserts the observable contract — the exit code, the
+log lines, and the written YAML — rather than the throughput, which is
+hardware-dependent.
 
 The test is marked ``integration`` and deselected by default; run it with
 ``uv run pytest -m integration``. The module skips when Podman is unavailable,
@@ -35,7 +36,9 @@ MODEL = "facebook/opt-125m"
 _NUM_PROMPTS = 4
 _INPUT_LEN = 32
 _OUTPUT_LEN = 8
-_RUN_TIMEOUT_SECONDS = 900.0
+_REPETITIONS = 2
+_WARMUP = 1
+_CONTAINER_TIMEOUT_SECONDS = 900.0
 _N_TRIALS = 2
 
 # opt-125m ships float16 weights, whose support on torch CPU is unstable; the
@@ -142,8 +145,12 @@ def test_two_trial_cpu_sweep_reports_progress_and_writes_the_winner(
             str(_INPUT_LEN),
             "--output-len",
             str(_OUTPUT_LEN),
-            "--run-timeout",
-            str(_RUN_TIMEOUT_SECONDS),
+            "--repetitions",
+            str(_REPETITIONS),
+            "--warmup-runs",
+            str(_WARMUP),
+            "--timeout",
+            str(_CONTAINER_TIMEOUT_SECONDS),
         ],
         backend=VLLMBackend(cpu_image=vllm_cpu_image),
         client=podman_client,
@@ -173,7 +180,10 @@ def test_two_trial_cpu_sweep_reports_progress_and_writes_the_winner(
     assert document["benchmark"]["num_prompts"] == _NUM_PROMPTS
     assert document["benchmark"]["input_len"] == _INPUT_LEN
     assert document["benchmark"]["output_len"] == _OUTPUT_LEN
-    assert document["benchmark"]["timeout"] == _RUN_TIMEOUT_SECONDS
+    assert document["benchmark"]["repetitions"] == _REPETITIONS
+    assert document["benchmark"]["warmup"] == _WARMUP
+    assert document["benchmark"]["startup_timeout"] == 600.0
+    assert document["benchmark"]["timeout"] == _CONTAINER_TIMEOUT_SECONDS
     assert document["llm"]["dtype"] == _CPU_DTYPE
     assert document["llm"]["quantization"] is None
     assert document["llm"]["kv_cache_dtype"] == "auto"

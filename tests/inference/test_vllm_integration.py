@@ -1,10 +1,11 @@
 """Integration tests for the vLLM inference backend.
 
 These run a real benchmark end to end: the layer detects the host, plans a
-container run, executes it through Podman against vLLM's official CPU image,
-and parses the engine's result JSON. The experiment forces the CPU target and
-uses a sub-1B model, so no accelerator is assumed and the suite is runnable on
-any machine with Podman and network access.
+one-container/one-server run, executes it through Podman against vLLM's official
+CPU image, and parses the repeated online benchmark runs into a typed result.
+The experiment forces the CPU target and uses a sub-1B model, so no accelerator
+is assumed and the suite is runnable on any machine with Podman and network
+access.
 
 The tests are marked ``integration`` and deselected by default; run them with
 ``uv run pytest -m integration``. The module skips when Podman is unavailable,
@@ -39,8 +40,10 @@ MODEL = "facebook/opt-125m"
 _NUM_PROMPTS = 4
 _INPUT_LEN = 32
 _OUTPUT_LEN = 8
-_RUN_TIMEOUT_SECONDS = 900.0
-_RESULT_FILENAME = "result.json"
+_REPETITIONS = 2
+_WARMUP = 1
+_CONTAINER_TIMEOUT_SECONDS = 900.0
+_MANIFEST_FILENAME = "manifest.json"
 
 # opt-125m ships float16 weights, whose support on torch CPU is unstable; the
 # CPU backend asks for an explicit portable dtype instead. On CPU the
@@ -112,7 +115,9 @@ def test_cpu_benchmark_runs_end_to_end(vllm_cpu_image: str, model: str, tmp_path
             num_prompts=_NUM_PROMPTS,
             input_len=_INPUT_LEN,
             output_len=_OUTPUT_LEN,
-            timeout=_RUN_TIMEOUT_SECONDS,
+            repetitions=_REPETITIONS,
+            warmup=_WARMUP,
+            timeout=_CONTAINER_TIMEOUT_SECONDS,
         ),
         llm=LLMConfig(dtype=_CPU_DTYPE, gpu_memory_utilization=_CPU_MEMORY_UTILIZATION),
     )
@@ -123,9 +128,12 @@ def test_cpu_benchmark_runs_end_to_end(vllm_cpu_image: str, model: str, tmp_path
     assert result.target == HardwareTarget.CPU
     assert result.image == vllm_cpu_image
     assert result.devices == ()
+    assert len(result.runs) == _REPETITIONS
+    assert result.failed_runs == 0
     assert result.tokens_per_second > 0
     assert result.requests_per_second > 0
     assert result.elapsed_time > 0
-    assert result.num_prompts == _NUM_PROMPTS
-    assert result.raw_json["model_id"] == model
-    assert (tmp_path / _RESULT_FILENAME).is_file()
+    assert result.num_prompts == _NUM_PROMPTS * _REPETITIONS
+    assert all(run.num_prompts == _NUM_PROMPTS for run in result.runs)
+    assert len(result.raw_json) == _REPETITIONS
+    assert (tmp_path / _MANIFEST_FILENAME).is_file()

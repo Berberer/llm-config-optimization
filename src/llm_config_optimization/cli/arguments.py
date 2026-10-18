@@ -33,7 +33,7 @@ _EPILOG = """\
 examples:
   llm-config-optimization facebook/opt-125m space.yaml
   llm-config-optimization facebook/opt-125m space.yaml --n-trials 50 --output-config best.yaml
-  llm-config-optimization /models/Llama-3.1-8B space.yaml --target cuda --timeout 3600
+  llm-config-optimization /models/Llama-3.1-8B space.yaml --target cuda --sweep-timeout 3600
 """
 
 
@@ -132,10 +132,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of tokens to generate per prompt.",
     )
     benchmark.add_argument(
-        "--run-timeout",
+        "--repetitions",
+        type=int,
+        default=3,
+        help="Number of measured benchmark runs taken per trial.",
+    )
+    benchmark.add_argument(
+        "--warmup-runs",
+        type=int,
+        default=1,
+        help="Discarded warmup runs taken before the measured runs.",
+    )
+    benchmark.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=600,
+        help="Seconds to wait for the served model to become healthy.",
+    )
+    benchmark.add_argument(
+        "--timeout",
         type=float,
         default=900,
-        help="Per-run benchmark timeout, in seconds.",
+        help="Overall time limit for a trial's container, covering startup, warmup, and every measured run, in seconds.",
     )
 
     engine = parser.add_argument_group("engine")
@@ -172,7 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of trials to run; unbounded when omitted.",
     )
     budget.add_argument(
-        "--timeout",
+        "--sweep-timeout",
         type=float,
         default=None,
         help="Wall-clock time limit for the sweep, in seconds; unbounded when omitted.",
