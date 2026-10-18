@@ -30,7 +30,6 @@
             packages = with pkgs; [
               python3
               uv
-              ruff
 
               nodejs_24
               pi-coding-agent

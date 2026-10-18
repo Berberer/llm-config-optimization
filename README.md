@@ -56,8 +56,8 @@ $ uv tool install .
 $ llm-config-optimization --help
 ```
 
-With [Nix](https://nixos.org/), `nix develop` provides Python, uv, and Ruff in a
-dev shell; run `uv sync` inside it once.
+With [Nix](https://nixos.org/), `nix develop` provides Python and uv in a dev
+shell; run `uv sync` inside it once to install the Python tooling.
 
 ### Synopsis
 
@@ -474,7 +474,8 @@ space:
 | Terminal UI          | [`plotext`](https://pypi.org/project/plotext/) for the live best-so-far graph |
 | Testing              | **pytest** (unit tests use fakes; `integration`-marked tests need a Podman daemon and are deselected by default) |
 | Linting / formatting | **Ruff** (line length 100, `py314` target)                                  |
-| Dev environment      | Nix flake (`nix develop`) providing Python, uv, and Ruff                   |
+| Type checking        | **ty** (checks the library sources in `src/`; `tests/` is excluded)        |
+| Dev environment      | Nix flake (`nix develop`) providing Python and uv; run `uv sync` to install the Python tooling (ruff, ty, pytest) |
 
 ### Architecture
 

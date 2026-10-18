@@ -112,7 +112,7 @@ Tests:
   translates and unsupported values are rejected.
 - [ ] Any other test that constructs a full `LLMConfig`, a complete
   `ExperimentSpace`, or asserts the canonical dimension order.
-- [ ] Run `uv run ruff format .`, `uv run ruff check .`, and `uv run pytest`.
+- [ ] Run `uv run ruff format .`, `uv run ruff check .`, `uv run ty check`, and `uv run pytest`.
 
 ### Data flow
 
@@ -135,6 +135,10 @@ hand-formatting.
 - Lint rules: `E4 E7 E9 F I UP B SIM C4 RUF` (no `E501`; the formatter owns
   line wrapping).
 
+Types are checked by [ty](https://docs.astral.sh/ty/) against the library
+sources in `src/`; `tests/` is excluded because its fakes do not implement every
+protocol member. Keep `uv run ty check` clean when touching `src/`.
+
 Always run tools through `uv run` so they use the project environment.
 
 ## Tools
@@ -144,6 +148,7 @@ Always run tools through `uv run` so they use the project environment.
 | Format in place    | `uv run ruff format .`         |
 | Lint (report)      | `uv run ruff check .`          |
 | Lint (auto-fix)    | `uv run ruff check --fix .`    |
+| Type check         | `uv run ty check`              |
 | Unit tests         | `uv run pytest`                |
 | Integration tests  | `uv run pytest -m integration` |
 
@@ -151,7 +156,7 @@ Always run tools through `uv run` so they use the project environment.
   (`addopts = "-m 'not integration'"` in `pyproject.toml`). They require a
   running Podman daemon.
 - Add dev tooling with `uv add --dev <pkg>` to keep it out of runtime deps.
-- `nix develop` provides Python, uv, and Ruff in the dev shell.
+- `nix develop` provides Python and uv in the dev shell; `uv sync` installs the Python tooling (ruff, ty, pytest).
 
 ## Testing conventions
 
