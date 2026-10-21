@@ -12,8 +12,12 @@ The package is driven through a single :func:`main` entry point that returns an
 integer exit code, so both the console script and ``python -m llm_config_optimization``
 can share one implementation. The inference engine is chosen by the required
 ``ENGINE`` positional and resolved through a small registry of backend factories,
-so the rest of the composition root never imports an engine class. ``main`` is a
-pure composition root: it loads the search space, resolves the hardware target,
+so the rest of the composition root never imports an engine class. That registry
+also records which command-line options each engine rejects, so an option listed
+for rejection is a usage error rather than a value the engine would silently
+ignore.
+``main`` is a pure composition root: it loads the search space, resolves the
+hardware target,
 validates the space against that target, builds the base configuration, resolves
 the model to a local directory, validates the model against that configuration,
 pulls the container image, and then calls the optimization adapter with the
@@ -32,16 +36,28 @@ to stderr.
 import argparse
 import sys
 import tempfile
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 import optuna
 
-from ..inference import BenchmarkClient, LocalCheckpoint, VLLMBackend, detect_hardware
-from ..inference.types import DetectedHardware, ExperimentConfig, HardwareTarget, InferenceBackend
+from ..inference import (
+    BenchmarkClient,
+    LlamaCppBackend,
+    LocalCheckpoint,
+    VLLMBackend,
+    detect_hardware,
+)
+from ..inference.types import (
+    DetectedHardware,
+    ExperimentConfig,
+    ExperimentError,
+    HardwareTarget,
+    InferenceBackend,
+)
 from ..optimization import (
     OptimizationError,
     OptimizationInterrupted,
@@ -89,15 +105,47 @@ def _vllm_backend() -> Generator[InferenceBackend]:
         yield VLLMBackend(cache_dir=Path(cache_directory))
 
 
-_ENGINE_FACTORIES: dict[str, Callable[[], AbstractContextManager[InferenceBackend]]] = {
-    "vllm": _vllm_backend,
-}
-"""Maps the CLI's ``ENGINE`` token to a backend factory.
+@contextmanager
+def _llamacpp_backend() -> Generator[InferenceBackend]:
+    """Build the llama.cpp backend for the duration of a sweep.
 
-The registry is the only place that knows which engines exist; the rest of the
-composition root selects a backend by token and never imports an engine class.
-A factory is a context manager so it can own the resources a backend needs for
-the whole sweep (vLLM's compile cache) without leaking that detail into the CLI.
+    llama.cpp needs no per-run host resources, so the factory only yields the
+    backend; it follows the registry's uniform context-manager contract rather
+    than leaking the engine's construction into the rest of the CLI.
+    """
+    yield LlamaCppBackend()
+
+
+@dataclass(frozen=True, slots=True)
+class _EngineEntry:
+    """One registered engine: its backend factory and the options it rejects.
+
+    ``factory`` builds the backend for the duration of a sweep and is a context
+    manager, so an engine can own the resources it needs (vLLM's per-run compile
+    cache) without leaking that detail into the CLI. ``rejected_options`` names
+    the command-line options that are meaningful only for other engines; passing
+    one of them selects a usage error instead of a value the backend would
+    silently ignore.
+    """
+
+    factory: Callable[[], AbstractContextManager[InferenceBackend]]
+    rejected_options: tuple[str, ...] = ()
+
+
+_ENGINES: Mapping[str, _EngineEntry] = {
+    "vllm": _EngineEntry(factory=_vllm_backend),
+    "llamacpp": _EngineEntry(
+        factory=_llamacpp_backend,
+        rejected_options=("quantization", "gpu-memory-utilization"),
+    ),
+}
+"""Maps the CLI's ``ENGINE`` token to its registry entry.
+
+The registry is the only place that knows which engines exist and which
+engine-scoped options they reject; the rest of the composition root selects a
+backend by token and never imports an engine class. A factory is a context
+manager so it can own the resources a backend needs for the whole sweep
+(vLLM's compile cache) without leaking that detail into the CLI.
 """
 
 
@@ -177,21 +225,31 @@ def _run(
     out: TextIO,
     err: TextIO,
 ) -> int:
-    """Resolve the output mode and the base config, then run one invocation.
+    """Resolve the output mode, the engine, and the base config, then run one invocation.
 
     The output mode is resolved first, because an explicit TUI request without a
-    terminal is a usage error that must fail before any expensive work. The base
-    configuration is built next, so a measurement control outside its valid
-    range is reported as a usage error before the space is loaded, the hardware
-    is probed, or a container is pulled. The engine is then resolved through the
-    registry, so an engine that is not wired fails before the header is printed
-    or any preparation runs. A caller-supplied backend is used as-is; otherwise
-    the factory for ``--engine`` builds one for the duration of the sweep, so
+    terminal is a usage error that must fail before any expensive work, and the
+    engine next, so an unwired engine or a vLLM-only option paired with
+    llama.cpp fails as a usage error before the header is printed or any
+    preparation runs. The base configuration is built after that, so a
+    measurement control outside its valid range is reported as a usage error
+    before the space is loaded, the hardware is probed, or a container is
+    pulled. A caller-supplied backend is used as-is; otherwise the entry's
+    factory builds the selected backend for the duration of the sweep, so
     resources such as vLLM's compile cache live exactly as long as the run.
     """
     mode = _output_mode(args, out)
     if mode is None:
         print("error: --output tui requires a terminal", file=err)
+        return _EXIT_USAGE
+
+    engine = _ENGINES.get(args.engine)
+    if engine is None:
+        print(f"error: engine {args.engine!r} is not available", file=err)
+        return _EXIT_USAGE
+    rejected = _rejected_option(args, engine)
+    if rejected is not None:
+        print(f"error: {rejected} is not supported by the {args.engine} engine", file=err)
         return _EXIT_USAGE
 
     try:
@@ -201,12 +259,8 @@ def _run(
         return _EXIT_USAGE
 
     if backend is None:
-        factory = _ENGINE_FACTORIES.get(args.engine)
-        if factory is None:
-            print(f"error: engine {args.engine!r} is not available", file=err)
-            return _EXIT_USAGE
         _print_header(args, out)
-        with factory() as resolved_backend:
+        with engine.factory() as resolved_backend:
             return _sweep(
                 args,
                 base,
@@ -288,6 +342,21 @@ def _sweep(
 
     _finish(result, args, target=hardware.target, image=image, out=out)
     return _EXIT_SUCCESS
+
+
+def _rejected_option(args: argparse.Namespace, engine: _EngineEntry) -> str | None:
+    """Name the first engine-scoped option this engine rejects, or ``None``.
+
+    Argparse parses every engine's options, because it cannot know the selected
+    engine at flag-definition time, and stores each option under the attribute
+    name derived from its spelling. An option that was not passed is ``None``,
+    so a non-``None`` value the entry rejects is a usage error raised before any
+    preparation rather than a value the backend would silently ignore.
+    """
+    for option in engine.rejected_options:
+        if getattr(args, option.replace("-", "_")) is not None:
+            return f"--{option}"
+    return None
 
 
 def _output_mode(args: argparse.Namespace, out: TextIO) -> str | None:
@@ -408,11 +477,16 @@ def _prefetch_model(model: str, backend: InferenceBackend, out: TextIO) -> Path:
     file — and the shared download helper fetches anything not already on the
     host. The resolved path is returned so a later model-aware check inspects
     the same checkpoint the run mounts; the caller records it on the benchmark
-    config so the backend plans the run from the checkpoint it actually has. A
-    download failure fails the run before any trial.
+    config so the backend plans the run from the checkpoint it actually has. An
+    argument the backend refuses to resolve is an unsupported-model failure (exit
+    code 4) reported before any download, and a download failure fails the run
+    before any trial.
     """
     print(f"resolving model: {model}", file=out)
-    request = backend.model_request(model)
+    try:
+        request = backend.model_request(model)
+    except ExperimentError as error:
+        raise _CliFailure(f"unsupported model: {error}", _EXIT_UNSUPPORTED) from error
     if isinstance(request, LocalCheckpoint):
         print(f"using local model: {request.path}", file=out)
         return request.path

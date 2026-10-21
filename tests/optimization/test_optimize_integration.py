@@ -25,6 +25,7 @@ from podman import PodmanClient
 from podman.errors import APIError
 
 from llm_config_optimization.inference import (
+    BenchmarkClient,
     BenchmarkConfig,
     ContainerRuntimeConfig,
     DType,
@@ -160,6 +161,7 @@ def test_two_trial_sweep_returns_a_usable_best_configuration(
         seed=0,
         backend=backend,
         client=podman_client,
+        benchmark_client=BenchmarkClient(),
     )
 
     assert isinstance(result, OptimizationResult)

@@ -168,19 +168,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--llm-seed",
         type=int,
         default=0,
-        help="Engine seed, so every trial runs under the same prompt randomness.",
+        help="Engine seed, so every trial runs under the same prompt randomness. vLLM only; accepted for llamacpp but not forwarded, because the host benchmark's workload is greedy.",
     )
     engine.add_argument(
         "--quantization",
         choices=("awq", "gptq", "fp8"),
         default=None,
-        help="Weight quantization the checkpoint was produced with; checked against the resolved checkpoint. The engine auto-detects when omitted.",
+        help="Weight quantization the checkpoint was produced with; checked against the resolved checkpoint. The engine auto-detects when omitted. vLLM only; a usage error for llamacpp, whose GGUF file carries its own quantization.",
     )
     engine.add_argument(
         "--gpu-memory-utilization",
         type=float,
         default=None,
-        help="Fraction of GPU memory the engine may use; the engine's default when omitted.",
+        help="Fraction of GPU memory the engine may use; the engine's default when omitted. vLLM only; a usage error for llamacpp.",
     )
     engine.add_argument(
         "--sampler-seed",

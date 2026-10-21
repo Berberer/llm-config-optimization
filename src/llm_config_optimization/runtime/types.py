@@ -131,6 +131,17 @@ class RunningContainer(Protocol):
         """Read the container's current logs as ``(stdout, stderr)``."""
         ...
 
+    def is_running(self) -> bool:
+        """Report whether the container is still running.
+
+        The health wait polls this alongside the server's health endpoint, so a
+        container that crashed during startup — a model-load failure, an
+        out-of-memory kill — ends the run as soon as it exits rather than
+        waiting out the whole startup timeout. A runtime that cannot be queried
+        reports the container as running, leaving the timeout as the backstop.
+        """
+        ...
+
     def stop(self, timeout: float | None = None) -> ContainerResult:
         """Stop the container, capture its result, and remove it."""
         ...

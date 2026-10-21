@@ -138,6 +138,25 @@ def test_explicit_flags_override_every_default() -> None:
     assert args.output_config == Path("best.yaml")
 
 
+def test_engine_scoped_options_parse_before_the_engine_is_known() -> None:
+    """The parser accepts both options for any engine; the composition root rejects
+    the llama.cpp pairing, because argparse cannot know the engine's scope here."""
+    args = parse_args(
+        [
+            "facebook/opt-125m",
+            "space.yaml",
+            "llamacpp",
+            "--quantization",
+            "awq",
+            "--gpu-memory-utilization",
+            "0.9",
+        ]
+    )
+
+    assert args.quantization == "awq"
+    assert args.gpu_memory_utilization == 0.9
+
+
 @pytest.mark.parametrize(
     "argv",
     [

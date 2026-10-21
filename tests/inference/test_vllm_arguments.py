@@ -26,6 +26,7 @@ from llm_config_optimization.inference import (
 )
 from llm_config_optimization.inference._vllm import (
     PARAMETER_TARGETS,
+    VALUE_MAPS,
     FlatFlag,
     JsonGroup,
     encode_arguments,
@@ -86,6 +87,66 @@ def test_attention_backend_is_forwarded_through_its_json_group() -> None:
     config = LLMConfig(attention_backend=AttentionBackend.FLASH_ATTENTION)
 
     assert serve_arguments(config) == ["--attention-config", '{"backend": "FLASH_ATTN"}']
+
+
+def test_every_curated_value_has_a_vllm_spelling() -> None:
+    """The maps pin every member vLLM can serve, so a spelling cannot be dropped."""
+    assert VALUE_MAPS["dtype"] == {
+        DType.AUTO: "auto",
+        DType.FLOAT16: "float16",
+        DType.BFLOAT16: "bfloat16",
+        DType.FLOAT32: "float32",
+    }
+    assert VALUE_MAPS["quantization"] == {
+        QuantizationMethod.AWQ: "awq",
+        QuantizationMethod.GPTQ: "gptq",
+        QuantizationMethod.FP8: "fp8",
+    }
+    assert VALUE_MAPS["kv_cache_dtype"] == {
+        KVCacheDType.AUTO: "auto",
+        KVCacheDType.FLOAT16: "float16",
+        KVCacheDType.BFLOAT16: "bfloat16",
+        KVCacheDType.FP8_E4M3: "fp8_e4m3",
+        KVCacheDType.FP8_E5M2: "fp8_e5m2",
+    }
+    assert VALUE_MAPS["attention_backend"] == {
+        AttentionBackend.FLASH_ATTENTION: "FLASH_ATTN",
+        AttentionBackend.FLASH_INFER: "FLASHINFER",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("dtype", DType.AUTO, ["--dtype", "auto"]),
+        ("dtype", DType.FLOAT16, ["--dtype", "float16"]),
+        ("dtype", DType.BFLOAT16, ["--dtype", "bfloat16"]),
+        ("dtype", DType.FLOAT32, ["--dtype", "float32"]),
+        ("quantization", QuantizationMethod.AWQ, ["--quantization", "awq"]),
+        ("quantization", QuantizationMethod.GPTQ, ["--quantization", "gptq"]),
+        ("quantization", QuantizationMethod.FP8, ["--quantization", "fp8"]),
+        ("kv_cache_dtype", KVCacheDType.AUTO, ["--kv-cache-dtype", "auto"]),
+        ("kv_cache_dtype", KVCacheDType.FLOAT16, ["--kv-cache-dtype", "float16"]),
+        ("kv_cache_dtype", KVCacheDType.BFLOAT16, ["--kv-cache-dtype", "bfloat16"]),
+        ("kv_cache_dtype", KVCacheDType.FP8_E4M3, ["--kv-cache-dtype", "fp8_e4m3"]),
+        ("kv_cache_dtype", KVCacheDType.FP8_E5M2, ["--kv-cache-dtype", "fp8_e5m2"]),
+        (
+            "attention_backend",
+            AttentionBackend.FLASH_ATTENTION,
+            ["--attention-config", '{"backend": "FLASH_ATTN"}'],
+        ),
+        (
+            "attention_backend",
+            AttentionBackend.FLASH_INFER,
+            ["--attention-config", '{"backend": "FLASHINFER"}'],
+        ),
+    ],
+)
+def test_every_curated_value_reaches_the_engine_under_its_spelling(
+    field: str, value: object, expected: list[str]
+) -> None:
+    """Every member the maps accept is translated end to end, not merely tabulated."""
+    assert serve_arguments(LLMConfig(**{field: value})) == expected
 
 
 def test_all_fields_assemble_in_the_declared_order() -> None:

@@ -10,11 +10,18 @@ pulled on demand and the tests skip if it cannot be obtained (for example when
 the registry is unreachable).
 """
 
+import time
+
 import pytest
 from podman import PodmanClient
 from podman.errors import APIError
 
-from llm_config_optimization.runtime import ContainerConfig, ContainerRunError, run_container
+from llm_config_optimization.runtime import (
+    ContainerConfig,
+    ContainerRunError,
+    run_container,
+    start_container,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -88,3 +95,19 @@ def test_non_zero_exit_raises_with_captured_streams(
     assert error.result.exit_code == 7
     assert "to-stdout" in error.result.stdout_text
     assert "to-stderr" in error.result.stderr_text
+
+
+def test_detached_liveness_sees_a_short_lived_container_exit(
+    podman_client: PodmanClient, alpine_image: str
+) -> None:
+    handle = start_container(
+        ContainerConfig(image=alpine_image, command=("/bin/sh", "-c", "exit 0")),
+        client=podman_client,
+    )
+    try:
+        deadline = time.monotonic() + 30.0
+        while handle.is_running() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert handle.is_running() is False
+    finally:
+        handle.remove()

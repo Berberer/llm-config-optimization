@@ -1,0 +1,852 @@
+"""llama.cpp backend for the inference experiment layer.
+
+This module is the only place that knows llama.cpp's vocabulary: how
+``llama-server`` spells the engine-neutral tunables, what the engine's
+``--model`` argument refers to, how a GGUF checkpoint's metadata reports its
+quantization, and which image, devices, and command a trial plans for each
+accelerator class. The engine-neutral surfaces never import it.
+
+Argument translation maps each parameter the engine supports onto its CLI flags
+and translates the curated categorical values, so a value with no engine
+spelling is rejected rather than silently dropped. The parameters llama.cpp
+does not model at all — ``dtype``, ``quantization``, ``tensor_parallel_size``,
+and ``gpu_memory_utilization`` — have no target here; declaring one in a space
+is the backend's validation problem, not this module's.
+
+Model resolution decides whether ``--model`` names a local checkpoint or a
+Hugging Face repository with an optional ``:QUANT`` selector, and picks the
+single GGUF file the server mounts. GGUF metadata makes model-aware validation
+possible without the engine: a file that is not GGUF is rejected up front, and
+the quantization it declares is read straight from its header.
+"""
+
+import os
+import struct
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from enum import Enum
+from pathlib import Path
+from types import MappingProxyType
+from typing import BinaryIO
+
+from huggingface_hub import list_repo_files as list_hub_files
+
+from ..runtime.types import ContainerConfig, ContainerResult, Mount
+from ..search_space.registry import TUNABLE_PARAMETERS
+from ..search_space.types import (
+    Categorical,
+    Default,
+    Dimension,
+    ExperimentSpace,
+    Fixed,
+    ParameterValue,
+)
+from .types import (
+    AttentionBackend,
+    BenchmarkConfig,
+    BenchmarkOutcome,
+    DetectedHardware,
+    ExperimentConfig,
+    ExperimentError,
+    ExperimentResult,
+    HardwareTarget,
+    HubCheckpoint,
+    KVCacheDType,
+    LLMConfig,
+    LocalCheckpoint,
+    ModelRequest,
+    QuantizationMethod,
+    ServerSpec,
+)
+
+PARAMETER_TARGETS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "kv_cache_dtype": ("--cache-type-k", "--cache-type-v"),
+        "max_model_len": ("--ctx-size",),
+        "max_num_seqs": ("--parallel",),
+        "max_num_batched_tokens": ("--batch-size", "--ubatch-size"),
+        "attention_backend": ("--flash-attn",),
+    }
+)
+"""Where each applicable :class:`LLMConfig` field is sent on ``llama-server``.
+
+Unlike vLLM's flags, llama.cpp's names cannot be derived from the field names
+(``max_model_len`` becomes ``--ctx-size``), so each one is spelled out. A field
+maps to a tuple of flags because the engine either splits one value across
+symmetric options — ``kv_cache_dtype`` configures both the K and the V cache
+type, which must agree for the cache the user asked for — or applies it at two
+levels, as ``max_num_batched_tokens`` does for the logical ``--batch-size`` and
+the physical ``--ubatch-size``. The latter defaults to 512, which throttles a
+prompt-heavy workload unless the sampled batch raises it. An empty or absent
+entry means the field is never forwarded.
+
+The insertion order is the canonical argument order: it follows the fields in
+:class:`LLMConfig`, so a run's command is deterministic.
+"""
+
+VALUE_MAPS: Mapping[str, Mapping[object, str]] = MappingProxyType(
+    {
+        "kv_cache_dtype": {
+            KVCacheDType.FLOAT16: "f16",
+            KVCacheDType.BFLOAT16: "bf16",
+        },
+        "attention_backend": {
+            AttentionBackend.FLASH_ATTENTION: "on",
+        },
+    }
+)
+"""How llama.cpp spells each engine-neutral categorical value it can serve.
+
+The enums in :mod:`llm_config_optimization.inference.types` carry no engine
+vocabulary; this table is the only place their llama.cpp spellings live. A
+member missing from its field's map is unsupported and is rejected rather than
+forwarded, while the engine's own default is reached by declaring the parameter
+as ``default: true`` instead of naming a value.
+
+``kv_cache_dtype`` is curated to the portable element formats llama.cpp accepts:
+``auto`` and the FP8 members have no equivalent here. For ``attention_backend``
+only the flash-attention implementation is modelled, mapped to the engine's
+``on`` setting; ``flash_infer`` and ``xformers`` are vLLM-only backends.
+"""
+
+
+def _translate_value(field: str, value: object) -> object:
+    """Translate an engine-neutral categorical value into llama.cpp's spelling.
+
+    Values for fields without a value map, and values that are not enum
+    members, pass through unchanged. An enum member absent from its field's map
+    is not supported by this backend and raises rather than being silently
+    dropped, so a requested configuration is never quietly ignored.
+    """
+    mapping = VALUE_MAPS.get(field)
+    if mapping is None or not isinstance(value, Enum):
+        return value
+    try:
+        return mapping[value]
+    except KeyError:
+        raise ExperimentError(f"llama.cpp does not support {field}={value.value!r}") from None
+
+
+def serve_arguments(
+    config: LLMConfig,
+    *,
+    extra_args: Sequence[str] = (),
+) -> list[str]:
+    """Turn an LLM config into the ``llama-server`` arguments that carry it.
+
+    Unset fields (``None``) are omitted so the engine keeps its own defaults,
+    categorical fields are translated from their engine-neutral enums into
+    llama.cpp's spellings, and a field that targets two flags emits both with
+    the same value. Any ``extra_args`` are appended verbatim after the mapped
+    parameters as the backend's escape hatch for unmodeled serving flags. The
+    workload is assembled separately by the host benchmark client, so the server
+    command carries no workload flags.
+
+    Raises :class:`ExperimentError` for an enum value the engine has no spelling
+    for.
+    """
+    arguments: list[str] = []
+    for field, flags in PARAMETER_TARGETS.items():
+        value = getattr(config, field)
+        if value is None:
+            continue
+        translated = _translate_value(field, value)
+        for flag in flags:
+            arguments.extend((flag, str(translated)))
+    return [*arguments, *extra_args]
+
+
+def _planned_llm(config: LLMConfig, benchmark: BenchmarkConfig) -> LLMConfig:
+    """Return the config with ``max_num_seqs`` cut to what the context can serve.
+
+    llama.cpp splits ``--ctx-size`` evenly across the ``--parallel`` slots, so a
+    request longer than a slot's share is rejected no matter how many slots the
+    engine was asked for. For the random workload the request length is known —
+    ``input_len + output_len`` — so the slot count is capped at
+    ``max_model_len // (input_len + output_len)``, at least one, and only then
+    is ``--parallel`` forwarded. The sampled ``max_model_len`` still reaches the
+    engine as ``--ctx-size`` unchanged; a context smaller than the request
+    length cannot be served at any slot count, so its trial fails at the engine.
+
+    A workload whose request length this layer cannot know — a JSONL
+    ``dataset_path``, or an unset length — leaves the declared slot count alone,
+    because there is nothing to size it against.
+    """
+    if (
+        config.max_model_len is None
+        or config.max_num_seqs is None
+        or benchmark.dataset_path is not None
+        or benchmark.input_len is None
+        or benchmark.output_len is None
+    ):
+        return config
+    request_tokens = benchmark.input_len + benchmark.output_len
+    if request_tokens < 1:
+        return config
+    return replace(
+        config,
+        max_num_seqs=min(config.max_num_seqs, max(1, config.max_model_len // request_tokens)),
+    )
+
+
+_GGUF_SUFFIX = ".gguf"
+"""The suffix a GGUF checkpoint's file name carries.
+
+Repositories are filtered by this suffix before a file is selected, so the
+fetch is narrowed to a servable checkpoint instead of its README or an
+adapter.
+"""
+
+_RepoFileLister = Callable[[str], Sequence[str]]
+"""Lists the file names a Hugging Face repository holds.
+
+The seam is injectable so resolution can be unit-tested without the network;
+production passes :func:`huggingface_hub.list_repo_files`.
+"""
+
+
+def model_request(
+    model: str,
+    *,
+    list_repo_files: _RepoFileLister = list_hub_files,
+) -> ModelRequest:
+    """Describe the checkpoint llama.cpp's ``--model`` argument refers to.
+
+    An existing host file is a local checkpoint and is returned resolved; an
+    existing directory is rejected, because llama.cpp serves one GGUF file
+    rather than a snapshot directory. Anything else is a Hugging Face
+    repository id, optionally followed by ``:`` and a selector — either the
+    GGUF file's name or its quantization tag. The repository's files are read
+    through ``list_repo_files``, so the single GGUF file is picked automatically
+    and an ambiguous repository is rejected instead of guessed at; the returned
+    :class:`HubCheckpoint` names the exact file to fetch.
+
+    Existence is the only test for the local case, so a repository id that
+    happens to resolve to a path in the working tree is treated as a local
+    checkpoint and mounted rather than downloaded. A local file's GGUF-ness is
+    not checked here; the checkpoint's metadata is read before the run, so the
+    engine-neutral path stays free of file-format details.
+    """
+    path = Path(model).expanduser()
+    if path.exists():
+        if not path.is_file():
+            raise ExperimentError(
+                f"{path} is not a GGUF file; point --model at a local .gguf checkpoint"
+            )
+        return LocalCheckpoint(path=path.resolve())
+    repo_id, separator, raw_selector = model.partition(":")
+    selector = raw_selector if separator and raw_selector else None
+    files = [name for name in list_repo_files(repo_id) if name.lower().endswith(_GGUF_SUFFIX)]
+    if not files:
+        raise ExperimentError(f"the repository {repo_id!r} offers no GGUF files")
+    return HubCheckpoint(repo_id=repo_id, filename=_select_gguf(files, selector, repo_id))
+
+
+def _select_gguf(files: Sequence[str], selector: str | None, repo_id: str) -> str:
+    """Pick the one GGUF file a repository holds or a selector names.
+
+    With no selector, a repository that holds exactly one GGUF file is used
+    directly while one that holds several is rejected: guessing could silently
+    measure a different quantization than the user meant. A selector is matched
+    as an exact file path first and then as a case-insensitive substring of the
+    file path, which is what lets ``:Q4_K_M`` name a file like
+    ``Llama-3.2-1B-Instruct-Q4_K_M.gguf``. Zero or several matches are rejected
+    with the candidates listed, so the user can narrow the choice.
+    """
+    if selector is None:
+        if len(files) == 1:
+            return files[0]
+        raise ExperimentError(
+            f"the repository {repo_id!r} holds several GGUF files ({', '.join(files)}); "
+            f"select one with {repo_id}:QUANT"
+        )
+    exact = [name for name in files if name == selector]
+    if len(exact) == 1:
+        return exact[0]
+    matches = [name for name in files if selector.casefold() in name.casefold()]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ExperimentError(
+            f"no GGUF file in {repo_id!r} matches {selector!r}; available files: {', '.join(files)}"
+        )
+    raise ExperimentError(
+        f"several GGUF files in {repo_id!r} match {selector!r} ({', '.join(matches)}); "
+        f"select one with {repo_id}:{matches[0]}"
+    )
+
+
+_GGUF_MAGIC = b"GGUF"
+"""The four bytes every GGUF file starts with."""
+
+_GGUF_VERSIONS = frozenset({2, 3})
+"""GGUF container versions whose layout this reader understands.
+
+Version 1 used 32-bit counts and is long obsolete. An unknown version is not a
+format mismatch but an unreadable header, so the reader fails open rather than
+guessing at a layout it does not know.
+"""
+
+_GGUF_FILE_TYPE_KEY = "general.file_type"
+"""The metadata key that carries the checkpoint's quantization."""
+
+_GGUF_BOOL_TYPE = 7
+"""The value type id of a boolean metadata value."""
+
+_GGUF_STRING_TYPE = 8
+"""The value type id of a length-prefixed string metadata value."""
+
+_GGUF_ARRAY_TYPE = 9
+"""The value type id of a homogeneous array metadata value."""
+
+_GGUF_SCALAR_FORMATS: Mapping[int, str] = MappingProxyType(
+    {
+        0: "<B",
+        1: "<b",
+        2: "<H",
+        3: "<h",
+        4: "<I",
+        5: "<i",
+        6: "<f",
+        7: "<?",
+        10: "<Q",
+        11: "<q",
+        12: "<d",
+    }
+)
+"""Binary format of every fixed-width GGUF metadata value, keyed by type id.
+
+String and array values are variable-length and are handled separately by the
+reader. The ids are the ``GGUFValueType`` constants from the GGUF
+specification, and every format is little-endian because GGUF is.
+"""
+
+_GGUF_FILE_TYPE_LABELS: Mapping[int, str] = MappingProxyType(
+    {
+        0: "F32",
+        1: "F16",
+        2: "Q4_0",
+        3: "Q4_1",
+        7: "Q8_0",
+        8: "Q5_0",
+        9: "Q5_1",
+        10: "Q2_K",
+        11: "Q3_K_S",
+        12: "Q3_K_M",
+        13: "Q3_K_L",
+        14: "Q4_K_S",
+        15: "Q4_K_M",
+        16: "Q5_K_S",
+        17: "Q5_K_M",
+        18: "Q6_K",
+        19: "IQ2_XXS",
+        20: "IQ2_XS",
+        21: "Q2_K_S",
+        22: "IQ3_XS",
+        23: "IQ3_XXS",
+        24: "IQ1_S",
+        25: "IQ4_NL",
+        26: "IQ3_S",
+        27: "IQ3_M",
+        28: "IQ2_S",
+        29: "IQ2_M",
+        30: "IQ4_XS",
+        31: "IQ1_M",
+        32: "BF16",
+        36: "TQ1_0",
+        37: "TQ2_0",
+        38: "MXFP4_MOE",
+        39: "NVFP4",
+        40: "Q1_0",
+        41: "Q2_0",
+    }
+)
+"""Canonical short tag of every quantization ``general.file_type`` can declare.
+
+The numbers are llama.cpp's ``llama_ftype`` values from ``llama.h`` and the tags
+are the names checkpoint repositories use in their file names (``Q4_K_M``,
+``BF16``, and so on), so a reported quantization reads the same as the one a
+user selects. Removed or future values are absent; the reader reports no
+quantization for them rather than inventing a name.
+"""
+
+
+class _UnreadableGguf(Exception):
+    """Raised internally when the GGUF magic is present but the header is not parseable."""
+
+
+@dataclass(frozen=True, slots=True)
+class GgufMetadata:
+    """The quantization a GGUF checkpoint declares in its metadata.
+
+    ``quantization`` is the canonical short tag for the checkpoint's
+    ``general.file_type`` (``"Q4_K_M"``, ``"BF16"``, and so on), or ``None``
+    when the checkpoint declares no file type or one this library does not
+    name. ``general.file_type`` is the value llama.cpp itself reports as the
+    model's quantization, so validation speaks the engine's own vocabulary.
+    """
+
+    quantization: str | None
+
+
+def _read_exact(handle: BinaryIO, size: int) -> bytes:
+    """Read exactly ``size`` bytes, or signal that the header is unreadable."""
+    data = handle.read(size)
+    if len(data) != size:
+        raise _UnreadableGguf
+    return data
+
+
+def _read_uint32(handle: BinaryIO) -> int:
+    """Read one little-endian unsigned 32-bit integer."""
+    return int.from_bytes(_read_exact(handle, 4), "little")
+
+
+def _read_uint64(handle: BinaryIO) -> int:
+    """Read one little-endian unsigned 64-bit integer."""
+    return int.from_bytes(_read_exact(handle, 8), "little")
+
+
+def _read_scalar(handle: BinaryIO, format: str) -> object:
+    """Read one fixed-width metadata value in ``format``."""
+    return struct.unpack(format, _read_exact(handle, struct.calcsize(format)))[0]
+
+
+def _read_metadata_string(handle: BinaryIO) -> str:
+    """Read one length-prefixed UTF-8 metadata string."""
+    return _read_exact(handle, _read_uint64(handle)).decode("utf-8")
+
+
+def _skip_metadata_value(handle: BinaryIO, value_type: int) -> None:
+    """Advance past one metadata value without materialising it.
+
+    Only ``general.file_type`` is ever read, so every other entry is skipped.
+    A fixed-width array is skipped in one seek, which matters because tokenizer
+    metadata can hold a hundred thousand elements; only string elements and
+    nested arrays are walked one by one.
+    """
+    if value_type == _GGUF_STRING_TYPE:
+        handle.seek(_read_uint64(handle), os.SEEK_CUR)
+        return
+    if value_type == _GGUF_ARRAY_TYPE:
+        element_type = _read_uint32(handle)
+        count = _read_uint64(handle)
+        format = _GGUF_SCALAR_FORMATS.get(element_type)
+        if format is not None:
+            handle.seek(struct.calcsize(format) * count, os.SEEK_CUR)
+            return
+        for _ in range(count):
+            _skip_metadata_value(handle, element_type)
+        return
+    format = _GGUF_SCALAR_FORMATS.get(value_type)
+    if format is None:
+        raise _UnreadableGguf
+    handle.seek(struct.calcsize(format), os.SEEK_CUR)
+
+
+def read_gguf_metadata(path: Path) -> GgufMetadata | None:
+    """Read the quantization a GGUF checkpoint declares, if it can be read.
+
+    A path that is not a regular file, or a file that does not start with the
+    GGUF magic, is rejected with :class:`ExperimentError`: llama.cpp cannot
+    serve it, so failing before an image is pulled is the clear outcome. A file
+    that is GGUF but whose header cannot be parsed returns ``None`` (fail
+    open), leaving the engine as the final authority rather than rejecting on
+    metadata this library could not see. An unknown container version or
+    ``general.file_type`` value is likewise reported as no quantization, never
+    as a guess.
+    """
+    if not path.is_file():
+        raise ExperimentError(f"{path} is not a GGUF file; llama.cpp serves GGUF checkpoints")
+    try:
+        with path.open("rb") as handle:
+            if _read_exact(handle, len(_GGUF_MAGIC)) != _GGUF_MAGIC:
+                raise ExperimentError(
+                    f"{path} is not a GGUF file; llama.cpp serves GGUF checkpoints"
+                )
+            if _read_uint32(handle) not in _GGUF_VERSIONS:
+                return None
+            _read_uint64(handle)
+            metadata_count = _read_uint64(handle)
+            file_type: int | None = None
+            for _ in range(metadata_count):
+                key = _read_metadata_string(handle)
+                value_type = _read_uint32(handle)
+                scalar_format = _GGUF_SCALAR_FORMATS.get(value_type)
+                if key == _GGUF_FILE_TYPE_KEY and value_type != _GGUF_BOOL_TYPE and scalar_format:
+                    value = _read_scalar(handle, scalar_format)
+                    if isinstance(value, int):
+                        file_type = value
+                else:
+                    _skip_metadata_value(handle, value_type)
+    except ExperimentError:
+        raise
+    except OSError, _UnreadableGguf, UnicodeDecodeError:
+        return None
+    quantization = _GGUF_FILE_TYPE_LABELS.get(file_type) if file_type is not None else None
+    return GgufMetadata(quantization=quantization)
+
+
+_MODEL_MOUNT_PATH = "/models/model.gguf"
+"""Where a resolved GGUF checkpoint is mounted inside the server container.
+
+llama.cpp serves one file rather than a directory, so the checkpoint is mounted
+at a fixed target and the command points ``--model`` at it. Mounting the
+resolved file itself also follows a Hugging Face cache symlink on the host, so
+a snapshot download's relative link cannot dangle inside the container the way
+it would if only its parent directory were mounted.
+"""
+
+_SERVER_PORT = 8080
+"""The container port the server binds and the plan publishes.
+
+The port is explicit rather than left to the engine's own default, so the
+command, the published mapping, and the host client's URL all name the same
+one. The host port is assigned by the runtime, so parallel trials never
+contend for a fixed one.
+"""
+
+_SERVER_BIND_HOST = "0.0.0.0"
+"""Where the server binds inside the container.
+
+The host benchmark client reaches the server through the container's published
+port, so the server must accept connections on every interface rather than
+container loopback.
+"""
+
+_HEALTH_PATH = "/health"
+"""The llama-server endpoint the host client polls until the model is loaded."""
+
+_SELINUX_OPTIONS = ("z",)
+"""Bind-mount options applied to the checkpoint mount.
+
+The ``z`` option asks the container runtime to relabel the host path for
+SELinux, so runs work on enforcing hosts. Caller-supplied volumes keep whatever
+options they were given.
+"""
+
+_DEFAULT_IMAGES: Mapping[HardwareTarget, str] = MappingProxyType(
+    {
+        HardwareTarget.CUDA: "ghcr.io/ggml-org/llama.cpp:server-cuda",
+        HardwareTarget.ROCM: "ghcr.io/ggml-org/llama.cpp:server-rocm",
+        HardwareTarget.CPU: "ghcr.io/ggml-org/llama.cpp:server",
+    }
+)
+"""llama.cpp's official server image per accelerator class.
+
+The names are already registry-qualified, so podman resolves them without a
+TTY, and each image contains only ``llama-server`` — exactly what a
+host-driven trial runs. ``--image`` still overrides the mapping through the
+container configuration.
+"""
+
+_DEVICE_MAPPINGS: Mapping[HardwareTarget, tuple[str, ...]] = MappingProxyType(
+    {
+        HardwareTarget.CUDA: ("nvidia.com/gpu=all",),
+        HardwareTarget.ROCM: ("/dev/kfd", "/dev/dri"),
+        HardwareTarget.CPU: (),
+    }
+)
+"""How each accelerator class reaches the container.
+
+CUDA uses the CDI device name so the runtime supplies the driver; ROCm passes
+the KFD and DRM nodes the userspace in the image needs; CPU passes nothing.
+"""
+
+
+def _target_for(
+    devices: tuple[str, ...], *, raw_result: ContainerResult | None = None
+) -> HardwareTarget:
+    """Recover the accelerator class a plan's device mapping was chosen for.
+
+    :meth:`LlamaCppBackend.plan` fills ``devices`` straight from
+    :data:`_DEVICE_MAPPINGS`, so a run's target can be read back from the plan
+    that produced it. A mapping the backend never emits cannot be attributed to
+    a target and raises rather than guessing; ``raw_result`` is attached to that
+    error so every :meth:`LlamaCppBackend.parse_result` failure carries the
+    captured container output uniformly.
+    """
+    for target, mapping in _DEVICE_MAPPINGS.items():
+        if mapping == devices:
+            return target
+    raise ExperimentError(
+        f"cannot determine the accelerator class for devices {devices!r}",
+        raw_result=raw_result,
+    )
+
+
+def _model_mount(path: Path) -> Mount:
+    """Build the read-only mount that exposes a GGUF checkpoint to the server."""
+    return Mount(
+        source=str(path),
+        target=_MODEL_MOUNT_PATH,
+        read_only=True,
+        options=_SELINUX_OPTIONS,
+    )
+
+
+def _model_arguments(
+    model: str,
+    resolved_path: Path | None,
+    list_repo_files: _RepoFileLister,
+) -> tuple[list[str], tuple[Mount, ...]]:
+    """Resolve the checkpoint arguments and any mount the server needs.
+
+    A ``resolved_path`` — the GGUF file the composition root already fetched —
+    is mounted read-only at a fixed container path and the command points at
+    it. Without one, the engine's own model-resolution rules decide: a local
+    file is mounted the same way, while a Hugging Face repository is left for
+    the server to fetch itself through ``--hf-repo``/``--hf-file``, so a direct
+    library caller that never prefetched the checkpoint still plans a runnable
+    server. The production path is the resolved one: the composition root
+    resolves and validates the model before planning, and the server needs no
+    network of its own.
+    """
+    if resolved_path is not None:
+        return ["--model", _MODEL_MOUNT_PATH], (_model_mount(resolved_path),)
+    request = model_request(model, list_repo_files=list_repo_files)
+    if isinstance(request, LocalCheckpoint):
+        return ["--model", _MODEL_MOUNT_PATH], (_model_mount(request.path),)
+    arguments = ["--hf-repo", request.repo_id]
+    if request.filename is not None:
+        arguments += ["--hf-file", request.filename]
+    return arguments, ()
+
+
+def _declared_values(dimension: Dimension) -> list[tuple[str, ParameterValue]]:
+    """Pair each value a dimension declares with the problem path naming it."""
+    spec = dimension.spec
+    if isinstance(spec, Fixed):
+        return [(f"space.{dimension.name}.fixed", spec.value)]
+    if isinstance(spec, Categorical):
+        return [
+            (f"space.{dimension.name}.categorical[{index}]", value)
+            for index, value in enumerate(spec.values)
+        ]
+    return []
+
+
+def _validate_spec_values(dimension: Dimension, field: str) -> list[str]:
+    """Report every declared value llama.cpp has no spelling for.
+
+    Only enum values are checked: a numeric parameter is forwarded verbatim, so
+    it has nothing to look up in :data:`VALUE_MAPS`. A categorical field with
+    no value map at all cannot translate any member and rejects every enum
+    value.
+    """
+    mapping = VALUE_MAPS.get(field)
+    problems: list[str] = []
+    for path, value in _declared_values(dimension):
+        if isinstance(value, Enum) and (mapping is None or value not in mapping):
+            problems.append(f"{path}: llama.cpp does not support {field}={value.value!r}")
+    return problems
+
+
+def _quantization_problems(
+    quantization: QuantizationMethod, model: Path, metadata: GgufMetadata | None
+) -> list[str]:
+    """Report that llama.cpp takes its quantization from the checkpoint.
+
+    A GGUF file's ``general.file_type`` *is* the engine's quantization and
+    llama.cpp has no ``--quantization`` flag, so any configured value is
+    rejected no matter what the checkpoint declares. The checkpoint's detected
+    quantization is named in the problem so the user can see which quantization
+    the run would actually serve.
+    """
+    detected = metadata.quantization if metadata is not None else None
+    detail = f"the checkpoint declares {detected}" if detected else "the checkpoint declares none"
+    return [
+        f"llama.cpp serves the checkpoint at {model} with its own quantization ({detail}); "
+        f"remove quantization={quantization.value!r}"
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class LlamaCppBackend:
+    """The llama.cpp implementation of the inference backend seam.
+
+    ``extra_args`` is the single escape hatch for ``llama-server`` flags the
+    engine-neutral config does not model (``--n-gpu-layers``, ``--split-mode``,
+    and speculative decoding, for example). The sequence is appended verbatim
+    to the assembled command, after the mapped parameters, so a caller can
+    experiment without widening :class:`LLMConfig`; values passed this way are
+    the caller's responsibility.
+
+    ``list_repo_files`` is the repository-listing seam model resolution uses to
+    pick the GGUF file of a Hugging Face repository. It defaults to
+    :func:`huggingface_hub.list_repo_files` and is injectable so a unit test
+    needs no network.
+    """
+
+    extra_args: tuple[str, ...] = ()
+    list_repo_files: _RepoFileLister = list_hub_files
+
+    @property
+    def applicable_parameters(self) -> frozenset[str]:
+        """Exactly the tunables this backend forwards.
+
+        llama.cpp can vary ``max_model_len``, ``max_num_seqs``,
+        ``max_num_batched_tokens``, ``kv_cache_dtype``, and
+        ``attention_backend``; ``dtype`` and ``tensor_parallel_size`` have no
+        engine flag, so a definition may omit them and the loader does not
+        require them.
+        """
+        return frozenset(
+            name for name, field in TUNABLE_PARAMETERS.items() if field in PARAMETER_TARGETS
+        )
+
+    def validate(
+        self,
+        space: ExperimentSpace,
+        hardware: DetectedHardware | None = None,
+    ) -> Sequence[str]:
+        """Report every way llama.cpp cannot support ``space``.
+
+        The space is assumed to have passed engine-agnostic validation. Every
+        dimension's parameter must be one the backend forwards, and every fixed
+        or categorical enum value must have a spelling in :data:`VALUE_MAPS`.
+        A ``Default`` dimension defers its value to the engine and carries
+        nothing to support-check. Problems are returned as strings so the
+        caller can aggregate them; an empty sequence means llama.cpp supports
+        every dimension.
+
+        ``hardware`` is accepted for the backend seam but adds no checks today:
+        the modelled values are not accelerator-specific, and the numeric
+        values the engine bounds are clamped by llama.cpp at load time rather
+        than rejected, so there is nothing to narrow before a sweep starts.
+        """
+        problems: list[str] = []
+        for dimension in space.dimensions:
+            field = TUNABLE_PARAMETERS[dimension.name]
+            if field not in PARAMETER_TARGETS:
+                problems.append(f"space.{dimension.name}: llama.cpp does not forward {field!r}")
+                continue
+            if isinstance(dimension.spec, Default):
+                continue
+            problems.extend(_validate_spec_values(dimension, field))
+        return problems
+
+    def validate_model(self, experiment: ExperimentConfig, model: Path) -> Sequence[str]:
+        """Report every way the checkpoint at ``model`` cannot serve ``experiment``.
+
+        A non-GGUF checkpoint is rejected, because llama.cpp can only serve
+        GGUF. A configured ``quantization`` is rejected too: llama.cpp reads
+        the quantization from the file's metadata rather than from a flag, and
+        the problem names the quantization the checkpoint actually declares. A
+        GGUF whose header cannot be parsed is accepted (fail-open), leaving the
+        engine as the final authority rather than rejecting on metadata this
+        library could not see.
+        """
+        quantization = experiment.llm.quantization
+        try:
+            metadata = read_gguf_metadata(model)
+        except ExperimentError as exc:
+            if quantization is None:
+                return [str(exc)]
+            return [*_quantization_problems(quantization, model, None), str(exc)]
+        if quantization is None:
+            return []
+        return _quantization_problems(quantization, model, metadata)
+
+    def model_request(self, model: str) -> ModelRequest:
+        """Decide whether ``model`` is a local GGUF file or a Hub repository.
+
+        The composition root calls this before downloading, so llama.cpp's
+        model-argument rules — existence means a local file, a repository id
+        may carry a ``:QUANT`` selector, and a multi-quant repository requires
+        one — stay here rather than in the CLI.
+        """
+        return model_request(model, list_repo_files=self.list_repo_files)
+
+    def plan(
+        self,
+        experiment: ExperimentConfig,
+        hardware: DetectedHardware,
+    ) -> ServerSpec:
+        """Turn an experiment and the detected hardware into a server run.
+
+        The accelerator class resolves from the container config's override or,
+        failing that, the detected hardware, and selects the image and device
+        mapping. The checkpoint is mounted read-only at a fixed container path
+        (or left for the server to fetch itself when no path was resolved), the
+        server binds on every interface on the published port, the served name
+        is pinned to the configured model string, and the five mapped tunables
+        and ``extra_args`` follow. The slot count is cut beforehand to what the
+        context can serve, so the benchmark's request length always fits a
+        slot's share of ``--ctx-size``.
+
+        The returned :class:`ServerSpec` describes the ``/health`` endpoint and
+        the startup timeout the host client uses. llama.cpp exposes no
+        cache-reset endpoint, so ``reset_paths`` is empty and the client skips
+        resetting. Planning touches no host filesystem: unlike vLLM, llama.cpp
+        needs no cache directory to exist before the run.
+        """
+        container = experiment.container
+        target = container.target or hardware.target
+        benchmark = experiment.benchmark
+        model_arguments, model_mounts = _model_arguments(
+            benchmark.model, benchmark.resolved_path, self.list_repo_files
+        )
+        command = (
+            *model_arguments,
+            "--alias",
+            benchmark.model,
+            "--host",
+            _SERVER_BIND_HOST,
+            "--port",
+            str(_SERVER_PORT),
+            *serve_arguments(_planned_llm(experiment.llm, benchmark), extra_args=self.extra_args),
+        )
+        return ServerSpec(
+            container=ContainerConfig(
+                image=container.image or self.image_for(target),
+                command=command,
+                env=container.env,
+                volumes=(*container.volumes, *model_mounts),
+                devices=_DEVICE_MAPPINGS[target],
+                ports={str(_SERVER_PORT): None},
+                mem_limit=container.mem_limit,
+                shm_size=container.shm_size,
+                selinux_opts=container.selinux_opts,
+                pull_policy=container.pull_policy,
+            ),
+            health_path=_HEALTH_PATH,
+            health_timeout=benchmark.startup_timeout,
+            reset_paths=(),
+        )
+
+    def image_for(self, target: HardwareTarget) -> str:
+        """Return the official llama.cpp server image for ``target``.
+
+        This is the public image-resolution seam: the image a run is planned
+        with is ``container.image`` when the caller set one, and this method's
+        result otherwise.
+        """
+        return _DEFAULT_IMAGES[target]
+
+    def parse_result(
+        self,
+        outcome: BenchmarkOutcome,
+        spec: ServerSpec,
+        result: ContainerResult,
+    ) -> ExperimentResult:
+        """Assemble a typed result from the host client's measured runs.
+
+        The runs and the failed-run count come straight from the host benchmark
+        client, which already enforced the strict majority, so this method only
+        records what actually ran: the accelerator class, image, and device
+        mapping are recovered from the planned :class:`ServerSpec`, and the
+        captured server container outcome is kept as ``raw_result``. An outcome
+        with no successful run raises :class:`ExperimentError` rather than
+        letting :class:`ExperimentResult` reject it with a bare ``ValueError``.
+        """
+        if not outcome.runs:
+            raise ExperimentError("the benchmark produced no successful run", raw_result=result)
+        return ExperimentResult(
+            runs=outcome.runs,
+            failed_runs=outcome.failed_runs,
+            target=_target_for(spec.container.devices, raw_result=result),
+            image=spec.container.image,
+            devices=spec.container.devices,
+            raw_result=result,
+        )

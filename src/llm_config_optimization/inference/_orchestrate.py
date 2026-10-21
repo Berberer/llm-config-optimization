@@ -44,9 +44,10 @@ def run_experiment(
     ``target`` override — and passed to the backend's ``plan``, so the backend
     never probes the host itself. The planned server container is started
     through :func:`~llm_config_optimization.runtime.start_container`; the host
-    benchmark client waits for its health, takes the warmup and measured runs,
-    and returns its measured outcome; the container is stopped and the outcome
-    is handed to the backend's ``parse_result``.
+    benchmark client waits for its health — aborting as soon as the started
+    container exits during that wait — takes the warmup and measured runs, and
+    returns its measured outcome; the container is stopped and the outcome is
+    handed to the backend's ``parse_result``.
 
     ``backend`` defaults to :class:`~llm_config_optimization.inference.VLLMBackend`.
     ``client`` is forwarded to ``start_container`` so a caller (or a test) can
@@ -116,7 +117,11 @@ def _run(
     try:
         base_url = _base_url(spec, handle)
         outcome = benchmark_client.measure_sync(
-            base_url, config.benchmark.model, spec, config.benchmark
+            base_url,
+            config.benchmark.model,
+            spec,
+            config.benchmark,
+            is_alive=handle.is_running,
         )
     except ExperimentError as exc:
         result = _stop_with_logs(handle)

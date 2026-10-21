@@ -13,9 +13,13 @@ forces the CPU target so hardware detection short-circuits without a probe. The
 scenarios mirror the exit-code contract: a successful bounded sweep, a space the
 backend rejects, a model the backend rejects, an invalid definition, a sweep that
 completes no trial, an interrupt, and an explicit TUI request without a terminal.
+The engine-scoped option rules are covered here too: the registry selects the
+llama.cpp backend for the ``llamacpp`` token, and a vLLM-only option paired with
+it is a usage error rather than a value the engine ignores.
 """
 
 import json
+import struct
 from io import StringIO
 from pathlib import Path
 
@@ -31,6 +35,9 @@ from llm_config_optimization.inference import (
     ExperimentError,
     ExperimentResult,
     HardwareTarget,
+    LlamaCppBackend,
+    ModelRequest,
+    QuantizationMethod,
     RunMetrics,
     ServerSpec,
     VLLMBackend,
@@ -107,6 +114,23 @@ class ModelProblemBackend(FakeBackend):
         return self.problems
 
 
+class UnresolvableModelBackend(FakeBackend):
+    """A backend whose model-argument resolution rejects the model.
+
+    The real llama.cpp backend raises :class:`ExperimentError` for a directory,
+    a repository with no GGUF file, and an ambiguous ``:QUANT`` selector; the
+    composition root must map every such rejection rather than letting it
+    escape as an unexpected error. Planning and parsing stay canned and are
+    never reached.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(PLAN, RESULT, [])
+
+    def model_request(self, model: str) -> ModelRequest:
+        raise ExperimentError("the repository holds several GGUF files; select one with :QUANT")
+
+
 class CheckpointValidatingBackend(FakeBackend):
     """A fake backend that delegates model validation to the real vLLM rule.
 
@@ -122,6 +146,23 @@ class CheckpointValidatingBackend(FakeBackend):
 
     def validate_model(self, experiment: ExperimentConfig, model: Path) -> tuple[str, ...]:
         return tuple(VLLMBackend().validate_model(experiment, model))
+
+
+class GgufValidatingBackend(FakeBackend):
+    """A fake backend that delegates model validation to the real llama.cpp rule.
+
+    Planning and result parsing stay canned, so a compatible run completes
+    without a daemon or a valid benchmark payload, while the checkpoint on disk
+    is inspected by :meth:`LlamaCppBackend.validate_model`. This is the CLI
+    wiring under test; the GGUF rule itself is covered directly against the
+    backend.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(PLAN, RESULT, [])
+
+    def validate_model(self, experiment: ExperimentConfig, model: Path) -> tuple[str, ...]:
+        return tuple(LlamaCppBackend().validate_model(experiment, model))
 
 
 class InterruptingBackend(FakeBackend):
@@ -174,16 +215,18 @@ def _invoke(
     *extra: str,
     backend: FakeBackend | None = None,
     client: FakePodmanClient | None = None,
+    engine: str = "vllm",
 ) -> tuple[int, str, str]:
     """Run ``main`` with injected fakes and captured streams.
 
     The CPU target is always passed so detection short-circuits without probing
-    the host; the caller supplies the output flag and budget through ``extra``.
+    the host; the caller supplies the output flag and budget through ``extra``
+    and the ``ENGINE`` token through ``engine``, which defaults to ``vllm``.
     Returns the exit code and the captured stdout and stderr.
     """
     out, err = StringIO(), StringIO()
     code = main(
-        [model, str(space), "vllm", "--target", "cpu", *extra],
+        [model, str(space), engine, "--target", "cpu", *extra],
         backend=_backend() if backend is None else backend,
         client=FakePodmanClient() if client is None else client,
         stdout=out,
@@ -242,29 +285,102 @@ def test_a_successful_bounded_sweep_reports_progress_and_the_winner(
     assert (PLAN.container.image, "missing") in client.pull_calls
 
 
-def test_an_engine_with_no_registered_backend_fails_before_preparation(
-    tmp_path: Path, model: str
+def test_the_llamacpp_engine_is_selected_through_the_registry(
+    tmp_path: Path, model: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``llamacpp`` is an accepted choice but is not wired until stage 2.
+    """The registry maps the ``llamacpp`` token to the llama.cpp backend.
 
-    The failure is a usage error raised from the registry before the header is
-    printed or any preparation (space load, hardware probe, image pull) runs, so
-    a missing engine never costs a download. This test flips when ``llamacpp``
-    is registered in a later task.
+    The backend class is replaced with the shared fakes, so the selection, the
+    startup header, and the sweep are exercised without a GGUF checkpoint or an
+    engine; the recorded instance pins that the factory built the llama.cpp
+    backend for this run.
     """
     space = _write_space(tmp_path / "space.yaml")
+    created: list[FakeBackend] = []
+
+    class RecordingBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__(PLAN, RESULT, [])
+            created.append(self)
+
+    monkeypatch.setattr("llm_config_optimization.cli.LlamaCppBackend", RecordingBackend)
     out, err = StringIO(), StringIO()
 
     code = main(
-        [model, str(space), "llamacpp", "--target", "cpu", "--n-trials", "1"],
+        [model, str(space), "llamacpp", "--target", "cpu", "--n-trials", "1", "--output", "log"],
         client=FakePodmanClient(),
         stdout=out,
         stderr=err,
     )
 
+    assert code == 0
+    assert err.getvalue() == ""
+    assert len(created) == 1
+    assert "engine: llamacpp" in out.getvalue()
+    assert "trial 1/1  COMPLETE  42.00 tps" in out.getvalue()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--quantization", "awq"],
+        ["--gpu-memory-utilization", "0.9"],
+    ],
+    ids=["quantization", "gpu-memory-utilization"],
+)
+def test_a_vllm_only_option_is_rejected_for_llamacpp_as_a_usage_error(
+    tmp_path: Path, model: str, extra: list[str]
+) -> None:
+    """A vLLM-only option paired with llama.cpp fails before any preparation.
+
+    llama.cpp has no ``--quantization`` flag (the GGUF file carries its
+    quantization) and no ``--gpu-memory-utilization`` knob, so both are usage
+    errors rather than values the backend silently ignores. Nothing is loaded,
+    planned, or pulled.
+    """
+    space = _write_space(tmp_path / "space.yaml")
+    backend = _backend()
+    client = FakePodmanClient()
+    out, err = StringIO(), StringIO()
+
+    code = main(
+        [model, str(space), "llamacpp", "--target", "cpu", "--n-trials", "1", *extra],
+        backend=backend,
+        client=client,
+        stdout=out,
+        stderr=err,
+    )
+
     assert code == 2
-    assert "llamacpp" in err.getvalue()
     assert out.getvalue() == ""
+    assert extra[0] in err.getvalue()
+    assert "llamacpp" in err.getvalue()
+    assert backend.plan_calls == []
+    assert client.pull_calls == []
+
+
+def test_the_vllm_only_options_are_preserved_for_vllm(tmp_path: Path, model: str) -> None:
+    """The same options still reach a vLLM run unchanged."""
+    space = _write_space(tmp_path / "space.yaml")
+    backend = _backend()
+
+    code, _, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--quantization",
+        "awq",
+        "--gpu-memory-utilization",
+        "0.9",
+        backend=backend,
+    )
+
+    assert code == 0
+    assert err == ""
+    planned, _ = backend.plan_calls[0]
+    assert planned.llm.quantization is QuantizationMethod.AWQ
+    assert planned.llm.gpu_memory_utilization == 0.9
 
 
 def test_the_resolved_checkpoint_reaches_the_planned_run(tmp_path: Path, model: str) -> None:
@@ -280,6 +396,29 @@ def test_the_resolved_checkpoint_reaches_the_planned_run(tmp_path: Path, model: 
     planned, _ = backend.plan_calls[0]
     assert planned.benchmark.resolved_path == Path(model).expanduser().resolve()
     assert planned.benchmark.model == model
+
+
+def test_an_unresolvable_model_argument_is_an_unsupported_model(tmp_path: Path, model: str) -> None:
+    """A backend rejection while resolving MODEL maps to the unsupported code.
+
+    llama.cpp rejects a directory, a repository with no GGUF file, and an
+    ambiguous ``:QUANT`` selector from ``model_request``. Those are expected
+    input errors, so they must return the unsupported-model exit code before any
+    download, plan, or pull instead of falling through to the unexpected-error
+    code.
+    """
+    space = _write_space(tmp_path / "space.yaml")
+    client = FakePodmanClient()
+
+    code, out, err = _invoke(
+        model, space, "--n-trials", "1", backend=UnresolvableModelBackend(), client=client
+    )
+
+    assert code == 4
+    assert "unsupported model" in err
+    assert "several GGUF files" in err
+    assert "preparing study" not in out
+    assert client.pull_calls == []
 
 
 def test_the_cli_gives_the_default_backend_a_temporary_cache_directory(
@@ -460,6 +599,30 @@ def test_validation_receives_the_resolved_hardware(tmp_path: Path, model: str) -
     assert backend.validated_hardware[0].target == HardwareTarget.ROCM
 
 
+def test_a_space_llama_cpp_does_not_forward_is_rejected_up_front(
+    tmp_path: Path, model: str
+) -> None:
+    """A declared ``dtype`` is a parameter llama.cpp has no flag for."""
+    space = _write_space(tmp_path / "space.yaml")
+    client = FakePodmanClient()
+
+    code, out, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        backend=LlamaCppBackend(),
+        client=client,
+        engine="llamacpp",
+    )
+
+    assert code == 4
+    assert "space.dtype" in err
+    assert "does not forward" in err
+    assert "preparing study" not in out
+    assert client.pull_calls == []
+
+
 def test_an_attention_backend_unsupported_on_the_target_is_rejected_up_front(
     tmp_path: Path, model: str
 ) -> None:
@@ -509,6 +672,55 @@ def test_every_model_compatibility_problem_is_reported_before_the_image_pull(
     experiment, resolved = backend.model_calls[0]
     assert experiment.llm.quantization is None
     assert resolved == Path(model).expanduser().resolve()
+
+
+def test_a_non_gguf_checkpoint_is_rejected_before_the_image_pull(
+    tmp_path: Path, model: str
+) -> None:
+    """The real llama.cpp rule rejects the directory the fixture points at."""
+    space = _write_space(tmp_path / "space.yaml")
+    client = FakePodmanClient()
+
+    code, out, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        backend=GgufValidatingBackend(),
+        client=client,
+        engine="llamacpp",
+    )
+
+    assert code == 4
+    assert "unsupported configuration" in err
+    assert "not a GGUF file" in err
+    assert "validating model compatibility" in out
+    assert "pulling container image" not in out
+    assert client.pull_calls == []
+
+
+def test_a_gguf_checkpoint_proceeds_to_the_image_pull(tmp_path: Path) -> None:
+    """A readable GGUF checkpoint with no configured quantization is accepted."""
+    checkpoint = tmp_path / "model.gguf"
+    checkpoint.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))
+    space = _write_space(tmp_path / "space.yaml")
+    client = FakePodmanClient()
+
+    code, out, err = _invoke(
+        str(checkpoint),
+        space,
+        "--n-trials",
+        "1",
+        backend=GgufValidatingBackend(),
+        client=client,
+        engine="llamacpp",
+    )
+
+    assert code == 0
+    assert err == ""
+    assert "validating model compatibility" in out
+    assert f"pulling container image: {PLAN.container.image}" in out
+    assert (PLAN.container.image, "missing") in client.pull_calls
 
 
 def test_an_incompatible_quantization_is_rejected_before_the_image_pull(
@@ -596,13 +808,15 @@ def test_a_missing_definition_returns_the_definition_code(tmp_path: Path, model:
     assert err != ""
 
 
+@pytest.mark.parametrize("engine", ["vllm", "llamacpp"])
 def test_a_sweep_that_completes_no_trial_returns_the_empty_sweep_code(
-    tmp_path: Path, model: str
+    tmp_path: Path, model: str, engine: str
 ) -> None:
+    """The exit-code contract is engine-independent; only the scoped flags differ."""
     space = _write_space(tmp_path / "space.yaml")
     backend = FakeBackend(PLAN, RESULT, [], parse_error=ExperimentError("engine never started"))
 
-    code, _, err = _invoke(model, space, "--n-trials", "2", backend=backend)
+    code, _, err = _invoke(model, space, "--n-trials", "2", backend=backend, engine=engine)
 
     assert code == 5
     assert "without a completed trial" in err

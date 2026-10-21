@@ -1,0 +1,43 @@
+# The complete llama.cpp search space: only the five parameters llama-server
+# forwards are declared. `dtype` and `tensor_parallel_size` are not applicable
+# and must be omitted — a GGUF checkpoint carries its own numerical format, and
+# llama.cpp spreads requests over `--parallel` slots rather than tensor-parallel
+# ranks. Declaring either one makes the llama.cpp backend reject the space.
+#
+# Each dimension maps to a real llama-server flag: `kv_cache_dtype` to
+# `--cache-type-k`/`--cache-type-v`, `max_model_len` to `--ctx-size`,
+# `max_num_seqs` to `--parallel`, `max_num_batched_tokens` to `--batch-size`
+# and `--ubatch-size`, and `attention_backend` to `--flash-attn`.
+#
+# The enum ranges list only values llama.cpp can serve: `auto` and the FP8
+# members have no KV-cache spelling, and only the flash-attention implementation
+# is modelled. `attention_backend` defers to the engine because flash attention
+# depends on the accelerator class and the build; pin `flash_attention` only
+# when the target is known to support it.
+#
+# llama.cpp divides `--ctx-size` evenly across the `--parallel` slots, so the
+# backend caps the slot count at `max_model_len // (input_len + output_len)`
+# (at least one). The sampled `max_model_len` is always sent as `--ctx-size`
+# unchanged: a point below the benchmark's request length cannot be served at
+# any slot count and its trial fails, so keep this interval's floor above
+# `--input-len + --output-len` for a sweep that never fails on context size.
+# `max_num_batched_tokens` is independent: it sizes both the logical
+# `--batch-size` and the physical `--ubatch-size`, and upstream clamps them to
+# the context size rather than rejecting.
+space:
+  kv_cache_dtype:
+    categorical: [float16, bfloat16]
+  max_model_len:
+    interval:
+      min: 1024
+      max: 32768
+  max_num_seqs:
+    interval:
+      min: 1
+      max: 256
+  max_num_batched_tokens:
+    interval:
+      min: 2048
+      max: 8192
+  attention_backend:
+    default: true

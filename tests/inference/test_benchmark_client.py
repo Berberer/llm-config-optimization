@@ -315,6 +315,43 @@ def test_a_server_that_never_becomes_healthy_fails() -> None:
     assert engine.completions == []
 
 
+def test_a_dead_server_container_ends_the_health_wait_immediately() -> None:
+    engine = FakeEngine(health_failures=100)
+    client = BenchmarkClient(
+        transport=engine.transport(), clock=FakeClock(step=1.0), poll_interval=0.0
+    )
+
+    with pytest.raises(ExperimentError, match="exited before becoming healthy"):
+        client.measure_sync(
+            "http://engine",
+            MODEL,
+            _spec(health_timeout=600.0),
+            _random_benchmark(),
+            is_alive=lambda: False,
+        )
+
+    assert engine.health_attempts == 1
+    assert engine.completions == []
+
+
+def test_a_live_container_does_not_shorten_the_health_wait() -> None:
+    engine = FakeEngine(health_failures=2)
+    client = BenchmarkClient(
+        transport=engine.transport(), clock=FakeClock(step=1.0), poll_interval=0.0
+    )
+
+    outcome = client.measure_sync(
+        "http://engine",
+        MODEL,
+        _spec(health_timeout=100.0),
+        _random_benchmark(),
+        is_alive=lambda: True,
+    )
+
+    assert engine.health_attempts == 3
+    assert len(outcome.runs) == 1
+
+
 def test_the_client_waits_for_health_before_measuring() -> None:
     engine = FakeEngine(health_failures=2)
     client = BenchmarkClient(

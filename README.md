@@ -14,11 +14,12 @@ ends.
 
 The inference engine is deliberately pluggable and chosen on the command line:
 the search-space and experiment layers are engine-neutral and name no engine, so
-the same definition and workflow can target a different backend later. **vLLM is
-currently the only backend implemented**. A trial starts the engine's server in
-a container and measures it from the host through one shared HTTP client, so the
-container carries only the server and every engine is measured by identical
-logic.
+the same definition and workflow can target a different backend later. **vLLM
+and llama.cpp are implemented today**, and each declares which tunables it
+forwards, so a definition names exactly the parameters the selected engine can
+serve. A trial starts the engine's server in a container and measures it from
+the host through one shared HTTP client, so the container carries only the
+server and every engine is measured by identical logic.
 
 The search space is deliberately explicit: every tunable the selected engine
 forwards must be declared, so a result is always explainable from the
@@ -73,13 +74,55 @@ Three positional arguments are required:
 
 | Argument  | Description                                                              |
 | --------- | ------------------------------------------------------------------------ |
-| `MODEL`   | Model to benchmark: a Hugging Face id (`Qwen/Qwen3.8-27B`) or a host path to a local checkpoint. |
+| `MODEL`   | Model to benchmark: a Hugging Face id (`Qwen/Qwen3.8-27B`) or a host path to a local checkpoint. For `llamacpp`, a `.gguf` file or a GGUF repository with an optional `:QUANT` selector (see [Engines](#engines)). |
 | `SPACE`   | Path to the search-space YAML file (see [section 2](#2-search-space-yaml-format)). |
-| `ENGINE`  | Inference engine to benchmark; it selects the backend that plans the server and interprets the result. `vllm` is implemented today. |
+| `ENGINE`  | Inference engine to benchmark: `vllm` or `llamacpp`. It selects the backend that checks the search space, plans the server, and interprets the result. |
 
 Everything else has a default, so the shortest invocation is just the three
 positionals. Run `llm-config-optimization --help` for the same documentation on the
 command line.
+
+### Engines
+
+The selected engine decides which tunables a space must declare, how `MODEL` is
+resolved, which server command runs, and which image is used. Both engines are
+driven by the same host-side client, so their workload and metric definitions
+are identical, but their defaults and scoped options differ.
+
+| Engine     | Checkpoint                                              | Applicable tunables                                    | Cache reset between runs      |
+| ---------- | ------------------------------------------------------- | ------------------------------------------------------ | ----------------------------- |
+| `vllm`     | A Hugging Face id or a local snapshot directory.        | All seven in [section 2](#2-search-space-yaml-format). | vLLM dev-mode endpoints.      |
+| `llamacpp` | A local `.gguf` file or a Hub repository with `:QUANT`. | The five llama.cpp forwards.                           | None; llama.cpp exposes none. |
+
+The **default images**, used when `--image` is omitted, are:
+
+| Target | vLLM                                     | llama.cpp                                |
+| ------ | ---------------------------------------- | ---------------------------------------- |
+| `cuda` | `docker.io/vllm/vllm-openai:latest`      | `ghcr.io/ggml-org/llama.cpp:server-cuda` |
+| `rocm` | `docker.io/vllm/vllm-openai-rocm:latest` | `ghcr.io/ggml-org/llama.cpp:server-rocm` |
+| `cpu`  | `docker.io/vllm/vllm-openai-cpu:latest`  | `ghcr.io/ggml-org/llama.cpp:server`      |
+
+**llama.cpp model argument.** `MODEL` is either a host path to a `.gguf` file
+or a Hugging Face repository id, optionally followed by `:` and a selector: the
+GGUF file's name or a quantization tag. A repository that holds exactly one GGUF
+file needs no selector; one that holds several requires it, so the tool never
+guesses which quantization you meant. The exact file name always names one
+file — `unsloth/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q6_K.gguf`; anything shorter is
+matched as a case-insensitive substring, so `:q4_k_m` finds `...-Q4_K_M.gguf`
+and the `.gguf` suffix may be left off. A shorter selector is only unambiguous
+while no other file's name contains it, though: in
+`unsloth/Qwen3.5-0.8B-GGUF`, `:Q6_K` also matches the dynamic
+`...-UD-Q6_K_XL.gguf` and is rejected with the candidates listed, so name the
+file when tags overlap. The resolved file is mounted into the server and its
+GGUF metadata is read before the image is pulled: a checkpoint that is not GGUF
+is rejected, and the quantization it declares is what the run serves.
+
+`--quantization` and `--gpu-memory-utilization` are **vLLM-only**: for
+`llamacpp` both are usage errors (exit code `2`) before any preparation runs,
+because a GGUF file carries its own quantization and llama.cpp sizes memory with
+its own flags. `--llm-seed` is likewise forwarded by vLLM only; the host
+client's workload is greedy, so llama.cpp needs no engine-side seed. Everything
+else on the command line behaves the same for both engines.
 
 ### Options
 
@@ -89,7 +132,7 @@ command line.
 | ---------------- | ---------------------------------------- | ------- | --------------------------------------------------------------------------- |
 | `--target`       | `cuda`, `rocm`, `cpu`                    | auto    | Accelerator class to target; auto-detected from the host when omitted.       |
 | `--image`        | any image reference                      | backend | Container image to run; the backend's image for the resolved target.        |
-| `--shm-size`     | size string, e.g. `8g`                   | `8g`    | Size of the container's `/dev/shm` (vLLM needs a large one).                 |
+| `--shm-size`     | size string, e.g. `8g`                   | `8g`    | Size of the container's `/dev/shm`; vLLM needs a large one, while llama.cpp is unaffected. |
 | `--mem-limit`    | size string, e.g. `16g`                  | unset   | Container memory limit; unlimited when omitted.                              |
 | `--pull-policy`  | `missing`, `always`, `never`, `newer`    | `missing` | When to pull the container image.                                          |
 
@@ -104,7 +147,7 @@ command line.
 | `--output-len`      | `128`        | Number of tokens to generate per prompt.                       |
 | `--repetitions`     | `3`          | Measured benchmark runs taken per trial.                       |
 | `--warmup-runs`     | `1`          | Discarded warmup runs taken before the measured runs.          |
-| `--startup-timeout` | `600`        | Seconds to wait for the served model to become healthy.        |
+| `--startup-timeout` | `600`        | Seconds to wait for the served model to become healthy; the wait ends early if the container exits. |
 | `--timeout`         | `900`        | Overall time limit for a trial's container, covering startup, warmup, and every measured run, in seconds. |
 
 `--dataset-path` reads a JSONL file, one JSON object per line, with a required
@@ -124,8 +167,9 @@ runs' total token throughput, and a trial succeeds as long as a strict majority
 of its measured runs succeed, so a single failed run does not discard an
 otherwise valid configuration.
 
-Before every run the server's caches are reset through vLLM's dev-mode
-endpoints, and each measured run is seeded with its index `0 … N-1` (warmup
+Before every run the server's caches are reset through the paths the backend
+declares — vLLM's dev-mode endpoints, while llama.cpp exposes none and is left
+as it is — and each measured run is seeded with its index `0 … N-1` (warmup
 runs are seeded past that range). The reset keeps a run from being flattered by
 prompts a previous run left cached, and the per-run seed makes it draw a fresh
 prompt set rather than replaying the one that warmed the cache. The per-run
@@ -133,19 +177,22 @@ measurements and the failure count are kept on the result, so the spread behind
 the mean stays inspectable.
 
 > **Note:** measurement goes through the server's OpenAI-compatible HTTP API
-> rather than the offline engine path (`vllm bench throughput`). The online
-> numbers include tokenisation and request overhead, so they are expected to be
-> somewhat lower and are **not comparable** to numbers recorded by earlier
+> rather than an offline engine path (`vllm bench throughput` for vLLM). The
+> online numbers include tokenisation and request overhead, so they are expected
+> to be somewhat lower and are **not comparable** to numbers recorded by earlier
 > versions of this tool.
 
 #### Engine
 
 | Flag                         | Default          | Description                                                                 |
 | ---------------------------- | ---------------- | --------------------------------------------------------------------------- |
-| `--llm-seed`                 | `0`              | Engine seed, so every trial runs under the same prompt randomness.           |
+| `--llm-seed`                 | `0`              | Engine seed (vLLM only), so every trial runs under the same prompt randomness. |
 | `--quantization`             | engine default   | Weight quantization the checkpoint was produced with (`awq`, `gptq`, `fp8`); checked against the resolved checkpoint. Omit to let the engine auto-detect. |
 | `--gpu-memory-utilization`   | engine default   | Fraction of GPU memory the engine may use.                                   |
 | `--sampler-seed`             | unset            | Seed for the optimization sampler; a non-deterministic search when omitted.  |
+
+`--quantization` and `--gpu-memory-utilization` are vLLM-only and are rejected
+as usage errors for `llamacpp`; see [Engines](#engines).
 
 #### Budget
 
@@ -185,12 +232,13 @@ lines. Asking for `--output tui` without a terminal is a usage error.
 Progress and the summary go to **stdout**; warnings and errors go to **stderr**,
 so `> run.log` captures a clean record.
 
-Both modes first resolve the model. A Hugging Face id is downloaded with a
-single progress line — `downloading <model>: 40%|…| 4/10` — that names the model
-and shows file progress; the Hub's own transfer and reconstruction bars are
-hidden. A warning emitted mid-download, such as the missing-`HF_TOKEN` advice,
-is terminated onto its own line rather than being overwritten by the next bar
-refresh. A local model path skips the download entirely.
+Both modes first resolve the model. A Hugging Face id — or, for `llamacpp`, a
+GGUF repository — is downloaded with a single progress line — `downloading
+<model>: 40%|…| 4/10` — that names the model and shows file progress; the Hub's
+own transfer and reconstruction bars are hidden. A warning emitted mid-download,
+such as the missing-`HF_TOKEN` advice, is terminated onto its own line rather
+than being overwritten by the next bar refresh. A local model path skips the
+download entirely.
 
 **TUI mode** draws a plotext graph of the sweep, redrawn at the start of each
 trial and again when it finishes. The running frame's status line marks the
@@ -300,6 +348,26 @@ $ llm-config-optimization Qwen/Qwen3.8-27B space.yaml vllm \
     --timeout 1800
 ```
 
+**llama.cpp over a local GGUF file, CPU-only and offline:**
+
+```console
+$ llm-config-optimization /models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+    examples/space-llamacpp-full.yaml llamacpp \
+    --target cpu \
+    --pull-policy never \
+    --num-prompts 20 \
+    --n-trials 3
+```
+
+**llama.cpp with a checkpoint selected from a Hugging Face repository:**
+
+```console
+$ llm-config-optimization bartowski/Llama-3.2-1B-Instruct-GGUF:Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+    examples/space-llamacpp-all-fixed.yaml llamacpp \
+    --n-trials 10 \
+    --output-config best-llamacpp.yaml
+```
+
 > **Requirement:** runs execute through Podman, so a running Podman daemon is
 > needed. A Hugging Face model id is downloaded to the host cache before the
 > first trial; a local path is bind-mounted instead.
@@ -309,7 +377,9 @@ Each run also uses a **temporary compile cache** on the host. vLLM rebuilds its
 without one each trial of a sweep pays several minutes of startup before the
 benchmark begins. The cache is mounted into every trial's container, so the
 first trial populates it and the rest reuse it, and it is removed when the run
-ends (including on interrupt or failure). Nothing is left behind.
+ends (including on interrupt or failure). Nothing is left behind. The cache is
+vLLM-only; llama.cpp needs no host directory, so a llama.cpp run places nothing
+on the host.
 
 ---
 
@@ -317,7 +387,8 @@ ends (including on interrupt or failure). Nothing is left behind.
 
 The definition file has exactly one top-level key, `space`, mapping each tunable
 parameter name to its **spec**. Nothing else is allowed at the top level, and
-every parameter the selected engine forwards must be declared.
+every parameter the selected engine forwards must be declared. The sample below
+is a vLLM space, which declares all seven tunables:
 
 ```yaml
 space:
@@ -341,16 +412,23 @@ space:
     default: true
 ```
 
-Two example definitions live in [`examples/`](examples/) and can be used
+Four example definitions live in [`examples/`](examples/) and can be used
 as starting points:
 
-* [`examples/space-all-fixed.yaml`](examples/space-all-fixed.yaml) pins all seven
-  tunables to a single value. This can be used as a reproducible baseline.
-  Its `flash_attention` backend is CUDA-only; use `attention_backend:
+* [`examples/space-vllm-all-fixed.yaml`](examples/space-vllm-all-fixed.yaml) pins
+  all seven vLLM tunables to a single value. This can be used as a reproducible
+  baseline. Its `flash_attention` backend is CUDA-only; use `attention_backend:
   {default: true}` there on ROCm or CPU.
-* [`examples/space-full.yaml`](examples/space-full.yaml) declares every tunable
-  with a broad range, deferring the hardware-dependent `tensor_parallel_size`
-  and `attention_backend` to the engine so it runs on any host.
+* [`examples/space-vllm-full.yaml`](examples/space-vllm-full.yaml) declares every
+  vLLM tunable with a broad range, deferring the hardware-dependent
+  `tensor_parallel_size` and `attention_backend` to the engine so it runs on any
+  host.
+* [`examples/space-llamacpp-all-fixed.yaml`](examples/space-llamacpp-all-fixed.yaml)
+  pins the five llama.cpp tunables to a single value, for a reproducible
+  llama.cpp baseline.
+* [`examples/space-llamacpp-full.yaml`](examples/space-llamacpp-full.yaml)
+  declares every llama.cpp tunable with a broad range, deferring the
+  build-dependent `attention_backend` to the engine.
 
 ### Spec kinds
 
@@ -373,9 +451,11 @@ sampled and the optimizer cannot interpolate between them.
 The definition must declare every parameter the selected engine forwards — the
 search space is **total over that engine's applicable set**, so a value can
 never silently fall back to an engine default. Omitting one is an error naming
-the missing parameter. vLLM forwards all seven parameters below, so for a vLLM
-run every one is required; an engine that lacks a parameter may omit it. Write
-`default: true` for using an engine default.
+the missing parameter, and declaring one the engine does not forward is a
+backend problem (exit code `4`). vLLM forwards all seven parameters below;
+llama.cpp forwards all but `dtype` and `tensor_parallel_size`, which it omits
+because a GGUF file carries its own numerical format and llama.cpp has no
+tensor parallelism. Write `default: true` for using an engine default.
 
 | Parameter                | Kind                                            | Accepted values                                       |
 | ------------------------ | ----------------------------------------------- | ----------------------------------------------------- |
@@ -389,32 +469,87 @@ run every one is required; an engine that lacks a parameter may omit it. Write
 
 `interval` is only valid for the integer parameters. `fixed` and `categorical`
 are valid for both kinds: an enum parameter's categorical values are written
-using the engine-neutral spellings above (not vLLM's own names), while a
+using the engine-neutral spellings above (not the engine's own names), while a
 numeric parameter's categorical values are the integers themselves.
 
-`attention_backend` and `tensor_parallel_size` are the two host-dependent
-parameters. `flash_attention` and `flash_infer` are CUDA-only, so a ROCm or CPU
-run must declare `attention_backend: {default: true}` and let the engine select
-its own backend; a space that can produce a `tensor_parallel_size` larger than
-the resolved device count must likewise defer it with `{default: true}` or pin
-a value the host can run. Either problem is rejected up front (exit code `4`).
+For vLLM, `attention_backend` and `tensor_parallel_size` are the two
+host-dependent parameters. `flash_attention` and `flash_infer` are CUDA-only, so
+a ROCm or CPU run must declare `attention_backend: {default: true}` and let the
+engine select its own backend; a space that can produce a
+`tensor_parallel_size` larger than the resolved device count must likewise defer
+it with `{default: true}` or pin a value the host can run. Either problem is
+rejected up front (exit code `4`).
+
+### Engine-specific spaces
+
+A llama.cpp space declares exactly the five tunables that map to real
+`llama-server` flags:
+
+```yaml
+space:
+  kv_cache_dtype:
+    categorical: [float16, bfloat16]
+  max_model_len:
+    interval: {min: 1024, max: 32768}
+  max_num_seqs:
+    interval: {min: 1, max: 256}
+  max_num_batched_tokens:
+    interval: {min: 2048, max: 8192}
+  attention_backend:
+    default: true
+```
+
+The engine-neutral names translate to llama.cpp as follows:
+
+| Parameter                | `llama-server` flags               | Accepted values                                                                     |
+| ------------------------ | ---------------------------------- | ----------------------------------------------------------------------------------- |
+| `kv_cache_dtype`         | `--cache-type-k`, `--cache-type-v` | `float16` → `f16`, `bfloat16` → `bf16`; `auto` and the FP8 members are unsupported. |
+| `max_model_len`          | `--ctx-size`                       | Any integer ≥ 1.                                                                    |
+| `max_num_seqs`           | `--parallel`                       | Any integer ≥ 1; capped to what `max_model_len` can serve (see below).              |
+| `max_num_batched_tokens` | `--batch-size`, `--ubatch-size`    | Any integer ≥ 1; sets both the logical and the physical batch, which llama.cpp clamps to the context size rather than rejecting. A larger value needs more compute-buffer memory. |
+| `attention_backend`      | `--flash-attn`                     | `flash_attention` → `on`; `flash_infer` and `xformers` are unsupported.             |
+
+llama.cpp divides `--ctx-size` evenly across the `--parallel` slots, so a
+request longer than a slot's share is rejected. The backend therefore keeps
+`--ctx-size` exactly at the sampled `max_model_len` and caps the forwarded slot
+count at `max_model_len // (input_len + output_len)` for the random workload,
+with at least one slot; a sampled context below the workload's request length
+cannot be served at any slot count and its trial fails. A JSONL
+`--dataset-path` workload leaves the declared slot count alone, because its
+request length is not known when the plan is built.
+
+Only the values above are spellable: a fixed or categorical value with no
+mapping — an `auto` KV cache, say — is rejected before the sweep starts rather
+than silently dropped, so a declared value always reaches the server. Use
+`default: true` to let llama.cpp choose for itself. `dtype` and
+`tensor_parallel_size` must not be declared for llama.cpp; the backend reports
+them as parameters it does not forward.
+
+vLLM's space is the sample at the top of this section: it declares all seven
+tunables, and every value is translated to vLLM's own spelling. The KV-cache
+`auto` and FP8 members and the `flash_infer` attention backend have no
+llama.cpp mapping; `xformers` is not modelled by either engine.
 
 `seed`, `gpu_memory_utilization`, and `quantization` are intentionally **not**
-tunable. `seed` and `gpu_memory_utilization` are reproducibility and fit knobs
-set on the command line (`--llm-seed`, `--gpu-memory-utilization`);
-`quantization` describes how the checkpoint was produced, so it is a model
-property rather than a runtime choice and is set with `--quantization`. The
-measurement controls — `repetitions`, `warmup`, `startup_timeout`, and the
-overall container `timeout` — are non-tunables too: they configure *how* a
-point is measured, not which point is tried, so they are set on the command
-line (`--repetitions`, `--warmup-runs`, `--startup-timeout`, `--timeout`) and
-never enter the search space.
+tunable. `seed` (vLLM only) and `gpu_memory_utilization` (vLLM only) are
+reproducibility and fit knobs set on the command line (`--llm-seed`,
+`--gpu-memory-utilization`); `quantization` describes how the checkpoint was
+produced, so it is a model property rather than a runtime choice and is set with
+`--quantization` (vLLM only). The measurement controls — `repetitions`,
+`warmup`, `startup_timeout`, and the overall container `timeout` — are
+non-tunables too: they configure *how* a point is measured, not which point is
+tried, so they are set on the command line (`--repetitions`, `--warmup-runs`,
+`--startup-timeout`, `--timeout`) and never enter the search space.
 
-Because it is a checkpoint property, `--quantization` is validated against the
-resolved checkpoint before the image is pulled: a quantized checkpoint accepts
-only the method it was produced with, and an unquantized checkpoint accepts only
-a method the engine can apply online (`fp8`). Omit `--quantization` to let the
-engine auto-detect the method, which is always accepted.
+Because it is a checkpoint property, vLLM's `--quantization` is validated
+against the resolved checkpoint before the image is pulled: a quantized
+checkpoint accepts only the method it was produced with, and an unquantized
+checkpoint accepts only a method the engine can apply online (`fp8`). Omit
+`--quantization` to let the engine auto-detect the method, which is always
+accepted. For llama.cpp the flag is a usage error in the first place: the GGUF
+metadata is the checkpoint's quantization, and the tool reads it to report what
+the run serves. A checkpoint that is not GGUF is rejected before the image is
+pulled.
 
 ### Validation
 
@@ -426,19 +561,24 @@ Validation happens in three stages, all before any container runs:
    known, that categoricals are non-empty and unique, that intervals are ordered,
    and the universal `≥ 1` bounds. **Every problem found is reported at once**,
    so a broken definition can be fixed in a single pass.
-2. **Backend-specific**: `vLLM` is asked whether it forwards each declared
-   parameter, supports each value, supports that value on the resolved
-   accelerator class, and fits the resolved device count. It also enforces its
-   own cross-parameter rule `max_num_batched_tokens >= max_num_seqs` (checked
-   against the most permissive point the space allows).
-3. **Model-aware**: Once the checkpoint is resolved to a local directory (a host
-   path, or the snapshot the Hugging Face download produced), `vLLM` inspects
-   the quantization method it declares and rejects a `--quantization` the
-   checkpoint cannot serve. The check runs before the container image is pulled,
-   so a doomed configuration does not wait on a multi-gigabyte download. An
-   omitted `--quantization` always passes, because the engine auto-detects the
-   method, and a checkpoint whose metadata cannot be read is likewise accepted,
-   so custom checkpoints are never blocked.
+2. **Backend-specific**: The selected backend is asked whether it forwards each
+   declared parameter and supports each value. vLLM additionally checks that a
+   value is supported on the resolved accelerator class and fits the resolved
+   device count, and enforces its cross-parameter rule
+   `max_num_batched_tokens >= max_num_seqs` (checked against the most permissive
+   point the space allows). llama.cpp rejects a parameter it does not forward
+   and any enum value it has no spelling for.
+3. **Model-aware**: Once the checkpoint is resolved to a local path (a host path,
+   the snapshot a Hugging Face download produced, or the single GGUF file
+   llama.cpp fetches), the backend inspects it and rejects a configuration it
+   cannot serve. vLLM reads the quantization method the checkpoint declares and
+   rejects a `--quantization` the checkpoint cannot serve; llama.cpp rejects a
+   non-GGUF checkpoint and a configured `--quantization`, naming the
+   quantization the GGUF metadata declares. The check runs before the container
+   image is pulled, so a doomed configuration does not wait on a multi-gigabyte
+   download. An omitted `--quantization` always passes, because the engine
+   auto-detects the method, and a checkpoint whose metadata cannot be read is
+   likewise accepted, so custom checkpoints are never blocked.
 
 Malformed YAML and a non-mapping document are reported through the same error as
 a structural problem, so a broken file fails uniformly with exit code `3`; an
@@ -446,7 +586,7 @@ unsupported space or model fails with exit code `4`.
 
 ### All-default and mixed examples
 
-A space that pins nothing and lets the engine choose everything:
+A vLLM space that pins nothing and lets the engine choose everything:
 
 ```yaml
 space:
@@ -459,7 +599,18 @@ space:
   attention_backend: {default: true}
 ```
 
-A mixed space exploring sequence length, batch size, and precision:
+The llama.cpp equivalent declares only the five it forwards:
+
+```yaml
+space:
+  kv_cache_dtype: {default: true}
+  max_model_len: {default: true}
+  max_num_seqs: {default: true}
+  max_num_batched_tokens: {default: true}
+  attention_backend: {default: true}
+```
+
+A mixed vLLM space exploring sequence length, batch size, and precision:
 
 ```yaml
 space:
@@ -487,11 +638,11 @@ space:
 | -------------------- | -------------------------------------------------------------------------- |
 | Language / packaging | Python **3.14**, `src/` layout, [uv](https://docs.astral.sh/uv/) with the `uv_build` backend |
 | Search / optimization| [Optuna](https://optuna.org/) TPE sampler, maximizing token throughput; SQLite or in-memory studies |
-| Inference engine     | **vLLM** (the only backend implemented so far), started once per trial with `vllm serve` and measured from the host by a shared HTTP client; the layer above it is engine-neutral |
+| Inference engine     | **vLLM** and **llama.cpp**, each started once per trial (`vllm serve`, `llama-server`) and measured from the host by a shared HTTP client; the layer above them is engine-neutral |
 | Benchmark client     | **`httpx2`** async HTTP client, driving the server's OpenAI-compatible API from the host with an injectable transport and clock |
 | Container runtime    | **Podman** via the [`podman`](https://pypi.org/project/podman/) Python bindings (CDI for CUDA, device nodes for ROCm, none for CPU) |
 | Config format        | **PyYAML** (`yaml.safe_load`) for the search-space and output-config files |
-| Model fetching       | [`huggingface_hub`](https://pypi.org/project/huggingface-hub/) snapshot download for Hugging Face ids |
+| Model fetching       | [`huggingface_hub`](https://pypi.org/project/huggingface-hub/) snapshot download for vLLM, single-file GGUF download for llama.cpp |
 | Terminal UI          | [`plotext`](https://pypi.org/project/plotext/) for the live best-so-far graph |
 | Testing              | **pytest** (unit tests use fakes; `integration`-marked tests need a Podman daemon and are deselected by default) |
 | Linting / formatting | **Ruff** (line length 100, `py314` target)                                  |
@@ -505,11 +656,12 @@ The codebase is layered so engine details stay at the edges:
 - `search_space/`: Engine-neutral definition types, the tunable registry, the
   YAML loader, and validation.
 - `inference/`: The engine-neutral experiment surface (the `InferenceBackend`
-  `Protocol` and the `ServerSpec` a backend plans) plus the `VLLMBackend`, the
-  host-side benchmark client, and hardware detection. A backend validates a
-  resolved checkpoint, plans a `ServerSpec`, and parses results; the client
-  waits for the server's health, takes the warmup and measured runs, and
-  aggregates the metrics. A second engine is another implementation of the
+  `Protocol` and the `ServerSpec` a backend plans) plus the `VLLMBackend` and
+  `LlamaCppBackend`, the host-side benchmark client, and hardware detection. A
+  backend validates a resolved checkpoint, plans a `ServerSpec`, and parses
+  results; the client waits for the server's health — failing the run as soon
+  as the container exits during that wait — takes the warmup and measured runs,
+  and aggregates the metrics. A second engine is another implementation of the
   protocol.
 - `runtime/`: Backend-agnostic container types, the detached start/stop
   lifecycle a host-driven run uses, and the Podman client (plus SELinux
@@ -523,4 +675,6 @@ Because the definition and experiment surfaces import no engine, the same
 search space and validation workflow can target a different inference backend
 later without changing the file format. The search space is total over the
 selected backend's applicable set, so the engine — not the file format —
-decides which parameters a definition must declare.
+decides which parameters a definition must declare. Each backend keeps its
+vocabulary — flags, value spellings, checkpoint handling, and default images —
+in its own module.

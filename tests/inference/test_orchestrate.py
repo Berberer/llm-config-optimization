@@ -201,6 +201,26 @@ def test_each_stage_receives_the_previous_stage_output(monkeypatch: pytest.Monke
     assert measured_benchmark is experiment.benchmark
 
 
+def test_the_started_containers_liveness_is_passed_to_the_benchmark_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The benchmark client can tell a stalled wait from a container that died."""
+    events: list[str] = []
+    client = RecordingPodmanClient(events)
+    backend = FakeBackend(_SPEC, _result(), events)
+    benchmark = FakeBenchmarkClient(_outcome())
+    _detector(monkeypatch, events)
+
+    run_experiment(_experiment(), backend, client=client, benchmark_client=benchmark)
+
+    assert len(benchmark.liveness) == 1
+    is_alive = benchmark.liveness[0]
+    assert is_alive is not None
+    assert is_alive() is True
+    client.container_status = "exited"
+    assert is_alive() is False
+
+
 def test_container_target_override_reaches_detection(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     client = RecordingPodmanClient(events)

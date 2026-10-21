@@ -10,7 +10,7 @@ without an engine or GPU. Both live beside the root ``conftest.py`` so every
 test package can import them.
 """
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,6 +67,7 @@ class FakeContainer:
         self.started = False
         self.stopped = False
         self.killed = False
+        self.status = client.container_status
         self.ports: dict[str, object] = {}
         self.wait_calls: list[float | None] = []
         self.remove_calls: list[bool] = []
@@ -88,6 +89,7 @@ class FakeContainer:
         self.reload_calls += 1
         if self.client.reload_error is not None:
             raise self.client.reload_error
+        self.status = self.client.container_status
         self.ports = dict(self.client.resolved_ports)
 
     def wait(self, timeout: float | None = None) -> int:
@@ -153,6 +155,7 @@ class FakePodmanClient:
         reload_error: APIError | None = None,
         stop_error: APIError | None = None,
         resolved_ports: dict[str, object] | None = None,
+        container_status: str = "running",
     ) -> None:
         self.exit_code = exit_code
         self.logs = logs
@@ -169,6 +172,7 @@ class FakePodmanClient:
             if resolved_ports is not None
             else {"8000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8000"}]}
         )
+        self.container_status = container_status
         self.images = FakeImageManager(self)
         self.containers = FakeContainerManager(self)
         self.pull_calls: list[tuple[str, str]] = []
@@ -285,6 +289,8 @@ class FakeBenchmarkClient:
     It returns a canned :class:`BenchmarkOutcome` and records every server it is
     asked to measure, so the orchestrator's lifecycle can be driven without a
     server, a daemon, or a GPU. ``measure_error`` makes every measurement fail.
+    The liveness callback the orchestrator passes is recorded uninvoked, so a
+    test can probe it against the fake runtime itself.
     """
 
     def __init__(
@@ -296,6 +302,7 @@ class FakeBenchmarkClient:
         self.outcome = outcome if outcome is not None else BenchmarkOutcome(runs=(), failed_runs=0)
         self.measure_error = measure_error
         self.calls: list[tuple[str, str, ServerSpec, BenchmarkConfig]] = []
+        self.liveness: list[Callable[[], bool] | None] = []
 
     def measure_sync(
         self,
@@ -305,8 +312,10 @@ class FakeBenchmarkClient:
         benchmark: BenchmarkConfig,
         *,
         concurrency: int | None = None,
+        is_alive: Callable[[], bool] | None = None,
     ) -> BenchmarkOutcome:
         self.calls.append((base_url, model, spec, benchmark))
+        self.liveness.append(is_alive)
         if self.measure_error is not None:
             raise self.measure_error
         return self.outcome

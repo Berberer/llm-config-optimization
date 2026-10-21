@@ -464,6 +464,24 @@ def test_detached_logs_read_the_current_streams() -> None:
     assert handle.logs() == (b"served", b"warn")
 
 
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("running", True), ("paused", True), ("exited", False), ("stopped", False)],
+)
+def test_detached_liveness_reflects_the_container_status(status: str, expected: bool) -> None:
+    client = FakePodmanClient(container_status=status)
+    handle = start_container(ContainerConfig(image="img"), client=client)
+
+    assert handle.is_running() is expected
+
+
+def test_detached_liveness_fails_open_when_the_runtime_cannot_be_queried() -> None:
+    client = FakePodmanClient(reload_error=APIError("inspect failed"))
+    handle = start_container(ContainerConfig(image="img"), client=client)
+
+    assert handle.is_running() is True
+
+
 def test_detached_stop_captures_result_and_removes_container() -> None:
     client = FakePodmanClient(exit_code=143, logs=_frame(1, b"served") + _frame(2, b"warn"))
 

@@ -213,6 +213,7 @@ class BenchmarkClient:
         benchmark: BenchmarkConfig,
         *,
         concurrency: int | None = None,
+        is_alive: Callable[[], bool] | None = None,
     ) -> BenchmarkOutcome:
         """Measure ``spec``'s server at ``base_url`` and return its runs.
 
@@ -223,25 +224,33 @@ class BenchmarkClient:
         are fired concurrently, bounded by ``concurrency`` when it is given and
         unbounded otherwise.
 
+        ``is_alive``, when given, is polled during the health wait so a server
+        container that has already exited — a model-load crash, an out-of-memory
+        kill — ends the run immediately with that reason instead of waiting out
+        the whole startup timeout. The orchestrator passes the started
+        container's liveness check.
+
         A run whose requests all fail is counted in ``failed_runs`` and does not
         contribute a metric. Raises :class:`ExperimentError` when the server
-        never becomes healthy, when the workload cannot be built, when the
-        overall timeout is exceeded, or when fewer than a strict majority of the
-        measured runs succeeded.
+        never becomes healthy, when the server container exits during the wait,
+        when the workload cannot be built, when the overall timeout is exceeded,
+        or when fewer than a strict majority of the measured runs succeeded.
         """
         workload = _build_workload(benchmark, self.vocab_size)
         if benchmark.timeout is not None:
             try:
                 async with asyncio.timeout(benchmark.timeout):
                     return await self._measure(
-                        base_url, model, spec, benchmark, workload, concurrency
+                        base_url, model, spec, benchmark, workload, concurrency, is_alive
                     )
             except TimeoutError as exc:
                 raise ExperimentError(
                     f"the benchmark for {benchmark.model!r} exceeded its "
                     f"{benchmark.timeout}s overall timeout"
                 ) from exc
-        return await self._measure(base_url, model, spec, benchmark, workload, concurrency)
+        return await self._measure(
+            base_url, model, spec, benchmark, workload, concurrency, is_alive
+        )
 
     def measure_sync(
         self,
@@ -251,6 +260,7 @@ class BenchmarkClient:
         benchmark: BenchmarkConfig,
         *,
         concurrency: int | None = None,
+        is_alive: Callable[[], bool] | None = None,
     ) -> BenchmarkOutcome:
         """Synchronous entry point for a caller that is not already in a loop.
 
@@ -258,7 +268,11 @@ class BenchmarkClient:
         :meth:`measure` through :func:`asyncio.run` rather than owning an event
         loop of its own.
         """
-        return asyncio.run(self.measure(base_url, model, spec, benchmark, concurrency=concurrency))
+        return asyncio.run(
+            self.measure(
+                base_url, model, spec, benchmark, concurrency=concurrency, is_alive=is_alive
+            )
+        )
 
     async def _measure(
         self,
@@ -268,6 +282,7 @@ class BenchmarkClient:
         benchmark: BenchmarkConfig,
         workload: Callable[[int], list[_Request]],
         concurrency: int | None,
+        is_alive: Callable[[], bool] | None,
     ) -> BenchmarkOutcome:
         """Run the health wait, warmup, and measured runs against one server."""
         limits = httpx2.Limits(
@@ -280,7 +295,7 @@ class BenchmarkClient:
             limits=limits,
             timeout=self.request_timeout,
         ) as client:
-            await self._wait_for_health(client, spec)
+            await self._wait_for_health(client, spec, is_alive)
             measured: list[RunMetrics] = []
             failed_runs = 0
             for warmup_index in range(benchmark.warmup):
@@ -307,8 +322,19 @@ class BenchmarkClient:
             )
         return BenchmarkOutcome(runs=tuple(measured), failed_runs=failed_runs)
 
-    async def _wait_for_health(self, client: httpx2.AsyncClient, spec: ServerSpec) -> None:
-        """Poll the spec's health path until it succeeds or the deadline passes."""
+    async def _wait_for_health(
+        self,
+        client: httpx2.AsyncClient,
+        spec: ServerSpec,
+        is_alive: Callable[[], bool] | None,
+    ) -> None:
+        """Poll the spec's health path until it succeeds, the container dies, or the deadline passes.
+
+        A failed probe is followed by ``is_alive`` — when the caller supplied
+        one — so a container that crashed on startup is reported as such at
+        once, with the engine's logs attached by the orchestrator, instead of
+        polling a dead endpoint until the startup timeout elapses.
+        """
         deadline = self.clock() + spec.health_timeout
         while True:
             try:
@@ -317,6 +343,10 @@ class BenchmarkClient:
                 response = None
             if response is not None and response.is_success:
                 return
+            if is_alive is not None and not is_alive():
+                raise ExperimentError(
+                    f"the server container exited before becoming healthy at {spec.health_path}"
+                )
             if self.clock() >= deadline:
                 raise ExperimentError(
                     f"the server did not become healthy at {spec.health_path} within "

@@ -326,6 +326,21 @@ class _PodmanRunningContainer:
     def logs(self) -> tuple[bytes, bytes]:
         return _read_logs(self._container)
 
+    def is_running(self) -> bool:
+        """Refresh the container's state and report whether it still runs.
+
+        ``reload`` reads the container back from the runtime, so a process that
+        exited between two polls is seen; the read-back is the same one the
+        port resolution uses. A query that fails — the daemon is unreachable,
+        the container record is already gone — reports the container as
+        running, because an unknown state is what the health timeout is for.
+        """
+        try:
+            self._container.reload()
+        except APIError:
+            return True
+        return self._container.status not in ("exited", "stopped")
+
     def stop(self, timeout: float | None = None) -> ContainerResult:
         try:
             self._container.stop(timeout=timeout, ignore=True)

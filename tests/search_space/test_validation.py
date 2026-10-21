@@ -168,12 +168,68 @@ def test_a_space_that_satisfies_the_engine_bound_has_no_problems() -> None:
     assert list(VLLMBackend().validate(satisfying)) == []
 
 
+def test_a_categorical_engine_bound_is_checked_by_its_extremes() -> None:
+    """A categorical bound can violate the rule too, so its extremes are compared."""
+    violating = space(
+        Dimension("max_num_batched_tokens", Categorical((512, 4096))),
+        Dimension("max_num_seqs", Categorical((1024, 2048))),
+    )
+
+    problems = VLLMBackend().validate(violating)
+
+    assert any("space.max_num_batched_tokens" in problem for problem in problems)
+
+
+def test_a_non_numeric_engine_bound_value_skips_the_bound_check() -> None:
+    """A spec the bound cannot be compared against is skipped, not crashed on."""
+    incomparable = space(
+        Dimension("max_num_batched_tokens", Fixed(512)),
+        Dimension("max_num_seqs", Categorical((1024, "wide"))),
+    )
+
+    assert list(VLLMBackend().validate(incomparable)) == []
+
+
+def test_an_enum_engine_bound_value_skips_the_bound_check() -> None:
+    """An enum member is incomparable with an integer bound, like a non-numeric value."""
+    incomparable = space(
+        Dimension("max_num_batched_tokens", Fixed(512)),
+        Dimension("max_num_seqs", Categorical((DType.FLOAT16,))),
+    )
+
+    problems = VLLMBackend().validate(incomparable)
+
+    assert not any("requires" in problem for problem in problems)
+    assert any("space.max_num_seqs.categorical[0]" in problem for problem in problems)
+
+
 def test_an_attention_backend_vllm_no_longer_ships_is_reported() -> None:
     problems = VLLMBackend().validate(
         space(Dimension("attention_backend", Fixed(AttentionBackend.XFORMERS)))
     )
 
     assert any("space.attention_backend.fixed" in problem for problem in problems)
+
+
+def test_a_non_enum_attention_backend_value_skips_the_target_check() -> None:
+    """The target check classifies enum members; the kind check owns every other value."""
+    problems = VLLMBackend().validate(
+        space(Dimension("attention_backend", Fixed(7))),
+        DetectedHardware(HardwareTarget.CUDA, 1),
+    )
+
+    assert list(problems) == []
+
+
+def test_a_parameter_absent_from_the_value_maps_rejects_every_enum_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A field with no curated spelling cannot translate any member."""
+    monkeypatch.setattr("llm_config_optimization.inference._vllm.VALUE_MAPS", MappingProxyType({}))
+
+    problems = VLLMBackend().validate(space(Dimension("dtype", Fixed(DType.FLOAT16))))
+
+    assert any(problem.startswith("space.dtype.fixed") for problem in problems)
 
 
 @pytest.mark.parametrize("target", [HardwareTarget.ROCM, HardwareTarget.CPU])
