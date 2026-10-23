@@ -7,17 +7,29 @@ its own and cannot diverge from the sweep's own accounting. Unlike the TUI
 reporter, log mode has no running-trial marker: the format is deliberately one
 line per finished trial, so a redirected log stays easy to parse.
 
-The line is::
+A scalar trial's line is::
 
-    trial <i>/<N>  <STATE>  <tps> tps  best <best>  (<elapsed>)
+    trial <i>/<N>  <STATE>  <tps> tps  [prefill <p> tps  decode <d> tps ] best <best>  (<elapsed>)
 
 where ``<i>`` counts the trials finished in this invocation, ``<N>`` is the
 trial budget and is omitted when the sweep is unbounded, ``<STATE>`` is the
-trial's terminal state, ``<best>`` is the best objective value the study holds
-so far (``n/a`` until a trial completes), and ``<elapsed>`` is the wall-clock
-time since the reporter started. A failed trial prints the message the
-optimizer recorded under the trial's ``error`` user attribute in place of the
-throughput, so one bad configuration is visible without ending the sweep.
+trial's terminal state, ``<tps>`` is the objective value the trial submitted,
+``<best>`` is the best objective value the study holds so far (``n/a`` until a
+trial completes), and ``<elapsed>`` is the wall-clock time since the reporter
+started. The phase rates are the engine-reported prefill and decode
+tokens-per-second the optimizer recorded on the trial; they appear as a pair
+when the engine reported both and are omitted — keeping the historical line —
+when it did not.
+
+A multi-objective study has no single objective value, so the line names the
+trial's two rates instead and its best column reports the highest rate reached
+in each phase::
+
+    trial <i>/<N>  <STATE>  prefill <p> tps  decode <d> tps  best prefill <bp> tps  decode <bd> tps  (<elapsed>)
+
+A failed trial prints the message the optimizer recorded under the trial's
+``error`` user attribute in place of the value and phase columns, so one bad
+configuration is visible without ending the sweep.
 
 The elapsed time is read from an injectable clock and the line is written to an
 injectable stream, so the reporter is exercised in tests as a string producer
@@ -39,6 +51,15 @@ __all__ = ["LogReporter"]
 _ERROR_ATTRIBUTE = "error"
 """The trial user attribute the optimizer records a failed run's message under."""
 
+_RESULT_ATTRIBUTE = "result"
+"""The trial user attribute the optimizer records a successful run's metrics under."""
+
+_PREFILL_KEY = "prefill_tokens_per_second"
+"""The result-projection key holding the aggregate prefill tokens per second."""
+
+_DECODE_KEY = "decode_tokens_per_second"
+"""The result-projection key holding the aggregate decode tokens per second."""
+
 
 class LogReporter:
     """Print one line per finished trial, with best-so-far and elapsed time.
@@ -47,8 +68,10 @@ class LogReporter:
     it is passed straight through as ``callback``. It tracks two things across
     calls: the number of trials finished in this invocation, which numbers the
     lines, and the start time used for the elapsed column. The best-so-far value
-    is read from the study on every line rather than remembered here, so a
-    resumed study reflects the best an earlier run found.
+    is read from the study on every line rather than remembered here — the best
+    objective in a scalar study, the highest rate of each phase in a
+    multi-objective one — so a resumed study reflects the best an earlier run
+    found.
 
     ``n_trials`` is the sweep's trial budget and only shapes the ``<i>/<N>``
     progress column; ``None`` means an unbounded sweep and prints the index
@@ -87,11 +110,9 @@ class LogReporter:
         """
         index = self._completed + 1
         progress = f"{index}/{self._budget}" if self._budget is not None else str(index)
-        best = _best_value(study)
-        best_text = "n/a" if best is None else f"{best:.2f}"
         return (
             f"trial {progress}  {trial.state.name}  {_outcome(trial)}"
-            f"  best {best_text}  ({self._elapsed():.1f}s)"
+            f"  best {_best_text(study)}  ({self._elapsed():.1f}s)"
         )
 
     def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
@@ -117,19 +138,81 @@ def _best_value(study: optuna.Study) -> float | None:
         return None
 
 
-def _outcome(trial: optuna.trial.FrozenTrial) -> str:
-    """Render a trial's result column: its throughput, or its recorded error.
+def _best_text(study: optuna.Study) -> str:
+    """Render the best column: one value, one phase-rate pair, or ``n/a``.
 
-    A completed trial has an objective value, which is printed as tokens per
-    second. A trial without one failed, so the message the optimizer recorded on
-    it is used instead; a failure that recorded no message — a pruned trial, for
-    instance — falls back to a plain placeholder rather than an empty column.
-    The message is collapsed to a single line so the documented one-line-per-
-    trial format survives a multi-line engine traceback.
+    A scalar study reports the best objective value. A multi-objective study
+    has none, so its column reports the highest prefill and decode rate any
+    trial has reached instead of inventing a single winner.
     """
-    if trial.value is not None:
-        return f"{trial.value:.2f} tps"
+    if len(study.directions) > 1:
+        rates = _best_rates(study)
+        return "n/a" if rates is None else _rates_text(*rates)
+    best = _best_value(study)
+    return "n/a" if best is None else f"{best:.2f}"
+
+
+def _best_rates(study: optuna.Study) -> tuple[float, float] | None:
+    """Return the highest prefill and decode rate reached in a multi study.
+
+    Every completed trial of a multi study carries its two rates as its
+    objective values, so the per-phase maxima are read straight off the study.
+    The two maxima may come from different trials; each is the edge of the
+    Pareto front the sweep has reached in that phase. ``None`` until a trial
+    completes.
+    """
+    pairs = [values for trial in study.trials if (values := trial.values) is not None]
+    if not pairs:
+        return None
+    return max(values[0] for values in pairs), max(values[1] for values in pairs)
+
+
+def _outcome(trial: optuna.trial.FrozenTrial) -> str:
+    """Render a trial's result column: its rates, throughput, or recorded error.
+
+    A multi-objective trial's two objective values are exactly its prefill and
+    decode rates, so they are printed as the pair. A completed scalar trial
+    prints its objective as tokens per second and appends the phase-rate pair
+    the optimizer recorded on it when the engine reported both, so the same
+    line exposes the phase split without needing the study's mode. A trial
+    without values failed, so the message the optimizer recorded on it is used
+    instead; a failure that recorded no message — a pruned trial, for instance
+    — falls back to a plain placeholder rather than an empty column. The
+    message is collapsed to a single line so the documented one-line-per-trial
+    format survives a multi-line engine traceback.
+    """
+    values = trial.values
+    if values is not None:
+        if len(values) > 1:
+            return _rates_text(values[0], values[1])
+        scalar = f"{values[0]:.2f} tps"
+        rates = _recorded_rates(trial)
+        return scalar if rates is None else f"{scalar}  {_rates_text(*rates)}"
     error = trial.user_attrs.get(_ERROR_ATTRIBUTE)
     if error is None:
         return "no result"
     return " ".join(str(error).split())
+
+
+def _rates_text(prefill: float, decode: float) -> str:
+    """Render a phase-rate pair as the label/value columns the log line uses."""
+    return f"prefill {prefill:.2f} tps  decode {decode:.2f} tps"
+
+
+def _recorded_rates(trial: optuna.trial.FrozenTrial) -> tuple[float, float] | None:
+    """Return the phase-rate pair the optimizer recorded on a scalar trial.
+
+    The optimizer stores a JSON-serializable projection of every successful
+    run under the ``result`` user attribute, including the prefill and decode
+    rates when the engine reported them. They are shown as a pair or not at
+    all: a trial whose engine reported only one phase keeps the historical
+    single-value line rather than a half-labelled one.
+    """
+    recorded = trial.user_attrs.get(_RESULT_ATTRIBUTE)
+    if not isinstance(recorded, dict):
+        return None
+    prefill = recorded.get(_PREFILL_KEY)
+    decode = recorded.get(_DECODE_KEY)
+    if not isinstance(prefill, int | float) or not isinstance(decode, int | float):
+        return None
+    return float(prefill), float(decode)

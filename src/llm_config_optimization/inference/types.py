@@ -6,7 +6,7 @@ backend) imports them; they import no engine and no container backend, so the
 experiment surface stays free of engine-shaped details.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -266,12 +266,20 @@ class ServerSpec:
     before giving up, in seconds. ``reset_paths`` lists the endpoints the
     client calls between measured runs to drop engine-side caches; an empty
     tuple means the engine exposes none and the client skips resetting.
+
+    ``metrics_path`` is the HTTP path the client scrapes for the engine's
+    Prometheus metrics around each measured run. It is plain engine-neutral
+    data: ``None`` means the engine exposes no scrapeable metrics and the
+    client does nothing extra, while a declared path is the client's
+    instruction to snapshot it. Which series the engine publishes and how they
+    are interpreted stay in the backend that owns the engine.
     """
 
     container: ContainerConfig
     health_path: str
     health_timeout: float
     reset_paths: tuple[str, ...] = ()
+    metrics_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +369,15 @@ class RunMetrics:
     generation-only, so a workload with a large prompt-to-output ratio is
     dominated by prefill. The host client computes it from the engine's usage
     payload, which exposes no output-only throughput.
+
+    ``prefill_tokens_per_second`` and ``decode_tokens_per_second`` separate the
+    combined number into the two phases of inference. They are phase-work
+    rates: total phase tokens divided by the total phase seconds the engine
+    reported, not a partition of the run's wall-clock time — continuous
+    batching and chunked prefill interleave the phases, so only the engine can
+    attribute work to one. Either is ``None`` when the run's engine did not
+    report what the rate needs, so a consumer that requires a phase must check
+    rather than fall back to the combined number.
     """
 
     tokens_per_second: float
@@ -368,6 +385,8 @@ class RunMetrics:
     elapsed_time: float
     num_prompts: int
     raw_json: Mapping[str, object]
+    prefill_tokens_per_second: float | None = None
+    decode_tokens_per_second: float | None = None
 
     def __post_init__(self) -> None:
         """Store ``raw_json`` as a read-only view so the run is immutable."""
@@ -381,6 +400,8 @@ class RunMetrics:
                 self.requests_per_second,
                 self.elapsed_time,
                 self.num_prompts,
+                self.prefill_tokens_per_second,
+                self.decode_tokens_per_second,
                 _hashable(self.raw_json),
             )
         )
@@ -410,6 +431,22 @@ class BenchmarkOutcome:
         return tuple(run.raw_json for run in self.runs)
 
 
+def _mean_present(values: Iterable[float | None]) -> float | None:
+    """Mean of the values that are present, or ``None`` when none is.
+
+    A phase rate is optional on a run, so an aggregate averages only the runs
+    that reported one rather than treating a missing measurement as zero, and
+    a series with no measurement at all is ``None``.
+    """
+    present: list[float] = []
+    for value in values:
+        if value is not None:
+            present.append(value)
+    if not present:
+        return None
+    return sum(present) / len(present)
+
+
 @dataclass(frozen=True, slots=True)
 class ExperimentResult:
     """The typed outcome of one benchmark trial.
@@ -421,7 +458,10 @@ class ExperimentResult:
     runs it summarizes. ``tokens_per_second``, ``requests_per_second``, and
     ``elapsed_time`` are the means over the successful runs, ``num_prompts`` is
     their summed measured prompt count, and ``raw_json`` is the tuple of
-    per-run payloads.
+    per-run payloads. ``prefill_tokens_per_second`` and
+    ``decode_tokens_per_second`` are likewise means, taken over the runs that
+    reported a phase rate; each is ``None`` when no run did, mirroring the
+    optional field on :class:`RunMetrics`.
 
     ``raw_result`` keeps the container's raw output, so details the typed
     result omits remain inspectable. ``target``, ``image``, and ``devices``
@@ -458,6 +498,16 @@ class ExperimentResult:
     def elapsed_time(self) -> float:
         """Mean elapsed wall-clock time over the successful runs."""
         return sum(run.elapsed_time for run in self.runs) / len(self.runs)
+
+    @property
+    def prefill_tokens_per_second(self) -> float | None:
+        """Mean prefill throughput over the runs that reported it, or ``None``."""
+        return _mean_present(run.prefill_tokens_per_second for run in self.runs)
+
+    @property
+    def decode_tokens_per_second(self) -> float | None:
+        """Mean decode throughput over the runs that reported it, or ``None``."""
+        return _mean_present(run.decode_tokens_per_second for run in self.runs)
 
     @property
     def num_prompts(self) -> int:

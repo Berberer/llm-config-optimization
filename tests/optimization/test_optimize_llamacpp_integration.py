@@ -36,7 +36,7 @@ from llm_config_optimization.inference import (
     LlamaCppBackend,
     LLMConfig,
 )
-from llm_config_optimization.optimization import OptimizationResult, optimize
+from llm_config_optimization.optimization import ObjectiveMode, OptimizationResult, optimize
 from llm_config_optimization.search_space import (
     Categorical,
     Default,
@@ -172,6 +172,7 @@ def test_two_trial_sweep_returns_a_usable_best_configuration(
         base,
         n_trials=_N_TRIALS,
         seed=0,
+        mode=ObjectiveMode.COMBINED,
         backend=backend,
         client=podman_client,
         benchmark_client=BenchmarkClient(vocab_size=_VOCAB_SIZE),
@@ -210,3 +211,5 @@ def test_two_trial_sweep_returns_a_usable_best_configuration(
     assert recorded["tokens_per_second"] == pytest.approx(
         sum(run["tokens_per_second"] for run in per_run) / len(per_run)
     )
+    assert recorded["prefill_tokens_per_second"] > 0
+    assert recorded["decode_tokens_per_second"] > 0

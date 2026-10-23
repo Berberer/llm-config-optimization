@@ -8,7 +8,8 @@ mirrors the inference layer's neutral-types-plus-backend split: the
 result and error types, while the Optuna-specific module owns the study and
 trial logic and builds those types.
 
-The public surface is the single entry point and its result and error types::
+The public surface is the single entry point, its result and error types, and
+the engine-neutral objective model::
 
     from llm_config_optimization.optimization import optimize
 
@@ -16,15 +17,40 @@ The public surface is the single entry point and its result and error types::
 an :class:`OptimizationResult`; a sweep that completes no trial raises
 :class:`OptimizationError`. An interrupted sweep that did complete trials
 raises :class:`OptimizationInterrupted`, a subtype of :class:`OptimizationError`
-that carries the best-so-far :class:`OptimizationResult`.
+that carries the frontier found so far as its :class:`OptimizationResult`. The
+result's ``solutions`` is the Pareto front in the multi mode and the single
+winner in the scalar modes, and its ``recommended`` point is the one a caller
+should re-run. The :class:`ObjectiveMode`, :class:`ObjectiveWeights`, and
+scoring functions define what a trial maximizes and are public so the command
+line and reporters share one definition.
 """
 
 from ._optuna import optimize
-from .types import OptimizationError, OptimizationInterrupted, OptimizationResult
+from .types import (
+    ObjectiveMode,
+    ObjectiveWeights,
+    OptimizationError,
+    OptimizationInterrupted,
+    OptimizationResult,
+    OptimizationSolution,
+    combined_score,
+    objective_value,
+    phase_rates,
+    weighted_harmonic_rate,
+    weighted_score,
+)
 
 __all__ = [
+    "ObjectiveMode",
+    "ObjectiveWeights",
     "OptimizationError",
     "OptimizationInterrupted",
     "OptimizationResult",
+    "OptimizationSolution",
+    "combined_score",
+    "objective_value",
     "optimize",
+    "phase_rates",
+    "weighted_harmonic_rate",
+    "weighted_score",
 ]

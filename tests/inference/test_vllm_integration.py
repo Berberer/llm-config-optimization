@@ -131,6 +131,8 @@ def test_cpu_benchmark_runs_end_to_end(vllm_cpu_image: str, model: str) -> None:
     assert len(result.runs) == _REPETITIONS
     assert result.failed_runs == 0
     assert result.tokens_per_second > 0
+    assert result.prefill_tokens_per_second > 0
+    assert result.decode_tokens_per_second > 0
     assert result.requests_per_second > 0
     assert result.elapsed_time > 0
     assert result.num_prompts == _NUM_PROMPTS * _REPETITIONS

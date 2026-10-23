@@ -1,4 +1,5 @@
-"""llm-config-optimization: search a vLLM serving configuration for the best throughput.
+"""llm-config-optimization: search an LLM serving configuration for the best prefill,
+decode, or combined token throughput.
 
 The user-facing entry points are the ``llm-config-optimization`` console script and
 ``python -m llm_config_optimization``; both delegate to

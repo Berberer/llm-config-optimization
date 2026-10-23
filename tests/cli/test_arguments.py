@@ -50,6 +50,9 @@ def test_defaults_match_the_documented_settings() -> None:
     assert args.n_jobs == 1
     assert args.output is None
     assert args.output_config is None
+    assert args.objective == "multi"
+    assert args.prefill_weight is None
+    assert args.decode_weight is None
 
 
 def test_explicit_flags_override_every_default() -> None:
@@ -108,6 +111,12 @@ def test_explicit_flags_override_every_default() -> None:
             "log",
             "--output-config",
             "best.yaml",
+            "--objective",
+            "combined",
+            "--prefill-weight",
+            "512",
+            "--decode-weight",
+            "64",
         ]
     )
 
@@ -136,6 +145,9 @@ def test_explicit_flags_override_every_default() -> None:
     assert args.n_jobs == 2
     assert args.output == "log"
     assert args.output_config == Path("best.yaml")
+    assert args.objective == "combined"
+    assert args.prefill_weight == 512.0
+    assert args.decode_weight == 64.0
 
 
 def test_engine_scoped_options_parse_before_the_engine_is_known() -> None:
@@ -164,6 +176,7 @@ def test_engine_scoped_options_parse_before_the_engine_is_known() -> None:
         ["model", "space.yaml", "vllm", "--pull-policy", "sometimes"],
         ["model", "space.yaml", "vllm", "--quantization", "int8"],
         ["model", "space.yaml", "vllm", "--output", "json"],
+        ["model", "space.yaml", "vllm", "--objective", "fastest"],
         ["model", "space.yaml", "vllm", "--unknown"],
         ["model", "space.yaml", "tensorrt"],
         ["model", "space.yaml"],
@@ -175,6 +188,7 @@ def test_engine_scoped_options_parse_before_the_engine_is_known() -> None:
         "bad-pull-policy",
         "bad-quantization",
         "bad-output",
+        "bad-objective",
         "unknown-flag",
         "unknown-engine",
         "missing-engine",
@@ -219,6 +233,9 @@ def test_help_exits_zero_and_documents_the_invocation(
         "--timeout",
         "--sweep-timeout",
         "--n-trials",
+        "--objective",
+        "--prefill-weight",
+        "--decode-weight",
         "--output",
         "--output-config",
     ):

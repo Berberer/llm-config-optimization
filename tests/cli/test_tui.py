@@ -1,12 +1,13 @@
 """Unit tests for the TUI-mode reporter.
 
 ``TuiReporter``'s observable contract is the frame it renders: a plotext graph
-with the best-so-far line and the raw per-trial points, followed by a status
-line. These tests drive it as a string producer with an injectable clock and
-stream, using real Optuna studies and frozen trials, so no sweep, terminal, or
-real time is involved. They assert on the status line and the graph's legend and
-labels rather than on plotext's exact drawing, so the frame can be restyled
-without breaking them.
+with the best-so-far line and the raw per-trial points in the scalar view, or
+the prefill-versus-decode scatter with the highlighted Pareto front in the multi
+view, followed by a status line. These tests drive it as a string producer with
+an injectable clock and stream, using real Optuna studies and frozen trials, so
+no sweep, terminal, or real time is involved. They assert on the status line and
+the graph's legend and labels rather than on plotext's exact drawing, so the
+frame can be restyled without breaking them.
 """
 
 import io
@@ -15,6 +16,7 @@ import re
 import optuna
 
 from llm_config_optimization.cli.tui import TuiReporter
+from llm_config_optimization.optimization import ObjectiveMode
 
 
 class FakeClock:
@@ -56,6 +58,24 @@ def study_with(*trials: optuna.trial.FrozenTrial) -> optuna.Study:
     return study
 
 
+def completed_multi_trial(prefill: float, decode: float) -> optuna.trial.FrozenTrial:
+    """A frozen completed trial carrying the two phase rates as its objectives."""
+    return optuna.trial.create_trial(
+        state=optuna.trial.TrialState.COMPLETE,
+        values=[prefill, decode],
+        params={},
+        distributions={},
+    )
+
+
+def multi_study_with(*trials: optuna.trial.FrozenTrial) -> optuna.Study:
+    """An in-memory two-objective maximizing study holding ``trials``."""
+    study = optuna.create_study(directions=["maximize", "maximize"])
+    for trial in trials:
+        study.add_trial(trial)
+    return study
+
+
 def status_line(frame: str) -> str:
     """Return the last line of a frame, where the status line lives."""
     return frame.splitlines()[-1]
@@ -76,6 +96,13 @@ def x_tick_labels(frame: str) -> list[str]:
 def y_tick_labels(frame: str) -> list[str]:
     """Return the y-axis tick labels, read from the left edge of the plot."""
     return re.findall(r"^\s*([\d,\.]+)┤", frame, re.MULTILINE)
+
+
+def multi_x_tick_labels(frame: str) -> list[str]:
+    """Return the multi view's x tick labels, above its ``decode tps`` caption."""
+    lines = frame.splitlines()
+    axis_line = next(index for index, line in enumerate(lines) if line.startswith("decode tps"))
+    return lines[axis_line - 1].split()
 
 
 def final_frame(*values: float, n_trials: int | None = None) -> str:
@@ -303,3 +330,131 @@ def test_start_resets_the_series_so_a_restart_does_not_replay_points() -> None:
     reporter(study, good)
 
     assert status_line(stream.getvalue()) == "trials 1/10  best 50.00 tps  avg trial 0.0s  (0.0s)"
+
+
+def test_a_multi_frame_draws_the_trade_off_with_the_front_highlighted() -> None:
+    trial = completed_multi_trial(1200.0, 50.0)
+    study = multi_study_with(trial)
+    reporter = TuiReporter(n_trials=10, mode=ObjectiveMode.MULTI, clock=FakeClock())
+
+    frame = reporter.render(study, trial)
+
+    graph = graph_body(frame)
+    assert "prefill vs decode" in graph
+    assert "prefill tps" in graph
+    assert "decode tps" in graph
+    assert "front" in graph
+    assert "trials" in graph
+    assert status_line(frame) == (
+        "trials 1/10  best prefill 1200.00 tps  decode 50.00 tps  avg trial 0.0s  (0.0s)"
+    )
+
+
+def test_the_multi_status_reports_the_best_rate_of_each_phase() -> None:
+    """The two maxima can come from different trials, so neither hides the other."""
+    high_prefill = completed_multi_trial(1200.0, 50.0)
+    high_decode = completed_multi_trial(800.0, 90.0)
+    study = multi_study_with(high_prefill, high_decode)
+    reporter = TuiReporter(n_trials=10, mode=ObjectiveMode.MULTI, clock=FakeClock())
+
+    frame = reporter.render(study, high_decode)
+
+    assert status_line(frame) == (
+        "trials 1/10  best prefill 1200.00 tps  decode 90.00 tps  avg trial 0.0s  (0.0s)"
+    )
+
+
+def test_a_failed_multi_trial_keeps_the_front_and_the_best_rates() -> None:
+    completed = completed_multi_trial(1000.0, 40.0)
+    study = multi_study_with(completed)
+    reporter = TuiReporter(
+        n_trials=10, mode=ObjectiveMode.MULTI, stream=io.StringIO(), clock=FakeClock()
+    )
+    reporter(study, completed)
+    failed = failed_trial("simulated out-of-memory")
+    study.add_trial(failed)
+
+    frame = reporter.render(study, failed)
+
+    assert "front" in graph_body(frame)
+    assert status_line(frame) == (
+        "trials 2/10  best prefill 1000.00 tps  decode 40.00 tps  avg trial 0.0s  (0.0s)"
+    )
+
+
+def test_a_multi_study_with_no_completed_trial_plots_no_front() -> None:
+    failed = failed_trial("simulated out-of-memory")
+    study = multi_study_with(failed)
+    reporter = TuiReporter(n_trials=10, mode=ObjectiveMode.MULTI, clock=FakeClock())
+
+    frame = reporter.render(study, failed)
+
+    assert status_line(frame) == "trials 1/10  best n/a  (0.0s)"
+    assert "front" not in graph_body(frame)
+
+
+def test_the_running_multi_frame_keeps_the_front_and_the_best_rates() -> None:
+    clock = FakeClock()
+    stream = io.StringIO()
+    reporter = TuiReporter(n_trials=10, mode=ObjectiveMode.MULTI, stream=stream, clock=clock)
+    trial = completed_multi_trial(1200.0, 50.0)
+    study = multi_study_with(trial)
+    reporter.trial_started()
+    clock.now = 10.0
+    reporter(study, trial)
+    clock.now = 12.0
+    stream.truncate(0)
+    stream.seek(0)
+
+    reporter.trial_started()
+
+    frame = stream.getvalue()
+    assert "front" in graph_body(frame)
+    assert status_line(frame) == (
+        "trials 1/10  running trial 2  best prefill 1200.00 tps  decode 50.00 tps"
+        "  avg trial 10.0s  (12.0s)"
+    )
+
+
+def test_a_scalar_mode_keeps_the_historical_line_plot() -> None:
+    """The weighted mode is one scalar objective, so its view is unchanged."""
+    trial = completed_trial(42.0)
+    study = study_with(trial)
+    reporter = TuiReporter(n_trials=10, mode=ObjectiveMode.WEIGHTED, clock=FakeClock())
+
+    frame = reporter.render(study, trial)
+
+    assert "tokens per second" in graph_body(frame)
+    assert "front" not in graph_body(frame)
+    assert status_line(frame) == "trials 1/10  best 42.00 tps  avg trial 0.0s  (0.0s)"
+
+
+def test_start_resets_the_multi_series_so_a_restart_does_not_replay_points() -> None:
+    stream = io.StringIO()
+    reporter = TuiReporter(n_trials=10, mode=ObjectiveMode.MULTI, stream=stream, clock=FakeClock())
+    trial = completed_multi_trial(1200.0, 50.0)
+    study = multi_study_with(trial)
+    reporter(study, trial)
+    reporter.start()
+    stream.truncate(0)
+    stream.seek(0)
+
+    reporter(study, trial)
+
+    assert status_line(stream.getvalue()) == (
+        "trials 1/10  best prefill 1200.00 tps  decode 50.00 tps  avg trial 0.0s  (0.0s)"
+    )
+
+
+def test_the_multi_x_axis_labels_are_thousands_separated_and_never_scientific() -> None:
+    """Prefill rates reach the tens of thousands, where plotext uses scientific form."""
+    lower = completed_multi_trial(1_200_000.0, 50.0)
+    higher = completed_multi_trial(1_500_000.0, 40.0)
+    study = multi_study_with(lower, higher)
+    reporter = TuiReporter(n_trials=10, mode=ObjectiveMode.MULTI, clock=FakeClock())
+
+    frame = reporter.render(study, higher)
+
+    labels = multi_x_tick_labels(frame)
+    assert labels == ["1,200,000", "1,300,000", "1,400,000", "1,500,000"]
+    assert all("e" not in label.lower() for label in labels)

@@ -1,12 +1,16 @@
-"""Unit tests for base experiment construction from parsed arguments.
+"""Unit tests for base experiment and objective construction from parsed arguments.
 
 ``build_base_config``'s observable contract is the
 :class:`~llm_config_optimization.inference.types.ExperimentConfig` it produces: the
 container, benchmark, and non-tunable LLM values come from the flags, every
 tunable serving parameter is left unset for the space to fill, and an omitted
-target or image stays ``None`` for the backend to resolve. These tests parse
-real argument vectors and assert on the resulting config, so the parser and the
-builder are exercised together without a backend.
+target or image stays ``None`` for the backend to resolve. ``resolve_objective``'s
+contract is the mode and token-mix weights it resolves: the ``--objective``
+choice, explicit ``--prefill-weight``/``--decode-weight`` values, and the
+benchmark's own input and output lengths as the fallback, with a missing mix or
+an invalid pair rejected before anything expensive runs. These tests parse real
+argument vectors and assert on the resulting values, so the parser and the
+builders are exercised together without a backend.
 """
 
 from pathlib import Path
@@ -14,8 +18,13 @@ from pathlib import Path
 import pytest
 
 from llm_config_optimization.cli.arguments import parse_args
-from llm_config_optimization.cli.config import build_base_config
-from llm_config_optimization.inference import HardwareTarget, QuantizationMethod
+from llm_config_optimization.cli.config import build_base_config, resolve_objective
+from llm_config_optimization.inference import (
+    BenchmarkConfig,
+    HardwareTarget,
+    QuantizationMethod,
+)
+from llm_config_optimization.optimization import ObjectiveMode, ObjectiveWeights
 
 
 def test_defaults_produce_the_documented_base_config() -> None:
@@ -155,3 +164,124 @@ def test_a_missing_host_path_is_left_unresolved(tmp_path: Path) -> None:
     config = build_base_config(parse_args([str(tmp_path / "absent"), "space.yaml", "vllm"]))
 
     assert config.benchmark.resolved_path is None
+
+
+def test_the_default_objective_is_multi_scored_under_the_benchmark_mix() -> None:
+    """No flags resolves to the multi default and the benchmark's token mix."""
+    args = parse_args(["facebook/opt-125m", "space.yaml", "vllm"])
+    config = build_base_config(args)
+
+    mode, weights = resolve_objective(args, config.benchmark)
+
+    assert mode is ObjectiveMode.MULTI
+    assert weights == ObjectiveWeights(prefill=1024, decode=128)
+
+
+def test_explicit_weights_override_the_benchmark_mix() -> None:
+    args = parse_args(
+        [
+            "facebook/opt-125m",
+            "space.yaml",
+            "vllm",
+            "--objective",
+            "weighted",
+            "--prefill-weight",
+            "512",
+            "--decode-weight",
+            "64",
+        ]
+    )
+    config = build_base_config(args)
+
+    mode, weights = resolve_objective(args, config.benchmark)
+
+    assert mode is ObjectiveMode.WEIGHTED
+    assert weights == ObjectiveWeights(prefill=512, decode=64)
+
+
+def test_one_explicit_weight_falls_back_to_the_benchmark_for_the_other() -> None:
+    """The two weight flags are resolved independently against the workload."""
+    args = parse_args(["facebook/opt-125m", "space.yaml", "vllm", "--prefill-weight", "256"])
+    config = build_base_config(args)
+
+    mode, weights = resolve_objective(args, config.benchmark)
+
+    assert mode is ObjectiveMode.MULTI
+    assert weights == ObjectiveWeights(prefill=256, decode=128)
+
+
+@pytest.mark.parametrize("mode", ["multi", "weighted"], ids=["multi", "weighted"])
+def test_a_phase_scoring_mode_without_a_benchmark_mix_is_rejected(mode: str) -> None:
+    """No arbitrary token mix is invented when the benchmark cannot supply one."""
+    benchmark = BenchmarkConfig(model="facebook/opt-125m")
+    args = parse_args(["facebook/opt-125m", "space.yaml", "vllm", "--objective", mode])
+
+    with pytest.raises(ValueError, match="prefill-weight"):
+        resolve_objective(args, benchmark)
+
+    explicit = parse_args(
+        [
+            "facebook/opt-125m",
+            "space.yaml",
+            "vllm",
+            "--objective",
+            mode,
+            "--prefill-weight",
+            "1024",
+            "--decode-weight",
+            "128",
+        ]
+    )
+
+    resolved_mode, weights = resolve_objective(explicit, benchmark)
+
+    assert resolved_mode is ObjectiveMode(mode)
+    assert weights == ObjectiveWeights(prefill=1024, decode=128)
+
+
+def test_combined_tolerates_a_benchmark_without_a_mix() -> None:
+    """The historical objective needs no phase weights and accepts their absence."""
+    benchmark = BenchmarkConfig(model="facebook/opt-125m")
+    args = parse_args(["facebook/opt-125m", "space.yaml", "vllm", "--objective", "combined"])
+
+    mode, weights = resolve_objective(args, benchmark)
+
+    assert mode is ObjectiveMode.COMBINED
+    assert weights is None
+
+
+@pytest.mark.parametrize(
+    ("flags", "message"),
+    [
+        (["--prefill-weight", "0", "--decode-weight", "0"], "zero"),
+        (["--prefill-weight", "-1"], "non-negative"),
+        (["--prefill-weight", "nan"], "finite"),
+    ],
+    ids=["both-zero", "negative", "non-finite"],
+)
+def test_an_invalid_pair_is_rejected_before_any_preparation(flags: list[str], message: str) -> None:
+    """A weight outside the model fails here rather than mid-sweep."""
+    benchmark = BenchmarkConfig(model="facebook/opt-125m", input_len=1024, output_len=128)
+    args = parse_args(["facebook/opt-125m", "space.yaml", "vllm", *flags])
+
+    with pytest.raises(ValueError, match=message):
+        resolve_objective(args, benchmark)
+
+
+def test_combined_still_validates_a_resolvable_pair() -> None:
+    """An explicit nonsensical weight is a usage error even in the combined mode."""
+    benchmark = BenchmarkConfig(model="facebook/opt-125m", input_len=1024, output_len=128)
+    args = parse_args(
+        [
+            "facebook/opt-125m",
+            "space.yaml",
+            "vllm",
+            "--objective",
+            "combined",
+            "--prefill-weight",
+            "-1",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="non-negative"):
+        resolve_objective(args, benchmark)

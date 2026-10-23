@@ -6,8 +6,8 @@ engine-neutral :class:`~llm_config_optimization.inference.types.LLMConfig` field
 against: the host benchmark client drives the server's OpenAI-compatible API,
 so this backend never assembles a client command. The planned
 :class:`~llm_config_optimization.inference.types.ServerSpec` carries the serve
-command, the published port, the health and cache-reset endpoints, and the
-mounts the server needs.
+command, the published port, the health, metrics, and cache-reset endpoints,
+and the mounts the server needs.
 
 Measurement is host-driven: one server is started per trial and measured
 several times by the shared client, so the model is loaded once and each
@@ -35,6 +35,7 @@ from ..search_space.types import (
     ParameterValue,
     Spec,
 )
+from ._benchmark import _METRICS_AFTER_KEY, _METRICS_BEFORE_KEY, _METRICS_KEY
 from .types import (
     AttentionBackend,
     BenchmarkOutcome,
@@ -50,6 +51,7 @@ from .types import (
     LocalCheckpoint,
     ModelRequest,
     QuantizationMethod,
+    RunMetrics,
     ServerSpec,
 )
 
@@ -349,6 +351,32 @@ the client resets the caches before every run. ``/reset_prefix_cache`` is the
 one that matters for text workloads; the multimodal and encoder caches are
 reset too so a run starts from a clean server regardless of the workload.
 """
+_METRICS_PATH = "/metrics"
+"""The endpoint vLLM serves its Prometheus exposition on.
+
+The host benchmark client scrapes it immediately before and after every
+measured run, so this backend can derive the phase rates from the deltas of
+the counters and histogram sums the exposition carries. The endpoint is part
+of vLLM's OpenAI-compatible server and is served without any flag, so the
+planned command and image choice are unchanged by it.
+"""
+_PREFILL_RATE_SERIES = ("vllm:prompt_tokens_total", "vllm:request_prefill_time_seconds_sum")
+"""The ``(tokens, seconds)`` series pair behind the prefill rate.
+
+``vllm:prompt_tokens_total`` counts every prompt token the server has processed
+and ``vllm:request_prefill_time_seconds_sum`` the seconds it spent in prefill,
+so their deltas across one measured run are that run's processed prompt tokens
+and prefill seconds. Prompt tokens served from the prefix cache are excluded
+because the host client resets the cache before every run.
+"""
+_DECODE_RATE_SERIES = ("vllm:generation_tokens_total", "vllm:request_decode_time_seconds_sum")
+"""The ``(tokens, seconds)`` series pair behind the decode rate.
+
+``vllm:generation_tokens_total`` counts every generated token the server has
+produced and ``vllm:request_decode_time_seconds_sum`` the seconds it spent
+decoding, so their deltas across one measured run are that run's generated
+tokens and decode seconds.
+"""
 _DEV_MODE_ENV: Mapping[str, str] = MappingProxyType({"VLLM_SERVER_DEV_MODE": "1"})
 """Environment that enables vLLM's dev-mode endpoints.
 
@@ -434,6 +462,85 @@ def _target_for(
         f"cannot determine the accelerator class for devices {devices!r}",
         raw_result=raw_result,
     )
+
+
+def _snapshot_pair(
+    run: RunMetrics,
+) -> tuple[Mapping[str, object], Mapping[str, object]] | None:
+    """Return a run's ``(before, after)`` metric snapshots, or ``None``.
+
+    The host client stores the pair under the ``metrics`` key of a run's raw
+    JSON only when both halves were scraped, so a run without the key — or
+    with a value that is not the documented pair — carries no phase data and
+    the caller derives nothing from it.
+    """
+    metrics = run.raw_json.get(_METRICS_KEY)
+    if not isinstance(metrics, Mapping):
+        return None
+    before = metrics.get(_METRICS_BEFORE_KEY)
+    after = metrics.get(_METRICS_AFTER_KEY)
+    if not isinstance(before, Mapping) or not isinstance(after, Mapping):
+        return None
+    return before, after
+
+
+def _sample(snapshot: Mapping[str, object], series: str) -> float | None:
+    """Return ``snapshot``'s numeric value for ``series``, or ``None``.
+
+    The exposition parser produces floats, but the snapshots live in a run's
+    untyped raw JSON, so a value that is missing or not a real number is
+    treated as absent rather than coerced.
+    """
+    value = snapshot.get(series)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _phase_rate(run: RunMetrics, series: tuple[str, str]) -> float | None:
+    """Derive one phase's tokens-per-second rate from a run's metric deltas.
+
+    ``series`` pairs the phase's token counter with the sum of its time
+    histogram; the rate is the counter's increase over the histogram sum's
+    increase, so it counts tokens per second of the phase's own work rather
+    than a partition of the run's wall-clock time. The result is ``None``
+    whenever the run carries no complete snapshot pair, either series is absent
+    from a snapshot, or either delta is not positive — a counter that did not
+    move describes no measurable work, and a non-positive time delta cannot be
+    divided by.
+    """
+    snapshots = _snapshot_pair(run)
+    if snapshots is None:
+        return None
+    before, after = snapshots
+    tokens_before = _sample(before, series[0])
+    tokens_after = _sample(after, series[0])
+    seconds_before = _sample(before, series[1])
+    seconds_after = _sample(after, series[1])
+    if tokens_before is None or tokens_after is None:
+        return None
+    if seconds_before is None or seconds_after is None:
+        return None
+    tokens = tokens_after - tokens_before
+    seconds = seconds_after - seconds_before
+    if tokens <= 0 or seconds <= 0:
+        return None
+    return tokens / seconds
+
+
+def _with_phase_rates(run: RunMetrics) -> RunMetrics:
+    """Return a run enriched with the phase rates its metric snapshots imply.
+
+    Each rate is derived independently, so a run whose exposition lacked one
+    phase's series keeps the other rate rather than losing both. When neither
+    rate can be derived the run is returned unchanged, so an engine that
+    exposes no metrics keeps the object the client produced.
+    """
+    prefill = _phase_rate(run, _PREFILL_RATE_SERIES)
+    decode = _phase_rate(run, _DECODE_RATE_SERIES)
+    if prefill is None and decode is None:
+        return run
+    return replace(run, prefill_tokens_per_second=prefill, decode_tokens_per_second=decode)
 
 
 def _ensure_directory(path: Path) -> Path:
@@ -845,8 +952,8 @@ class VLLMBackend:
         model string so the host client addresses the server with the same name
         it was configured with. The dev-mode environment that the cache reset
         requires is added to the container environment. The returned
-        :class:`ServerSpec` describes the health endpoint, the cache-reset
-        endpoints, and the startup timeout the host client uses.
+        :class:`ServerSpec` describes the health endpoint, the metrics and
+        cache-reset endpoints, and the startup timeout the host client uses.
 
         Planning is not side-effect free: the host Hugging Face cache directory
         and the compile cache directory are created on the host when planning,
@@ -906,6 +1013,7 @@ class VLLMBackend:
             health_path="/health",
             health_timeout=experiment.benchmark.startup_timeout,
             reset_paths=_RESET_CACHE_ENDPOINTS,
+            metrics_path=_METRICS_PATH,
         )
 
     def image_for(self, target: HardwareTarget) -> str:
@@ -933,14 +1041,17 @@ class VLLMBackend:
         client, which already enforced the strict majority, so this method only
         records what actually ran: the accelerator class, image, and device
         mapping are recovered from the planned :class:`ServerSpec`, and the
-        captured server container outcome is kept as ``raw_result``. An outcome
-        with no successful run raises :class:`ExperimentError` rather than
-        letting :class:`ExperimentResult` reject it with a bare ``ValueError``.
+        captured server container outcome is kept as ``raw_result``. Each run
+        is enriched with the prefill and decode rates its metric snapshots
+        imply, and a run without a usable snapshot pair keeps ``None`` for
+        both. An outcome with no successful run raises :class:`ExperimentError`
+        rather than letting :class:`ExperimentResult` reject it with a bare
+        ``ValueError``.
         """
         if not outcome.runs:
             raise ExperimentError("the benchmark produced no successful run", raw_result=result)
         return ExperimentResult(
-            runs=outcome.runs,
+            runs=tuple(_with_phase_rates(run) for run in outcome.runs),
             failed_runs=outcome.failed_runs,
             target=_target_for(spec.container.devices, raw_result=result),
             image=spec.container.image,

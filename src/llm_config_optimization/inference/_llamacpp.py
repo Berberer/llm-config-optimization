@@ -13,6 +13,12 @@ does not model at all — ``dtype``, ``quantization``, ``tensor_parallel_size``,
 and ``gpu_memory_utilization`` — have no target here; declaring one in a space
 is the backend's validation problem, not this module's.
 
+Result parsing reads the phase timings llama.cpp attaches to every completion
+response, so each measured run carries its prefill and decode rates without a
+metrics endpoint: the engine's own ``prompt_n``/``prompt_ms`` and
+``predicted_n``/``predicted_ms`` are summed across a run's responses, and
+prompt tokens served from the cache are already excluded from ``prompt_n``.
+
 Model resolution decides whether ``--model`` names a local checkpoint or a
 Hugging Face repository with an optional ``:QUANT`` selector, and picks the
 single GGUF file the server mounts. GGUF metadata makes model-aware validation
@@ -41,6 +47,7 @@ from ..search_space.types import (
     Fixed,
     ParameterValue,
 )
+from ._benchmark import _RESPONSES_KEY
 from .types import (
     AttentionBackend,
     BenchmarkConfig,
@@ -56,6 +63,7 @@ from .types import (
     LocalCheckpoint,
     ModelRequest,
     QuantizationMethod,
+    RunMetrics,
     ServerSpec,
 )
 
@@ -517,6 +525,31 @@ container loopback.
 _HEALTH_PATH = "/health"
 """The llama-server endpoint the host client polls until the model is loaded."""
 
+_TIMINGS_KEY = "timings"
+"""The per-response key carrying llama.cpp's own phase timings.
+
+The host client preserves every successful completion payload in a run's raw
+JSON, and llama.cpp attaches its timings to each such response, so this engine
+needs no scrapeable metrics endpoint: the snapshots the client takes for vLLM
+have no counterpart here.
+"""
+
+_PREFILL_TIMING_KEYS = ("prompt_n", "prompt_ms")
+"""The ``(tokens, milliseconds)`` pair behind the prefill rate.
+
+``prompt_n`` is llama.cpp's ``n_prompt_processed``: the prompt tokens the
+server actually processed, with the tokens it served from its cache — reported
+separately as ``cache_n`` — already excluded, so the rate measures work
+performed. ``prompt_ms`` is the milliseconds it spent on that work.
+"""
+
+_DECODE_TIMING_KEYS = ("predicted_n", "predicted_ms")
+"""The ``(tokens, milliseconds)`` pair behind the decode rate.
+
+``predicted_n`` counts the tokens generated and ``predicted_ms`` the
+milliseconds spent generating them.
+"""
+
 _SELINUX_OPTIONS = ("z",)
 """Bind-mount options applied to the checkpoint mount.
 
@@ -573,6 +606,69 @@ def _target_for(
         f"cannot determine the accelerator class for devices {devices!r}",
         raw_result=raw_result,
     )
+
+
+def _timing_pair(response: object, keys: tuple[str, str]) -> tuple[float, float] | None:
+    """Return one response's ``(tokens, milliseconds)`` timing pair, or ``None``.
+
+    The response bodies live in a run's untyped raw JSON, so a payload that is
+    not a mapping, carries no ``timings`` object, or holds a value that is not
+    a real number is treated as absent rather than coerced. ``keys`` names the
+    phase's token count and milliseconds in the engine's own vocabulary.
+    """
+    if not isinstance(response, Mapping):
+        return None
+    timings = response.get(_TIMINGS_KEY)
+    if not isinstance(timings, Mapping):
+        return None
+    tokens = timings.get(keys[0])
+    milliseconds = timings.get(keys[1])
+    if isinstance(tokens, bool) or not isinstance(tokens, (int, float)):
+        return None
+    if isinstance(milliseconds, bool) or not isinstance(milliseconds, (int, float)):
+        return None
+    return float(tokens), float(milliseconds)
+
+
+def _phase_rate(run: RunMetrics, keys: tuple[str, str]) -> float | None:
+    """Derive one phase's tokens-per-second rate from the response timings.
+
+    Every response in the run must carry the phase's timing pair, because the
+    rate describes the whole run's phase work and a response that went untimed
+    would otherwise be silently dropped from the sum. The result is ``None``
+    when the run stores no responses, any response lacks the pair, or the
+    summed tokens or milliseconds are not positive — a phase with no measured
+    work has no rate, and a zero denominator cannot be divided by.
+    """
+    responses = run.raw_json.get(_RESPONSES_KEY)
+    if not isinstance(responses, (list, tuple)) or not responses:
+        return None
+    tokens = 0.0
+    milliseconds = 0.0
+    for response in responses:
+        pair = _timing_pair(response, keys)
+        if pair is None:
+            return None
+        tokens += pair[0]
+        milliseconds += pair[1]
+    if tokens <= 0 or milliseconds <= 0:
+        return None
+    return tokens / (milliseconds / 1000.0)
+
+
+def _with_phase_rates(run: RunMetrics) -> RunMetrics:
+    """Return a run enriched with the phase rates its response timings imply.
+
+    Each rate is derived independently, so a run that reported one phase's
+    timings but not the other's keeps the rate it has rather than losing both.
+    When neither rate can be derived the run is returned unchanged, so a
+    payload that carries no timings keeps the object the client produced.
+    """
+    prefill = _phase_rate(run, _PREFILL_TIMING_KEYS)
+    decode = _phase_rate(run, _DECODE_TIMING_KEYS)
+    if prefill is None and decode is None:
+        return run
+    return replace(run, prefill_tokens_per_second=prefill, decode_tokens_per_second=decode)
 
 
 def _model_mount(path: Path) -> Mount:
@@ -836,14 +932,17 @@ class LlamaCppBackend:
         client, which already enforced the strict majority, so this method only
         records what actually ran: the accelerator class, image, and device
         mapping are recovered from the planned :class:`ServerSpec`, and the
-        captured server container outcome is kept as ``raw_result``. An outcome
-        with no successful run raises :class:`ExperimentError` rather than
-        letting :class:`ExperimentResult` reject it with a bare ``ValueError``.
+        captured server container outcome is kept as ``raw_result``. Each run
+        is enriched with the prefill and decode rates its response timings
+        imply, and a run without usable timings keeps ``None`` for both. An
+        outcome with no successful run raises :class:`ExperimentError` rather
+        than letting :class:`ExperimentResult` reject it with a bare
+        ``ValueError``.
         """
         if not outcome.runs:
             raise ExperimentError("the benchmark produced no successful run", raw_result=result)
         return ExperimentResult(
-            runs=outcome.runs,
+            runs=tuple(_with_phase_rates(run) for run in outcome.runs),
             failed_runs=outcome.failed_runs,
             target=_target_for(spec.container.devices, raw_result=result),
             image=spec.container.image,

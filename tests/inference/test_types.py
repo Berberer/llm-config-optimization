@@ -154,6 +154,44 @@ def test_result_derives_its_metrics_from_the_successful_runs() -> None:
     assert result.failed_runs == 1
 
 
+def test_run_defaults_phase_rates_to_none() -> None:
+    run = _run()
+
+    assert run.prefill_tokens_per_second is None
+    assert run.decode_tokens_per_second is None
+
+
+def test_run_hashes_phase_rates_and_distinguishes_them() -> None:
+    first = _run(prefill_tokens_per_second=1200.0, decode_tokens_per_second=45.5)
+    same = _run(prefill_tokens_per_second=1200.0, decode_tokens_per_second=45.5)
+    absent = _run()
+
+    assert first == same
+    assert hash(first) == hash(same)
+    assert first != absent
+    assert hash(first) != hash(absent)
+
+
+def test_result_averages_present_phase_rates_independently() -> None:
+    runs = (
+        _run(prefill_tokens_per_second=100.0),
+        _run(prefill_tokens_per_second=300.0, decode_tokens_per_second=40.0),
+        _run(decode_tokens_per_second=60.0),
+    )
+
+    result = replace(_result(), runs=runs)
+
+    assert result.prefill_tokens_per_second == 200.0
+    assert result.decode_tokens_per_second == 50.0
+
+
+def test_result_phase_rates_are_none_without_a_reporting_run() -> None:
+    result = replace(_result(), runs=(_run(), _run()))
+
+    assert result.prefill_tokens_per_second is None
+    assert result.decode_tokens_per_second is None
+
+
 def test_result_rejects_an_empty_run_set() -> None:
     with pytest.raises(ValueError):
         ExperimentResult(
@@ -186,6 +224,16 @@ def test_server_spec_defaults_to_no_reset_paths() -> None:
     assert spec.container.image == "img"
     assert spec.health_path == "/health"
     assert spec.health_timeout == 1.0
+
+
+def test_server_spec_defaults_to_no_metrics_path() -> None:
+    spec = ServerSpec(
+        container=ContainerConfig(image="img"),
+        health_path="/health",
+        health_timeout=1.0,
+    )
+
+    assert spec.metrics_path is None
 
 
 def test_server_spec_hashes_regardless_of_container_env_order() -> None:

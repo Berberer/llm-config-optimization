@@ -23,6 +23,7 @@ import struct
 from io import StringIO
 from pathlib import Path
 
+import optuna
 import pytest
 import yaml
 
@@ -42,6 +43,7 @@ from llm_config_optimization.inference import (
     ServerSpec,
     VLLMBackend,
 )
+from llm_config_optimization.optimization import ObjectiveMode
 from llm_config_optimization.runtime import ContainerConfig, ContainerResult
 from llm_config_optimization.search_space import TUNABLE_PARAMETERS
 
@@ -60,6 +62,8 @@ RESULT = ExperimentResult(
             elapsed_time=2.5,
             num_prompts=8,
             raw_json={"tokens_per_second": 42.0},
+            prefill_tokens_per_second=1000.0,
+            decode_tokens_per_second=50.0,
         ),
     ),
     failed_runs=0,
@@ -275,14 +279,132 @@ def test_a_successful_bounded_sweep_reports_progress_and_the_winner(
     assert f"using local model: {model}" in out
     assert f"pulling container image: {PLAN.container.image}" in out
     assert "preparing study" in out
-    assert "trial 1/2  COMPLETE  42.00 tps  best 42.00" in out
-    assert "trial 2/2  COMPLETE  42.00 tps  best 42.00" in out
-    assert "best trial: 0" in out
-    assert "best throughput: 42.00 tps" in out
+    assert "trial 1/2  COMPLETE  prefill 1000.00 tps  decode 50.00 tps" in out
+    assert "trial 2/2  COMPLETE  prefill 1000.00 tps  decode 50.00 tps" in out
+    assert "recommended trial: 0" in out
+    assert "recommended rates: prefill 1000.00 tps  decode 50.00 tps" in out
+    assert "pareto front:" in out
     assert "trials run: 2" in out
     assert "winning configuration:" in out
     assert len(backend.plan_calls) == 2
     assert (PLAN.container.image, "missing") in client.pull_calls
+
+
+def test_the_default_study_name_carries_the_objective_mode(tmp_path: Path, model: str) -> None:
+    """A zero-config resume cannot collide with a study scored under another mode."""
+    space = _write_space(tmp_path / "space.yaml")
+    storage = f"sqlite:///{tmp_path / 'study.db'}"
+
+    code, out, err = _invoke(
+        model, space, "--n-trials", "1", "--output", "log", "--storage", storage
+    )
+
+    assert code == 0
+    assert err == ""
+    assert "preparing study" in out
+    recorded = optuna.load_study(
+        study_name=f"{model.replace('/', '_')}_{ObjectiveMode.MULTI.value}",
+        storage=storage,
+    )
+    assert recorded.user_attrs["objective_mode"] == ObjectiveMode.MULTI.value
+
+
+def test_an_explicit_objective_selects_a_scalar_study(tmp_path: Path, model: str) -> None:
+    """``--objective combined`` runs the historical single-objective sweep."""
+    space = _write_space(tmp_path / "space.yaml")
+    storage = f"sqlite:///{tmp_path / 'study.db'}"
+
+    code, out, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--output",
+        "log",
+        "--storage",
+        storage,
+        "--objective",
+        "combined",
+    )
+
+    assert code == 0
+    assert err == ""
+    assert "trial 1/1  COMPLETE  42.00 tps  prefill 1000.00 tps  decode 50.00 tps" in out
+    assert "best trial: 0" in out
+    assert "best throughput: 42.00 tps" in out
+    recorded = optuna.load_study(
+        study_name=f"{model.replace('/', '_')}_{ObjectiveMode.COMBINED.value}",
+        storage=storage,
+    )
+    assert recorded.user_attrs["objective_mode"] == ObjectiveMode.COMBINED.value
+
+
+def test_a_weighted_sweep_scores_the_weighted_harmonic_rate(tmp_path: Path, model: str) -> None:
+    """The weights default to the benchmark mix, so no arithmetic is needed."""
+    space = _write_space(tmp_path / "space.yaml")
+
+    code, out, err = _invoke(
+        model, space, "--n-trials", "1", "--output", "log", "--objective", "weighted"
+    )
+
+    assert code == 0
+    assert err == ""
+    # (1024 + 128) / (1024/1000 + 128/50) for the canned 1000/50 phase rates.
+    assert "trial 1/1  COMPLETE  321.43 tps" in out
+    assert "best throughput: 321.43 tps" in out
+
+
+def test_explicit_weights_override_the_benchmark_mix(tmp_path: Path, model: str) -> None:
+    """A zero prefill weight degenerates the score to the decode rate."""
+    space = _write_space(tmp_path / "space.yaml")
+
+    code, out, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--output",
+        "log",
+        "--objective",
+        "weighted",
+        "--prefill-weight",
+        "0",
+        "--decode-weight",
+        "1",
+    )
+
+    assert code == 0
+    assert err == ""
+    assert "best throughput: 50.00 tps" in out
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--objective", "multi", "--prefill-weight", "0", "--decode-weight", "0"],
+        ["--objective", "weighted", "--prefill-weight", "-1"],
+        ["--objective", "combined", "--prefill-weight", "nan"],
+    ],
+    ids=["both-zero", "negative", "non-finite"],
+)
+def test_invalid_objective_weights_are_a_usage_error_before_any_preparation(
+    tmp_path: Path, model: str, extra: list[str]
+) -> None:
+    """A weight outside the model fails before the space, hardware, or image work."""
+    space = _write_space(tmp_path / "space.yaml")
+    backend = _backend()
+    client = FakePodmanClient()
+
+    code, out, err = _invoke(
+        model, space, "--n-trials", "1", *extra, backend=backend, client=client
+    )
+
+    assert code == 2
+    assert out == ""
+    assert "error:" in err
+    assert backend.model_request_calls == []
+    assert backend.plan_calls == []
+    assert client.pull_calls == []
 
 
 def test_the_llamacpp_engine_is_selected_through_the_registry(
@@ -317,7 +439,7 @@ def test_the_llamacpp_engine_is_selected_through_the_registry(
     assert err.getvalue() == ""
     assert len(created) == 1
     assert "engine: llamacpp" in out.getvalue()
-    assert "trial 1/1  COMPLETE  42.00 tps" in out.getvalue()
+    assert "trial 1/1  COMPLETE  prefill 1000.00 tps  decode 50.00 tps" in out.getvalue()
 
 
 @pytest.mark.parametrize(
@@ -460,7 +582,7 @@ def test_the_output_mode_defaults_to_log_without_a_terminal(tmp_path: Path, mode
 
     assert code == 0
     assert err == ""
-    assert "trial 1/1  COMPLETE  42.00 tps" in out
+    assert "trial 1/1  COMPLETE  prefill 1000.00 tps  decode 50.00 tps" in out
 
 
 def test_the_budget_reports_the_sweep_timeout(tmp_path: Path, model: str) -> None:
@@ -833,9 +955,9 @@ def test_an_interrupt_reports_the_best_point_and_returns_the_interrupt_code(
 
     assert code == 130
     assert err == ""
-    assert "trial 1/2  COMPLETE  42.00 tps" in out
-    assert "best trial: 0" in out
-    assert "best throughput: 42.00 tps" in out
+    assert "trial 1/2  COMPLETE  prefill 1000.00 tps  decode 50.00 tps" in out
+    assert "recommended trial: 0" in out
+    assert "recommended rates: prefill 1000.00 tps  decode 50.00 tps" in out
     assert "trials run: 2" in out
 
 
@@ -869,8 +991,8 @@ def test_tui_mode_prints_preparation_before_the_first_frame(tmp_path: Path, mode
     assert err.getvalue() == ""
     preparation = output.index("preparing experiments")
     assert output.index("preparing study") < preparation
-    assert "tokens per second" not in output[:preparation]
-    assert output.index("tokens per second") > preparation
+    assert "prefill vs decode" not in output[:preparation]
+    assert output.index("prefill vs decode") > preparation
 
 
 def test_version_exits_zero_without_running_a_sweep() -> None:

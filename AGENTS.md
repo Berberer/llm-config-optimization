@@ -15,9 +15,9 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
 | Package         | Owns                                                                                                 | Key files |
 | --------------- | ---------------------------------------------------------------------------------------------------- | --------- |
 | `search_space/` | Engine-neutral definition types, the tunable registry, the YAML loader, engine-agnostic and backend-support validation | `types.py`, `registry.py`, `loader.py`, `validation.py` |
-| `inference/`    | Engine-neutral experiment surface (the `InferenceBackend` protocol and `ServerSpec`) plus the vLLM and llama.cpp backends, the host benchmark client, and hardware detection | `types.py`, `_orchestrate.py`, `_benchmark.py`, `_vllm.py`, `_llamacpp.py`, `hardware.py` |
+| `inference/`    | Engine-neutral experiment surface (the `InferenceBackend` protocol, `ServerSpec`, and the optional phase-rate metrics) plus the vLLM and llama.cpp backends, the host benchmark client with its Prometheus snapshots, and hardware detection | `types.py`, `_orchestrate.py`, `_benchmark.py`, `_vllm.py`, `_llamacpp.py`, `hardware.py` |
 | `runtime/`      | Backend-agnostic container types, the detached start/stop lifecycle, the Podman client, and the SELinux probe | `types.py`, `_podman.py`, `_selinux.py` |
-| `optimization/` | The Optuna adapter: maps spec kinds to suggestions and drives a study                                | `types.py`, `_optuna.py` |
+| `optimization/` | The engine-neutral objective model plus the Optuna adapter: maps spec kinds to suggestions, scores trials, drives a study, and guards study provenance | `types.py`, `_optuna.py` |
 | `cli/`          | Composition root: argument parsing, the engine registry, base-config construction, model download progress, log/TUI reporters, summary/writer, exit codes | `arguments.py`, `config.py`, `download.py`, `log.py`, `tui.py`, `summary.py`, `__init__.py` |
 
 ### Invariants
@@ -27,14 +27,41 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
   them.
 - `runtime/_podman.py` is the only module that imports the `podman` bindings at
   runtime; elsewhere it is `TYPE_CHECKING`-only. It carries no engine knowledge.
-- `optimization/_optuna.py` is the only module that knows Optuna's study and
-  trial API.
+- `optimization/_optuna.py` is the only module that drives Optuna's study and
+  trial API; the CLI reporters may read the raw study a result carries — its
+  directions, trials, and recorded user attributes — to render progress and
+  the summary, and that inspection is the reporting surface, not study logic.
+  `optimization/types.py` holds the engine-neutral objective model
+  (`ObjectiveMode`, `ObjectiveWeights`, and the scoring functions), and an
+  objective that needs a rate a result lacks raises `ExperimentError` naming
+  the missing source rather than silently falling back to another measurement.
 - Engine spellings live only in each engine's own backend module: vLLM's in
   `inference/_vllm.py` (`PARAMETER_TARGETS`, `VALUE_MAPS`,
-  `_CHECKPOINT_QUANTIZATION_METHODS`, `_DEFAULT_IMAGES`), and llama.cpp's in
+  `_CHECKPOINT_QUANTIZATION_METHODS`, `_DEFAULT_IMAGES`, `_METRICS_PATH`,
+  `_PREFILL_RATE_SERIES`, `_DECODE_RATE_SERIES`), and llama.cpp's in
   `inference/_llamacpp.py` (`PARAMETER_TARGETS`, `VALUE_MAPS`,
-  `_GGUF_FILE_TYPE_LABELS`, `_DEFAULT_IMAGES`); the search space uses
+  `_GGUF_FILE_TYPE_LABELS`, `_DEFAULT_IMAGES`, `_TIMINGS_KEY`,
+  `_PREFILL_TIMING_KEYS`, `_DECODE_TIMING_KEYS`); the search space uses
   engine-neutral enum values.
+- The metrics seam is engine-neutral: the host client knows only the standard
+  Prometheus exposition format and a spec-declared `ServerSpec.metrics_path`,
+  which it scrapes before and after every measured run and stores as parsed
+  name-to-value maps under `raw_json["metrics"]` (`{"before": ..., "after":
+  ...}`; absent unless both scrapes succeeded, and a failure never fails the
+  run). The backend that owns the engine derives the phase rates from those
+  snapshots (vLLM) or from its preserved raw payloads (llama.cpp) in
+  `parse_result`; the engine-neutral types carry only the optional
+  `RunMetrics.prefill_tokens_per_second` / `decode_tokens_per_second` fields
+  and their `ExperimentResult` means.
+- A persisted study records the objective mode that produced its scores and the
+  phase-metric schema version they were measured under — `_MODE_ATTRIBUTE`,
+  `_METRIC_SCHEMA_ATTRIBUTE`, and `_METRIC_SCHEMA_VERSION` in
+  `optimization/_optuna.py`. A resume under a different mode, or into a study
+  whose direction count does not match the selected mode, is refused with an
+  `OptimizationError`; an unmarked study is treated as legacy combined. The
+  CLI's derived study name carries a mode suffix, and bumping
+  `_METRIC_SCHEMA_VERSION` is the required response to any change in how either
+  backend defines a phase rate.
 - The llama.cpp backend keeps `max_model_len` a request length at the engine: it
   forwards the sampled value as `--ctx-size` unchanged and cuts `--parallel`
   to `max_model_len // (input_len + output_len)` (at least one) for the random
@@ -72,8 +99,11 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
 - **New inference engine** — implement `InferenceBackend` (`inference/types.py`):
   `applicable_parameters`, `validate`, `validate_model`, `model_request`,
   `image_for`, `plan`, `parse_result`. `plan` returns a `ServerSpec`, so the
-  shared host client and orchestrator need no engine-specific code. Register the
-  engine token in `_ENGINES` (`cli/__init__.py`) with its context-manager
+  shared host client and orchestrator need no engine-specific code; an engine
+  with a scrapeable exposition declares `ServerSpec.metrics_path` and derives
+  its phase rates from the snapshots in `parse_result`, while one with
+  per-response timings derives them from its preserved raw payloads. Register
+  the engine token in `_ENGINES` (`cli/__init__.py`) with its context-manager
   backend factory and any command-line options it rejects, and export the
   backend from `inference/__init__.py`. The file format and the layers above are
   unchanged, so a second engine is an addition, not a rewrite.
@@ -168,9 +198,12 @@ backend to `validate_model` it against that checkpoint, pulls the image, then
 calls `optimization.optimize`. Each trial: Optuna samples a point → `inference`
 plans a `ServerSpec` → `runtime` starts the server container detached and
 resolves its host port → the host benchmark client waits for health, takes the
-warmup and measured runs, and aggregates them → `runtime` stops the container →
-the backend parses the outcome into a result → the reporter callback runs.
-`cli/__init__.py` maps outcomes onto exit codes.
+warmup and measured runs, scraping the spec's metrics path around each measured
+run when one is declared, and aggregates them → `runtime` stops the container →
+the backend parses the outcome into a result and enriches it with the phase
+rates its engine reported → the selected objective maps the result to the trial
+value → the reporter callback runs. `cli/__init__.py` maps outcomes onto exit
+codes.
 
 ## Code style
 

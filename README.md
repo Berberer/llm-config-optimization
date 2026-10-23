@@ -1,16 +1,18 @@
 # llm-config-optimization
 
 `llm-config-optimization` is a command-line tool that searches an **LLM serving
-configuration** for the highest token throughput. You give it a model and a YAML
+configuration** for the best token throughput. You give it a model and a YAML
 file describing which serving parameters to sweep and which values each may
 take; it runs the model in a Podman container, benchmarks every candidate
 configuration through the configured inference engine, and uses
-[Optuna](https://optuna.org/) (TPE sampler) to find the best point. Progress is
-shown live as either a per-trial log or a terminal graph, and the winning
-configuration is printed and optionally written to a YAML file when the sweep
-ends.
+[Optuna](https://optuna.org/) (TPE sampler) to find the best point. Each trial
+reports **prefill** and **decode** throughput separately, and by default the
+sweep maximizes both at once, producing a Pareto front rather than committing
+to a trade-off before the run. Progress is shown live as either a per-trial log
+or a terminal graph, and the recommended configuration is printed and
+optionally written to a YAML file when the sweep ends.
 
-![Screenshot of the optimization tool TUI showing a plot with number of trials on the X-axis and tokens per second on the y-axis.](./assets/optimization_plot_example.png)
+![Screenshot of the optimization tool TUI in scalar mode, showing a plot with number of trials on the X-axis and tokens per second on the Y-axis; the default multi-objective view is a prefill-versus-decode scatter.](./assets/optimization_plot_example.png)
 
 The inference engine is deliberately pluggable and chosen on the command line:
 the search-space and experiment layers are engine-neutral and name no engine, so
@@ -89,10 +91,10 @@ resolved, which server command runs, and which image is used. Both engines are
 driven by the same host-side client, so their workload and metric definitions
 are identical, but their defaults and scoped options differ.
 
-| Engine     | Checkpoint                                              | Applicable tunables                                    | Cache reset between runs      |
-| ---------- | ------------------------------------------------------- | ------------------------------------------------------ | ----------------------------- |
-| `vllm`     | A Hugging Face id or a local snapshot directory.        | All seven in [section 2](#2-search-space-yaml-format). | vLLM dev-mode endpoints.      |
-| `llamacpp` | A local `.gguf` file or a Hub repository with `:QUANT`. | The five llama.cpp forwards.                           | None; llama.cpp exposes none. |
+| Engine     | Checkpoint                                              | Applicable tunables                                    | Cache reset between runs      | Phase rates from               |
+| ---------- | ------------------------------------------------------- | ------------------------------------------------------ | ----------------------------- | ------------------------------ |
+| `vllm`     | A Hugging Face id or a local snapshot directory.        | All seven in [section 2](#2-search-space-yaml-format). | vLLM dev-mode endpoints.      | Prometheus `/metrics`.         |
+| `llamacpp` | A local `.gguf` file or a Hub repository with `:QUANT`. | The five llama.cpp forwards.                           | None; llama.cpp exposes none. | The `timings` response object. |
 
 The **default images**, used when `--image` is omitted, are:
 
@@ -123,6 +125,79 @@ because a GGUF file carries its own quantization and llama.cpp sizes memory with
 its own flags. `--llm-seed` is likewise forwarded by vLLM only; the host
 client's workload is greedy, so llama.cpp needs no engine-side seed. Everything
 else on the command line behaves the same for both engines.
+
+### Objective and phase metrics
+
+Every measured run is summarised by up to three rates, all in tokens per
+second:
+
+- **combined** — all prompt and generated tokens over the run's elapsed
+  wall-clock time. This is the historical metric; with a large prompt-to-output
+  ratio it is dominated by prompt tokens.
+- **prefill** — the prompt tokens the engine reports processing over the
+  seconds it reports spending on prefill.
+- **decode** — the generated tokens over the seconds the engine reports
+  spending on generation.
+
+Prefill and decode are **phase-work rates**, not a partition of the run's
+wall-clock time: continuous batching and chunked prefill interleave the two
+phases, so only the engine can attribute work to one. Each engine is read from
+its own source, and neither needs a flag or a changed image:
+
+| Engine     | Phase-rate source |
+| ---------- | ----------------- |
+| `vllm`     | The Prometheus `/metrics` endpoint, scraped immediately before and after each measured run. Prefill is the delta of `vllm:prompt_tokens_total` over the delta of `vllm:request_prefill_time_seconds_sum`; decode is `vllm:generation_tokens_total` over `vllm:request_decode_time_seconds_sum`. The prefix cache is reset before every run, so prompt tokens served from it are excluded. |
+| `llamacpp` | The `timings` object the server attaches to every completion response: `prompt_n` over `prompt_ms` and `predicted_n` over `predicted_ms`, summed over the run's responses. `prompt_n` already excludes tokens served from the cache. |
+
+A scrape that fails, or a response without timings, leaves the phase rate
+absent rather than failing the run. Each run's full payload stays on the result
+for audit, and a trial's phase rates are the means over the runs that reported
+one — a run without a rate is not counted as zero.
+
+`--objective` chooses what the sweep maximizes:
+
+- **`multi`** (the default) submits prefill and decode as two independent
+  objectives, so Optuna keeps a **Pareto front** of non-dominated
+  configurations. The trade-off decision is therefore made after the sweep
+  rather than baked into weights beforehand; the final summary prints the front
+  with a recommended row, the per-trial log and the TUI show both rates, and
+  `--output-config` writes the recommended point.
+- **`weighted`** folds the two rates into the weighted-harmonic effective rate
+
+  ```
+  (w_p + w_d) / (w_p / prefill + w_d / decode)
+  ```
+
+  where `w_p` and `w_d` are the prefill and decode weights. The weights are a
+  **token mix** — counts, not fractions — so any positive scaling of a pair
+  gives the same score, and the result stays a tokens-per-second rate
+  interpretable as the throughput of a request shaped like the weights. They
+  default to the benchmark's `--input-len` and `--output-len`, so
+  `--objective weighted` needs no arithmetic while still biasing the score
+  toward the deployment's shape; `--prefill-weight` and `--decode-weight`
+  override them. A zero weight degenerates the score to the other phase; both
+  zero is rejected. For a JSONL `--dataset-path` the workload's real mix is not
+  known at launch, so the derived defaults are only a stand-in — pass explicit
+  weights to match the dataset.
+- **`combined`** keeps the historical single objective: the mean combined
+  throughput of the successful runs. It is the escape hatch for an engine that
+  reports no phase data, and how studies persisted before objective modes
+  existed are interpreted.
+
+The multi and weighted modes require every phase rate they actually score; a
+trial whose engine reported neither a `/metrics` snapshot nor response timings
+fails with an error naming the missing source instead of silently optimizing
+something else. The combined mode tolerates absent phase data. If no token mix
+can be derived for multi or weighted, both weights must be given explicitly.
+The weights are validated before any preparation runs: both must be finite and
+non-negative, and at least one must be positive, or the run exits with a usage
+error.
+
+> **Note:** the prefill and decode rates are new measurements. They are
+> engine-reported phase-work rates rather than wall-clock partitions, so they
+> are **not comparable** to the combined throughput — and because a study
+> records the phase-metric schema version its scores were measured under,
+> numbers from different versions are not comparable either.
 
 ### Options
 
@@ -162,10 +237,13 @@ drives it from the host with one shared HTTP client — one discarded warmup run
 per `--warmup-runs`, then `--repetitions` measured runs. The model is loaded
 once, so repeating the benchmark does not repeat the engine's startup cost, and
 the container runs only the server, so no engine image needs to carry a
-benchmark client. The trial's score is the **mean** of the successful measured
-runs' total token throughput, and a trial succeeds as long as a strict majority
-of its measured runs succeed, so a single failed run does not discard an
-otherwise valid configuration.
+benchmark client. The trial's typed metrics are the **means** of the successful
+measured runs — combined throughput, prefill rate, and decode rate — and the
+score is what the selected `--objective` makes of them: the `(prefill, decode)`
+pair in the default multi mode, the weighted-harmonic rate of the two means in
+weighted mode, or the mean combined throughput in combined mode. A trial
+succeeds as long as a strict majority of its measured runs succeed, so a single
+failed run does not discard an otherwise valid configuration.
 
 Before every run the server's caches are reset through the paths the backend
 declares — vLLM's dev-mode endpoints, while llama.cpp exposes none and is left
@@ -173,8 +251,8 @@ as it is — and each measured run is seeded with its index `0 … N-1` (warmup
 runs are seeded past that range). The reset keeps a run from being flattered by
 prompts a previous run left cached, and the per-run seed makes it draw a fresh
 prompt set rather than replaying the one that warmed the cache. The per-run
-measurements and the failure count are kept on the result, so the spread behind
-the mean stays inspectable.
+measurements — including each run's phase rates — and the failure count are
+kept on the result, so the spread behind the mean stays inspectable.
 
 > **Note:** measurement goes through the server's OpenAI-compatible HTTP API
 > rather than an offline engine path (`vllm bench throughput` for vLLM). The
@@ -194,6 +272,19 @@ the mean stays inspectable.
 `--quantization` and `--gpu-memory-utilization` are vLLM-only and are rejected
 as usage errors for `llamacpp`; see [Engines](#engines).
 
+#### Objective
+
+| Flag               | Default                  | Description                                                        |
+| ------------------ | ------------------------ | ------------------------------------------------------------------ |
+| `--objective`      | `multi`                  | What the sweep maximizes: `multi` submits prefill and decode as two objectives and reports the Pareto front, `weighted` scores their weighted-harmonic effective rate, and `combined` maximizes the historical total token throughput. |
+| `--prefill-weight` | benchmark `--input-len`  | Prompt tokens in the token mix the weighted score and the recommended point are chosen under; see [Objective and phase metrics](#objective-and-phase-metrics). |
+| `--decode-weight`  | benchmark `--output-len` | Generated tokens in the same token mix.                            |
+
+The weights are token counts (`1024` and `128` are as valid as `8` and `1`)
+and only their ratio matters: they describe the shape of a request, not a
+fractional split. The multi and weighted modes need the mix; `combined` ignores
+it.
+
 #### Budget
 
 | Flag              | Default   | Description                                                                 |
@@ -202,19 +293,31 @@ as usage errors for `llamacpp`; see [Engines](#engines).
 | `--sweep-timeout` | unbounded | Wall-clock time limit for the sweep, in seconds; unbounded when omitted.     |
 
 With neither bound the sweep runs until you press <kbd>Ctrl-C</kbd>; with both it
-stops at whichever is reached first. An interrupt is not a failure. Instead the best
-point found so far is reported.
+stops at whichever is reached first. An interrupt is not a failure. Instead the
+points found so far are reported: the single best point in a scalar mode — or
+the Pareto front and its recommended point in multi mode.
 
 #### Study persistence
 
-| Flag            | Default                    | Description                                                              |
-| --------------- | -------------------------- | ------------------------------------------------------------------------ |
-| `--storage`     | in-memory                  | Optuna storage URL, such as `sqlite:///study.db`; in-memory when omitted. |
-| `--study-name`  | derived from the model     | Name of the persisted study (`Qwen/Qwen3.8-27B` → `Qwen_Qwen3.8-27B`).          |
-| `--n-jobs`      | `1`                        | Number of trials to run in parallel; requires `--storage` and disjoint devices. |
+| Flag            | Default                              | Description                                                              |
+| --------------- | ------------------------------------ | ------------------------------------------------------------------------ |
+| `--storage`     | in-memory                            | Optuna storage URL, such as `sqlite:///study.db`; in-memory when omitted. |
+| `--study-name`  | derived from the model and objective | Name of the persisted study (`Qwen/Qwen3.8-27B` → `Qwen_Qwen3.8-27B_multi`). |
+| `--n-jobs`      | `1`                                  | Number of trials to run in parallel; requires `--storage` and disjoint devices. |
 
 When `--storage` is set, a study of the same name is **resumed** rather than
 recreated, so an interrupted sweep continues where it left off.
+
+A persisted study records the `--objective` mode that produced its scores, and
+resuming it under a different mode is refused with an error naming the recorded
+one — the two sets of scores are not comparable. Resume with
+`--objective <recorded>` or choose a different `--study-name`; the derived
+default name already carries the mode suffix (`…_multi`, `…_weighted`,
+`…_combined`), so the zero-config path cannot collide across modes. A study
+persisted before the mode was recorded is treated as legacy **combined**:
+`--objective combined` resumes it, while the phase-scoring modes are refused.
+A study also records the phase-metric schema version its rates were measured
+under, so a future change to the phase definitions stays detectable.
 
 #### Output
 
@@ -241,26 +344,45 @@ than being overwritten by the next bar refresh. A local model path skips the
 download entirely.
 
 **TUI mode** draws a plotext graph of the sweep, redrawn at the start of each
-trial and again when it finishes. The running frame's status line marks the
+trial and again when it finishes. In the default multi mode it is a
+prefill-versus-decode scatter of this run's trials with the study's Pareto
+front highlighted, and the status line reports the best rate reached in each
+phase. The scalar weighted and combined modes keep the historical best-so-far
+line with the raw per-trial points. The running frame's status line marks the
 trial as in flight, so a long trial is visibly running rather than frozen:
 
 ```
-trials 3/10  running trial 3  best 42.00 tps  avg trial 12.3s  (36.9s)
+trials 3/10  running trial 3  best prefill 1234.56 tps  decode 45.67 tps  avg trial 12.3s  (36.9s)
 ```
 
 `running trial` appears only while a trial is in flight, and `avg trial` — the
 mean seconds per successful trial, with failed trials excluded — only after the
-first success, so the remaining budget can be estimated. The graph's y-axis is
+first success, so the remaining budget can be estimated. The graph's axes are
 labelled with thousands-separated plain numbers (never scientific notation) and
 its x-axis with integer trial numbers, thinned to an even step once a sweep
 grows past ten trials.
 
 **Log mode** keeps a single line per finished trial, with no running marker, so
-a redirected log stays easy to parse:
+a redirected log stays easy to parse. A multi-mode line names the trial's two
+rates, and its best column reports the highest rate reached in each phase:
 
 ```
-trial 3/10  COMPLETE  42.00 tps  best 42.00  (36.9s)
+trial 3/10  COMPLETE  prefill 1234.56 tps  decode 45.67 tps  best prefill 1234.56 tps  decode 45.67 tps  (36.9s)
 ```
+
+A scalar line keeps the historical objective value and appends the measured
+phase pair when the engine reported both, so the phase split is visible without
+changing the familiar shape:
+
+```
+trial 3/10  COMPLETE  42.00 tps  prefill 1234.56 tps  decode 45.67 tps  best 42.00  (36.9s)
+```
+
+The sweep's final summary prints the recommended configuration as the same YAML
+document `--output-config` writes. In multi mode it also prints the Pareto front
+as a table — trial number, both phase rates, the trial's recorded combined
+throughput, and the recommended row marked — so the whole trade-off can be
+compared at a glance.
 
 With `--n-jobs` greater than one the reporters are driven from several worker
 threads; they are not thread-safe, so frames and lines can interleave. Use log
@@ -346,6 +468,15 @@ $ llm-config-optimization Qwen/Qwen3.8-27B space.yaml vllm \
     --input-len 2048 \
     --output-len 256 \
     --timeout 1800
+```
+
+**Prefer generation throughput for a chat-shaped deployment:**
+
+```console
+$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml vllm \
+    --objective weighted \
+    --prefill-weight 512 \
+    --decode-weight 512
 ```
 
 **llama.cpp over a local GGUF file, CPU-only and offline:**
@@ -637,13 +768,13 @@ space:
 | Layer                | Technology                                                                 |
 | -------------------- | -------------------------------------------------------------------------- |
 | Language / packaging | Python **3.14**, `src/` layout, [uv](https://docs.astral.sh/uv/) with the `uv_build` backend |
-| Search / optimization| [Optuna](https://optuna.org/) TPE sampler, maximizing token throughput; SQLite or in-memory studies |
+| Search / optimization | [Optuna](https://optuna.org/) TPE sampler, maximizing prefill and decode throughput as a Pareto front, their weighted-harmonic rate, or the combined token throughput; SQLite or in-memory studies |
 | Inference engine     | **vLLM** and **llama.cpp**, each started once per trial (`vllm serve`, `llama-server`) and measured from the host by a shared HTTP client; the layer above them is engine-neutral |
 | Benchmark client     | **`httpx2`** async HTTP client, driving the server's OpenAI-compatible API from the host with an injectable transport and clock |
 | Container runtime    | **Podman** via the [`podman`](https://pypi.org/project/podman/) Python bindings (CDI for CUDA, device nodes for ROCm, none for CPU) |
 | Config format        | **PyYAML** (`yaml.safe_load`) for the search-space and output-config files |
 | Model fetching       | [`huggingface_hub`](https://pypi.org/project/huggingface-hub/) snapshot download for vLLM, single-file GGUF download for llama.cpp |
-| Terminal UI          | [`plotext`](https://pypi.org/project/plotext/) for the live best-so-far graph |
+| Terminal UI          | [`plotext`](https://pypi.org/project/plotext/) for the live best-so-far graph or the prefill-versus-decode scatter with the Pareto front highlighted |
 | Testing              | **pytest** (unit tests use fakes; `integration`-marked tests need a Podman daemon and are deselected by default) |
 | Linting / formatting | **Ruff** (line length 100, `py314` target)                                  |
 | Type checking        | **ty** (checks the library sources in `src/`; `tests/` is excluded)        |
@@ -661,13 +792,15 @@ The codebase is layered so engine details stay at the edges:
   backend validates a resolved checkpoint, plans a `ServerSpec`, and parses
   results; the client waits for the server's health — failing the run as soon
   as the container exits during that wait — takes the warmup and measured runs,
-  and aggregates the metrics. A second engine is another implementation of the
-  protocol.
+  snapshots the spec's declared metrics path around each one, and aggregates
+  the metrics. A second engine is another implementation of the protocol.
 - `runtime/`: Backend-agnostic container types, the detached start/stop
   lifecycle a host-driven run uses, and the Podman client (plus SELinux
   auto-detection).
-- `optimization/`: The Optuna adapter that maps spec kinds to suggestions and
-  drives a study.
+- `optimization/`: The engine-neutral objective model (`ObjectiveMode`,
+  `ObjectiveWeights`, and the scoring functions) and the Optuna adapter that
+  maps spec kinds to suggestions, scores each trial, drives a study, and guards
+  its recorded mode.
 - `cli/`: The composition root: argument parsing, base-config construction,
   the log and TUI reporters, the summary/writer, and exit-code mapping.
 
@@ -676,5 +809,6 @@ search space and validation workflow can target a different inference backend
 later without changing the file format. The search space is total over the
 selected backend's applicable set, so the engine — not the file format —
 decides which parameters a definition must declare. Each backend keeps its
-vocabulary — flags, value spellings, checkpoint handling, and default images —
-in its own module.
+vocabulary — flags, value spellings, checkpoint handling, metric series, and
+default images — in its own module, and the host client only fetches and parses
+the Prometheus exposition a spec's `metrics_path` names.

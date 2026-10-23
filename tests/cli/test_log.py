@@ -5,8 +5,9 @@ trial and the sequence of lines it writes as it is called. These tests drive it
 as a string producer with an injectable clock and stream, using real Optuna
 studies and frozen trials, so no sweep, terminal, or real time is involved. They
 assert on the documented line format for successful and failed trials, with and
-without a budget, and on the best-so-far value coming from the study so a
-resumed sweep reflects it.
+without a budget and recorded phase rates, in scalar and multi-objective
+studies, and on the best-so-far value coming from the study so a resumed sweep
+reflects it.
 """
 
 import io
@@ -26,11 +27,38 @@ class FakeClock:
         return self.now
 
 
-def completed_trial(value: float) -> optuna.trial.FrozenTrial:
-    """A frozen completed trial carrying ``value`` as its objective."""
+def completed_trial(
+    value: float,
+    *,
+    prefill: float | None = None,
+    decode: float | None = None,
+) -> optuna.trial.FrozenTrial:
+    """A frozen completed trial carrying ``value`` as its objective.
+
+    When either phase rate is given, both are recorded under the ``result``
+    user attribute the optimizer uses, so the reporter can render the pair the
+    engine reported alongside the scalar objective.
+    """
+    user_attrs: dict[str, object] = {}
+    if prefill is not None or decode is not None:
+        user_attrs["result"] = {
+            "prefill_tokens_per_second": prefill,
+            "decode_tokens_per_second": decode,
+        }
     return optuna.trial.create_trial(
         state=optuna.trial.TrialState.COMPLETE,
         value=value,
+        params={},
+        distributions={},
+        user_attrs=user_attrs,
+    )
+
+
+def completed_multi_trial(prefill: float, decode: float) -> optuna.trial.FrozenTrial:
+    """A frozen completed trial carrying the two phase rates as its objectives."""
+    return optuna.trial.create_trial(
+        state=optuna.trial.TrialState.COMPLETE,
+        values=[prefill, decode],
         params={},
         distributions={},
     )
@@ -55,6 +83,14 @@ def study_with(*trials: optuna.trial.FrozenTrial) -> optuna.Study:
     return study
 
 
+def multi_study_with(*trials: optuna.trial.FrozenTrial) -> optuna.Study:
+    """An in-memory two-objective maximizing study holding ``trials``."""
+    study = optuna.create_study(directions=["maximize", "maximize"])
+    for trial in trials:
+        study.add_trial(trial)
+    return study
+
+
 def test_a_successful_trial_renders_the_documented_line() -> None:
     clock = FakeClock()
     reporter = LogReporter(n_trials=10, clock=clock)
@@ -63,6 +99,25 @@ def test_a_successful_trial_renders_the_documented_line() -> None:
     clock.now = 3.5
 
     assert reporter.render(study, trial) == "trial 1/10  COMPLETE  42.00 tps  best 42.00  (3.5s)"
+
+
+def test_a_scalar_trial_with_recorded_phase_rates_shows_both_on_the_line() -> None:
+    reporter = LogReporter(n_trials=10, clock=FakeClock())
+    trial = completed_trial(42.0, prefill=1200.0, decode=50.0)
+    study = study_with(trial)
+
+    assert reporter.render(study, trial) == (
+        "trial 1/10  COMPLETE  42.00 tps  prefill 1200.00 tps  decode 50.00 tps  best 42.00  (0.0s)"
+    )
+
+
+def test_a_scalar_trial_with_only_one_phase_rate_keeps_the_historical_line() -> None:
+    """The pair is shown together or not at all, so the grammar stays regular."""
+    reporter = LogReporter(n_trials=10, clock=FakeClock())
+    trial = completed_trial(42.0, prefill=1200.0)
+    study = study_with(trial)
+
+    assert reporter.render(study, trial) == "trial 1/10  COMPLETE  42.00 tps  best 42.00  (0.0s)"
 
 
 def test_an_unbounded_sweep_omits_the_denominator() -> None:
@@ -105,6 +160,49 @@ def test_a_failure_without_a_recorded_message_uses_a_placeholder() -> None:
 
     assert "  no result  " in line
     assert "best n/a" in line
+
+
+def test_a_multi_trial_renders_both_objectives_as_phase_rates() -> None:
+    reporter = LogReporter(n_trials=10, clock=FakeClock())
+    trial = completed_multi_trial(1200.0, 50.0)
+    study = multi_study_with(trial)
+
+    assert reporter.render(study, trial) == (
+        "trial 1/10  COMPLETE  prefill 1200.00 tps  decode 50.00 tps"
+        "  best prefill 1200.00 tps  decode 50.00 tps  (0.0s)"
+    )
+
+
+def test_a_multi_best_column_reports_the_high_water_mark_of_each_phase() -> None:
+    """The two rates can come from different trials, so neither hides the other."""
+    high_prefill = completed_multi_trial(1200.0, 50.0)
+    high_decode = completed_multi_trial(800.0, 90.0)
+    study = multi_study_with(high_prefill, high_decode)
+    reporter = LogReporter(n_trials=10, clock=FakeClock())
+
+    assert "best prefill 1200.00 tps  decode 90.00 tps" in reporter.render(study, high_decode)
+
+
+def test_a_failed_multi_trial_still_reports_its_error_and_the_best_rates() -> None:
+    completed = completed_multi_trial(1000.0, 40.0)
+    failed = failed_trial("simulated out-of-memory")
+    study = multi_study_with(completed, failed)
+    reporter = LogReporter(n_trials=10, clock=FakeClock())
+
+    assert reporter.render(study, failed) == (
+        "trial 1/10  FAIL  simulated out-of-memory"
+        "  best prefill 1000.00 tps  decode 40.00 tps  (0.0s)"
+    )
+
+
+def test_a_multi_study_without_a_completed_trial_has_no_best() -> None:
+    failed = failed_trial("simulated out-of-memory")
+    study = multi_study_with(failed)
+    reporter = LogReporter(n_trials=10, clock=FakeClock())
+
+    line = reporter.render(study, failed)
+
+    assert "  simulated out-of-memory  best n/a  " in line
 
 
 def test_best_so_far_is_read_from_the_study_so_a_resumed_sweep_reflects_it() -> None:

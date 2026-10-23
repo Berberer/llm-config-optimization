@@ -28,7 +28,10 @@ __all__ = ["build_parser", "parse_args"]
 _DISTRIBUTION_NAME = "llm-config-optimization"
 _PROG = "llm-config-optimization"
 
-_DESCRIPTION = "Search an LLM serving configuration for the best throughput."
+_DESCRIPTION = (
+    "Search an LLM serving configuration for the best prefill, decode, or combined "
+    "token throughput."
+)
 
 _EPILOG = """\
 examples:
@@ -219,6 +222,37 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Number of trials to run in parallel; requires --storage and disjoint devices.",
+    )
+
+    objective = parser.add_argument_group("objective")
+    objective.add_argument(
+        "--objective",
+        choices=("multi", "weighted", "combined"),
+        default="multi",
+        help=(
+            "What the sweep maximizes: multi submits prefill and decode rates as two "
+            "objectives and reports the Pareto front, weighted scores their "
+            "weighted-harmonic effective rate, and combined maximizes total token "
+            "throughput."
+        ),
+    )
+    objective.add_argument(
+        "--prefill-weight",
+        type=float,
+        default=None,
+        help=(
+            "Prompt tokens in the token mix the weighted and multi objectives are scored "
+            "under; the benchmark's --input-len when omitted."
+        ),
+    )
+    objective.add_argument(
+        "--decode-weight",
+        type=float,
+        default=None,
+        help=(
+            "Generated tokens in the token mix the weighted and multi objectives are "
+            "scored under; the benchmark's --output-len when omitted."
+        ),
     )
 
     output = parser.add_argument_group("output")

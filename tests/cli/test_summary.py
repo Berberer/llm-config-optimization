@@ -6,10 +6,13 @@ resolved target and image filled in. These tests build an
 :class:`~llm_config_optimization.optimization.types.OptimizationResult` directly and
 assert on the summary's headline fields and on the YAML read back from a
 temporary file, so the printed and written configurations are checked against
-the same structure.
+the same structure. A multi-objective study is exercised too: its summary names
+the recommended point and prints the Pareto front as a table with the
+recommended row marked, and the written document is the recommended point's
+configuration either way.
 """
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 
 import optuna
@@ -24,7 +27,7 @@ from llm_config_optimization.inference import (
     HardwareTarget,
     LLMConfig,
 )
-from llm_config_optimization.optimization import OptimizationResult
+from llm_config_optimization.optimization import OptimizationResult, OptimizationSolution
 
 TARGET = HardwareTarget.CUDA
 IMAGE = "vllm/vllm-openai:latest"
@@ -53,13 +56,83 @@ def base_config() -> ExperimentConfig:
 
 
 def result() -> OptimizationResult:
-    """A finished sweep whose winning configuration is :func:`base_config`."""
+    """A finished sweep whose recommended configuration is :func:`base_config`."""
+    solution = OptimizationSolution(
+        config=base_config(),
+        value=42.0,
+        trial_number=3,
+    )
     return OptimizationResult(
-        best_config=base_config(),
-        best_value=42.0,
-        best_trial_number=3,
+        solutions=(solution,),
+        recommended=solution,
         trial_count=5,
         study=optuna.create_study(direction="maximize"),
+    )
+
+
+_FRONT = (
+    # trial number, prefill tps, decode tps, combined tps, max_model_len
+    (0, 1000.0, 50.0, 128.0, 4096),
+    (1, 500.0, 200.0, 96.0, 2048),
+    (2, 200.0, 500.0, 64.0, 1024),
+)
+"""A three-point Pareto front, each point distinguished by its ``max_model_len``."""
+
+
+def completed_multi_trial(
+    prefill: float,
+    decode: float,
+    *,
+    combined: float | None = None,
+) -> optuna.trial.FrozenTrial:
+    """A frozen multi trial carrying its phase objectives and recorded combined rate.
+
+    The optimizer records a JSON projection of every successful run under the
+    ``result`` user attribute; ``combined`` fills in just the aggregate combined
+    throughput the front table reads. Omitting it exercises the trial whose
+    record is absent.
+    """
+    user_attrs: dict[str, object] = {}
+    if combined is not None:
+        user_attrs["result"] = {"tokens_per_second": combined}
+    return optuna.trial.create_trial(
+        state=optuna.trial.TrialState.COMPLETE,
+        values=[prefill, decode],
+        params={},
+        distributions={},
+        user_attrs=user_attrs,
+    )
+
+
+def config_with_max_model_len(value: int) -> ExperimentConfig:
+    """A copy of :func:`base_config` whose distinguishing field is ``max_model_len``."""
+    config = base_config()
+    return replace(config, llm=replace(config.llm, max_model_len=value))
+
+
+def multi_result() -> OptimizationResult:
+    """A finished multi sweep whose three-point front includes the recommended point.
+
+    The recommended point is the middle of the front, and the solutions are
+    deliberately stored out of trial order — as Optuna's ``best_trials`` may
+    return them — so the table's ordering cannot pass by accident.
+    """
+    study = optuna.create_study(directions=["maximize", "maximize"])
+    for _, prefill, decode, combined, _ in _FRONT:
+        study.add_trial(completed_multi_trial(prefill, decode, combined=combined))
+    solutions = {
+        number: OptimizationSolution(
+            config=config_with_max_model_len(max_model_len),
+            value=(prefill, decode),
+            trial_number=number,
+        )
+        for number, prefill, decode, _, max_model_len in _FRONT
+    }
+    return OptimizationResult(
+        solutions=(solutions[2], solutions[0], solutions[1]),
+        recommended=solutions[1],
+        trial_count=4,
+        study=study,
     )
 
 
@@ -168,3 +241,62 @@ def test_the_summary_and_the_file_share_the_same_document(tmp_path: Path) -> Non
     printed = summary.split("winning configuration:\n", 1)[1]
 
     assert yaml.safe_load(printed) == yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def test_a_multi_summary_names_the_recommended_point_and_the_trial_count() -> None:
+    summary = render_summary(multi_result(), target=TARGET, image=IMAGE)
+
+    assert "recommended trial: 1" in summary
+    assert "recommended rates: prefill 500.00 tps  decode 200.00 tps" in summary
+    assert "trials run: 4" in summary
+
+
+def test_a_multi_summary_prints_the_pareto_front_as_a_table() -> None:
+    """Rows read in trial order however the study stored them, with the marker column."""
+    summary = render_summary(multi_result(), target=TARGET, image=IMAGE)
+
+    table = summary.split("pareto front:\n", 1)[1].split("\n\nwinning configuration:", 1)[0]
+
+    assert table.splitlines() == [
+        "trial  prefill tps  decode tps  combined tps  recommended",
+        "0      1000.00      50.00       128.00",
+        "1      500.00       200.00      96.00         yes",
+        "2      200.00       500.00      64.00",
+    ]
+
+
+def test_a_front_trial_without_a_recorded_combined_rate_renders_na() -> None:
+    study = optuna.create_study(directions=["maximize", "maximize"])
+    study.add_trial(completed_multi_trial(300.0, 60.0))
+    solution = OptimizationSolution(
+        config=config_with_max_model_len(512), value=(300.0, 60.0), trial_number=0
+    )
+    result = OptimizationResult(
+        solutions=(solution,), recommended=solution, trial_count=1, study=study
+    )
+
+    summary = render_summary(result, target=TARGET, image=IMAGE)
+
+    assert "0      300.00       60.00       n/a" in summary
+
+
+def test_a_multi_summary_carries_the_recommended_configuration() -> None:
+    summary = render_summary(multi_result(), target=TARGET, image=IMAGE)
+
+    assert "winning configuration:" in summary
+    assert "max_model_len: 2048" in summary
+    assert "max_model_len: 4096" not in summary
+    assert "max_model_len: 1024" not in summary
+
+
+def test_a_multi_summary_and_the_file_share_the_recommended_document(tmp_path: Path) -> None:
+    path = tmp_path / "best.yaml"
+    result = multi_result()
+
+    write_config(path, result.recommended.config, target=TARGET, image=IMAGE)
+    summary = render_summary(result, target=TARGET, image=IMAGE)
+
+    printed = summary.split("winning configuration:\n", 1)[1]
+
+    assert yaml.safe_load(printed) == yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert yaml.safe_load(printed)["llm"]["max_model_len"] == 2048

@@ -130,6 +130,8 @@ def test_two_trial_cpu_sweep_reports_progress_and_writes_the_winner(
             str(_N_TRIALS),
             "--output",
             "log",
+            "--objective",
+            "combined",
             "--output-config",
             str(config_path),
             "--gpu-memory-utilization",

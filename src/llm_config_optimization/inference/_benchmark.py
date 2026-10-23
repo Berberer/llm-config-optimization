@@ -19,14 +19,23 @@ runs and the failed-run count become a
 :class:`~llm_config_optimization.inference.types.BenchmarkOutcome`. A trial is
 rejected unless a strict majority of its measured runs completed at least one
 request, mirroring the engine client this replaces.
+
+When the planned :class:`~llm_config_optimization.inference.types.ServerSpec`
+declares a metrics path, the client also scrapes that endpoint immediately
+before and after each measured run and stores the parsed samples in the run's
+``raw_json`` under the ``metrics`` key. Parsing touches only the standard
+Prometheus exposition format — no engine series names — and a scrape that
+fails or parses to nothing leaves the key absent rather than failing the run,
+so the snapshots are a best-effort diagnostic.
 """
 
 import asyncio
 import json
 import random
+import re
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
@@ -52,6 +61,28 @@ backend that knows better can widen or narrow it through
 """
 
 _COMPLETIONS_PATH = "/v1/completions"
+
+_METRICS_KEY = "metrics"
+"""The ``raw_json`` key under which a run's metric snapshots are stored.
+
+The value is ``{"before": {...}, "after": {...}}`` — the parsed exposition
+maps taken immediately before and after the measured run — and the key is
+absent when either snapshot could not be taken, so a consumer sees both
+snapshots or nothing. Which series the maps carry and how their deltas become
+phase rates stay in the backend that owns the engine.
+"""
+
+_METRICS_BEFORE_KEY = "before"
+_METRICS_AFTER_KEY = "after"
+
+_RESPONSES_KEY = "responses"
+"""The ``raw_json`` key under which a run's completion payloads are stored.
+
+The value is the list of successful response bodies in request order. It is
+the client's schema — each entry is the engine's own JSON — so a backend reads
+its engine's fields from the payloads without the client learning any of them.
+"""
+
 _RANDOM_DATASETS = frozenset({"random", "random-mm", "random-rerank"})
 """Dataset names that select the random workload rather than a file.
 
@@ -166,6 +197,64 @@ def _build_workload(benchmark: BenchmarkConfig, vocab_size: int) -> Callable[[in
     return lambda seed: _random_requests(benchmark, seed, vocab_size)
 
 
+_EXPOSITION_SAMPLE = re.compile(
+    r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{.*\})?\s+(?P<value>\S+)(?:\s+\S+)?\s*$"
+)
+"""Matches one sample line of a Prometheus exposition.
+
+The metric name is followed by optional labels — whose contents are discarded,
+hence the greedy brace match — a required value, and an optional trailing
+timestamp. Comment, blank, and non-matching lines simply yield no sample.
+"""
+
+
+def _parse_exposition(text: str) -> dict[str, float] | None:
+    """Parse a Prometheus exposition body into a name-to-value mapping.
+
+    Only sample lines matter: comments (``# HELP``, ``# TYPE``, or any other
+    ``#`` line) and blank lines are skipped, as are lines that do not match the
+    sample grammar. Labels are discarded because a server serves one model, so
+    a metric name identifies a series; when a name repeats — the ``le``-labelled
+    buckets of a histogram, for example — the last sample wins, which is why a
+    consumer reads series that are unique per model. Returns ``None`` when the
+    body yields no sample at all, so an error page or a non-exposition body
+    counts as a failed scrape rather than an empty one.
+    """
+    samples: dict[str, float] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = _EXPOSITION_SAMPLE.match(stripped)
+        if match is None:
+            continue
+        try:
+            samples[match.group("name")] = float(match.group("value"))
+        except ValueError:
+            continue
+    return samples or None
+
+
+def _with_metrics(
+    run: RunMetrics, before: Mapping[str, float] | None, after: Mapping[str, float] | None
+) -> RunMetrics:
+    """Return ``run`` with its metric snapshots stored in its raw JSON.
+
+    The snapshots are attached under :data:`_METRICS_KEY` only when both were
+    taken, so a consumer never has to guess which half of a pair is missing; a
+    run whose scrape failed keeps the raw JSON the engine payload produced.
+    """
+    if before is None or after is None:
+        return run
+    return replace(
+        run,
+        raw_json={
+            **run.raw_json,
+            _METRICS_KEY: {_METRICS_BEFORE_KEY: before, _METRICS_AFTER_KEY: after},
+        },
+    )
+
+
 def _usage_tokens(payload: Mapping[str, object]) -> tuple[int, int] | None:
     """Return ``(prompt_tokens, completion_tokens)`` from a completion payload.
 
@@ -222,7 +311,10 @@ class BenchmarkClient:
         resets the spec's cache paths when it declares any, and it seeds each
         run distinctly so every repetition draws a fresh prompt set. Requests
         are fired concurrently, bounded by ``concurrency`` when it is given and
-        unbounded otherwise.
+        unbounded otherwise. When the spec declares a metrics path, each
+        measured run is bracketed by a best-effort scrape of it, and both
+        parsed snapshots are stored in the run's raw JSON; warmup runs are not
+        scraped.
 
         ``is_alive``, when given, is polled during the health wait so a server
         container that has already exited — a model-load crash, an out-of-memory
@@ -310,11 +402,13 @@ class BenchmarkClient:
                 )
             for run_index in range(benchmark.repetitions):
                 await self._reset_caches(client, spec)
+                before = await self._snapshot_metrics(client, spec)
                 run = await self._take_run(client, model, workload(run_index), concurrency)
+                after = await self._snapshot_metrics(client, spec)
                 if run is None:
                     failed_runs += 1
                 else:
-                    measured.append(run)
+                    measured.append(_with_metrics(run, before, after))
         if len(measured) * 2 <= benchmark.repetitions:
             raise ExperimentError(
                 f"only {len(measured)}/{benchmark.repetitions} measured runs succeeded; "
@@ -353,6 +447,28 @@ class BenchmarkClient:
                     f"{spec.health_timeout}s"
                 )
             await asyncio.sleep(self.poll_interval)
+
+    async def _snapshot_metrics(
+        self, client: httpx2.AsyncClient, spec: ServerSpec
+    ) -> Mapping[str, float] | None:
+        """Fetch and parse the spec's metrics endpoint, or ``None`` on any failure.
+
+        A spec that declares no metrics path yields ``None`` without a request,
+        so an engine without scrapeable metrics costs nothing. The whole scrape
+        is best-effort: a transport error, an error response, an undecodable
+        body, or a body that parses to no samples leaves the run without a
+        snapshot rather than failing the measurement. The decode error is
+        defensive — httpx2 decodes with ``errors="replace"`` — but it is caught
+        here so a scrape can never be the reason a run fails.
+        """
+        if spec.metrics_path is None:
+            return None
+        try:
+            response = await client.get(spec.metrics_path)
+            response.raise_for_status()
+            return _parse_exposition(response.text)
+        except httpx2.HTTPError, UnicodeDecodeError:
+            return None
 
     async def _reset_caches(self, client: httpx2.AsyncClient, spec: ServerSpec) -> None:
         """Call the spec's cache-reset paths, ignoring any failure.
@@ -416,7 +532,7 @@ class BenchmarkClient:
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": total_tokens,
-                "responses": responses,
+                _RESPONSES_KEY: responses,
             },
         )
 

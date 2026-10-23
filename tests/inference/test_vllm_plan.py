@@ -271,6 +271,13 @@ def test_health_reset_and_startup_timeout_come_from_the_benchmark() -> None:
     )
 
 
+def test_the_metrics_endpoint_is_declared_for_phase_rates() -> None:
+    """The host client snapshots vLLM's exposition around every measured run."""
+    spec = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 1))
+
+    assert spec.metrics_path == "/metrics"
+
+
 def test_hub_model_is_passed_through_without_a_model_mount() -> None:
     spec = _plan(_experiment(), DetectedHardware(HardwareTarget.CUDA, 1))
 

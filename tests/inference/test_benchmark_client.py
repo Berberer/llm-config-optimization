@@ -3,8 +3,9 @@
 The client's observable contract is what it sends to the engine's
 OpenAI-compatible server and the metrics it derives from the responses: the
 random and JSONL workloads, the per-run seed, the warmup runs, the cache-reset
-calls, the concurrency bound, the strict-majority rule, and the aggregation of
-elapsed time and token usage. These tests drive it through an injected
+calls, the concurrency bound, the strict-majority rule, the aggregation of
+elapsed time and token usage, and the best-effort snapshots of a spec-declared
+metrics endpoint. These tests drive it through an injected
 :class:`httpx2.MockTransport` and an injected clock, so no daemon, engine, or
 GPU is required and every elapsed time is deterministic.
 """
@@ -12,7 +13,7 @@ GPU is required and every elapsed time is deterministic.
 import asyncio
 import json
 import random
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import httpx2
@@ -52,15 +53,27 @@ class FakeEngine:
 
     ``health_failures`` makes the first N health probes fail before the server
     reports healthy. ``fail_completions`` makes the first N completion requests
-    fail, so a test can fail whole runs by covering their request count. The
-    handler yields once so an unbounded run can have every request in flight at
-    the same time, which lets a test observe the concurrency bound.
+    fail, so a test can fail whole runs by covering their request count.
+    ``metrics``, when given, is called with the 1-based scrape number for each
+    ``GET /metrics`` and returns that scrape's body, or ``None`` to answer with
+    an error; leaving it unset makes the endpoint 404, modelling an engine
+    without scrapeable metrics. The handler yields once so an unbounded run can
+    have every request in flight at the same time, which lets a test observe
+    the concurrency bound.
     """
 
-    def __init__(self, *, health_failures: int = 0, fail_completions: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        health_failures: int = 0,
+        fail_completions: int = 0,
+        metrics: Callable[[int], str | None] | None = None,
+    ) -> None:
         self.health_failures = health_failures
         self.fail_completions = fail_completions
+        self.metrics = metrics
         self.health_attempts = 0
+        self.metrics_attempts = 0
         self.completions: list[dict[str, object]] = []
         self.resets: list[str] = []
         self.events: list[str] = []
@@ -81,6 +94,15 @@ class FakeEngine:
             self.resets.append(path)
             self.events.append(f"reset:{path}")
             return httpx2.Response(200, json={})
+        if path == "/metrics":
+            self.metrics_attempts += 1
+            self.events.append("metrics")
+            if self.metrics is None:
+                return httpx2.Response(404, json={"error": "not found"})
+            text = self.metrics(self.metrics_attempts)
+            if text is None:
+                return httpx2.Response(500, json={"error": "boom"})
+            return httpx2.Response(200, text=text)
         if path == "/v1/completions":
             self.in_flight += 1
             self.max_in_flight = max(self.max_in_flight, self.in_flight)
@@ -113,12 +135,14 @@ def _spec(
     *,
     health_timeout: float = 60.0,
     reset_paths: tuple[str, ...] = (),
+    metrics_path: str | None = None,
 ) -> ServerSpec:
     return ServerSpec(
         container=ContainerConfig(image="fake/server:latest"),
         health_path="/health",
         health_timeout=health_timeout,
         reset_paths=reset_paths,
+        metrics_path=metrics_path,
     )
 
 
@@ -301,6 +325,101 @@ def test_absent_reset_paths_skip_resetting() -> None:
     client.measure_sync("http://engine", MODEL, _spec(), _random_benchmark())
 
     assert engine.resets == []
+
+
+def _exposition(scrape: int) -> str:
+    """Build a realistic exposition whose counters advance with the scrape."""
+    return (
+        "# HELP vllm:prompt_tokens_total Number of prefill tokens processed.\n"
+        "# TYPE vllm:prompt_tokens_total counter\n"
+        f'vllm:prompt_tokens_total{{model_name="{MODEL}"}} {scrape * 10}.0\n'
+        f'vllm:request_decode_time_seconds_sum{{model_name="{MODEL}"}} {scrape}.5\n'
+    )
+
+
+def test_declared_metrics_are_snapshotted_before_and_after_the_run() -> None:
+    engine = FakeEngine(metrics=_exposition)
+    client = _client(engine)
+
+    outcome = client.measure_sync(
+        "http://engine", MODEL, _spec(metrics_path="/metrics"), _random_benchmark()
+    )
+
+    assert outcome.runs[0].raw_json["metrics"] == {
+        "before": {
+            "vllm:prompt_tokens_total": 10.0,
+            "vllm:request_decode_time_seconds_sum": 1.5,
+        },
+        "after": {
+            "vllm:prompt_tokens_total": 20.0,
+            "vllm:request_decode_time_seconds_sum": 2.5,
+        },
+    }
+    assert engine.metrics_attempts == 2
+    assert engine.events == ["metrics", "completion", "completion", "metrics"]
+
+
+def test_every_measured_run_is_bracketed_and_warmup_is_not_scraped() -> None:
+    engine = FakeEngine(metrics=lambda scrape: f"vllm:prompt_tokens_total {scrape}.0\n")
+    client = _client(engine)
+    benchmark = _random_benchmark(repetitions=2, warmup=1)
+
+    outcome = client.measure_sync("http://engine", MODEL, _spec(metrics_path="/metrics"), benchmark)
+
+    snapshots = [run.raw_json["metrics"] for run in outcome.runs]
+    assert [snapshot["before"]["vllm:prompt_tokens_total"] for snapshot in snapshots] == [1.0, 3.0]
+    assert [snapshot["after"]["vllm:prompt_tokens_total"] for snapshot in snapshots] == [2.0, 4.0]
+    assert engine.metrics_attempts == 4
+
+
+def test_a_spec_without_a_metrics_path_is_never_scraped() -> None:
+    engine = FakeEngine(metrics=_exposition)
+    client = _client(engine)
+
+    outcome = client.measure_sync("http://engine", MODEL, _spec(), _random_benchmark())
+
+    assert "metrics" not in outcome.runs[0].raw_json
+    assert engine.metrics_attempts == 0
+
+
+def test_a_missing_metrics_endpoint_leaves_the_run_intact() -> None:
+    engine = FakeEngine()  # the endpoint 404s
+    client = _client(engine)
+
+    outcome = client.measure_sync(
+        "http://engine", MODEL, _spec(metrics_path="/metrics"), _random_benchmark()
+    )
+
+    assert len(outcome.runs) == 1
+    assert "metrics" not in outcome.runs[0].raw_json
+    assert engine.metrics_attempts == 2
+
+
+def test_an_unparseable_metrics_payload_is_ignored() -> None:
+    engine = FakeEngine(metrics=lambda _scrape: '{"error": "this is not an exposition"}')
+    client = _client(engine)
+
+    outcome = client.measure_sync(
+        "http://engine", MODEL, _spec(metrics_path="/metrics"), _random_benchmark()
+    )
+
+    assert len(outcome.runs) == 1
+    assert "metrics" not in outcome.runs[0].raw_json
+    assert engine.metrics_attempts == 2
+
+
+def test_a_failed_half_of_the_snapshot_pair_leaves_no_metrics_key() -> None:
+    engine = FakeEngine(
+        metrics=lambda scrape: None if scrape == 1 else "vllm:gpu_cache_usage 0.5\n"
+    )
+    client = _client(engine)
+
+    outcome = client.measure_sync(
+        "http://engine", MODEL, _spec(metrics_path="/metrics"), _random_benchmark()
+    )
+
+    assert engine.metrics_attempts == 2
+    assert "metrics" not in outcome.runs[0].raw_json
 
 
 def test_a_server_that_never_becomes_healthy_fails() -> None:

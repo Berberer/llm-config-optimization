@@ -1,22 +1,28 @@
-"""Integration test for the optimization adapter's real sweep path.
+"""Integration tests for the optimization adapter's sweep paths.
 
-This runs a real two-trial sweep end to end: ``optimize`` samples a
+The first test runs a real two-trial sweep end to end: ``optimize`` samples a
 mostly-fixed space, rebuilds an experiment per trial, executes each as a
 one-container/one-server run through the real vLLM CPU backend and Podman,
 records the repeated-run outcome on the study, and returns the winning
 configuration. It asserts the result and study shape — the trial count, that
-every trial completed, and that the returned configuration carries the fixed
-and inherited values it should — rather than the throughput, which is
-hardware-dependent.
+every trial completed, the phase rates the engine reported, and that the
+returned configuration carries the fixed and inherited values it should —
+rather than the throughput, which is hardware-dependent.
 
-The test is marked ``integration`` and deselected by default; run it with
-``uv run pytest -m integration``. The module skips when Podman is unavailable,
-when the vLLM CPU image cannot be obtained, or when the model is neither cached
-nor downloadable. The first run pulls a multi-gigabyte image and downloads the
-model into the mounted Hugging Face cache, so it is slow.
+The second test drives the same adapter with a fake backend returning a
+phase-rate pair per trial, so the multi-objective path — a two-direction
+study, a real Pareto front, and the recommended point — is exercised end to
+end without Podman or a GPU.
+
+The tests are marked ``integration`` and deselected by default; run them with
+``uv run pytest -m integration``. The real sweep skips when Podman is
+unavailable, when the vLLM CPU image cannot be obtained, or when the model is
+neither cached nor downloadable. The first run pulls a multi-gigabyte image
+and downloads the model into the mounted Hugging Face cache, so it is slow.
 """
 
 import socket
+from collections.abc import Sequence
 from pathlib import Path
 
 import optuna
@@ -24,18 +30,29 @@ import pytest
 from podman import PodmanClient
 from podman.errors import APIError
 
+from fakes import FakeBackend, FakePodmanClient
 from llm_config_optimization.inference import (
     BenchmarkClient,
     BenchmarkConfig,
+    BenchmarkOutcome,
     ContainerRuntimeConfig,
     DType,
     ExperimentConfig,
+    ExperimentResult,
     HardwareTarget,
     KVCacheDType,
     LLMConfig,
+    RunMetrics,
+    ServerSpec,
     VLLMBackend,
 )
-from llm_config_optimization.optimization import OptimizationResult, optimize
+from llm_config_optimization.optimization import (
+    ObjectiveMode,
+    ObjectiveWeights,
+    OptimizationResult,
+    optimize,
+)
+from llm_config_optimization.runtime import ContainerConfig, ContainerResult
 from llm_config_optimization.search_space import (
     Categorical,
     Default,
@@ -102,6 +119,65 @@ SPACE = ExperimentSpace(
 )
 """A mostly-fixed CPU-safe space with one dimension the sweep varies."""
 
+_FAKE_PLAN = ServerSpec(
+    container=ContainerConfig(image="fake/engine:latest", command=("serve",), ports={"8000": None}),
+    health_path="/health",
+    health_timeout=600.0,
+)
+"""The canned server plan the phase-rate fake backend returns."""
+
+_FAKE_CONTAINER = ContainerResult(exit_code=0, stdout=b"", stderr=b"", container_id="fake")
+"""The canned container outcome the phase-rate fake backend's results carry."""
+
+
+def _phased_result(prefill: float, decode: float) -> ExperimentResult:
+    """A one-run result carrying the given phase rates."""
+    return ExperimentResult(
+        runs=(
+            RunMetrics(
+                tokens_per_second=42.0,
+                requests_per_second=4.0,
+                elapsed_time=2.5,
+                num_prompts=8,
+                raw_json={},
+                prefill_tokens_per_second=prefill,
+                decode_tokens_per_second=decode,
+            ),
+        ),
+        failed_runs=0,
+        target=HardwareTarget.CPU,
+        image=_FAKE_PLAN.container.image,
+        devices=(),
+        raw_result=_FAKE_CONTAINER,
+    )
+
+
+class PhasedSequenceBackend(FakeBackend):
+    """A fake backend returning one preset phase-rate pair per trial.
+
+    Every trial still runs through the real orchestration, objective, and
+    study, so a test can give each sampled point a distinct pair and observe
+    the multi-objective result the sweep builds. The last pair repeats when the
+    study runs more trials than pairs were given.
+    """
+
+    def __init__(self, pairs: Sequence[tuple[float, float]]) -> None:
+        super().__init__(_FAKE_PLAN, _phased_result(*pairs[0]), [])
+        self.pairs = tuple(pairs)
+        self.parses = 0
+
+    def parse_result(
+        self,
+        outcome: BenchmarkOutcome,
+        spec: ServerSpec,
+        result: ContainerResult,
+    ) -> ExperimentResult:
+        super().parse_result(outcome, spec, result)
+        pair = self.pairs[min(self.parses, len(self.pairs) - 1)]
+        self.parses += 1
+        return _phased_result(*pair)
+
+
 _MODEL_CACHE = Path.home() / ".cache" / "huggingface" / "hub" / "models--facebook--opt-125m"
 
 
@@ -159,6 +235,7 @@ def test_two_trial_sweep_returns_a_usable_best_configuration(
         BASE,
         n_trials=_N_TRIALS,
         seed=0,
+        mode=ObjectiveMode.COMBINED,
         backend=backend,
         client=podman_client,
         benchmark_client=BenchmarkClient(),
@@ -197,3 +274,48 @@ def test_two_trial_sweep_returns_a_usable_best_configuration(
     assert recorded["tokens_per_second"] == pytest.approx(
         sum(run["tokens_per_second"] for run in per_run) / len(per_run)
     )
+    assert recorded["prefill_tokens_per_second"] > 0
+    assert recorded["decode_tokens_per_second"] > 0
+
+
+def test_a_fake_backed_multi_sweep_returns_the_front_and_recommends_a_point() -> None:
+    """The multi path runs end to end without a container runtime or an engine.
+
+    The fake backend returns a distinct phase-rate pair per trial, so the real
+    two-direction study builds a real Pareto front, and the recommended point
+    is the front member with the highest weighted-harmonic score under the
+    benchmark's own token mix.
+    """
+    backend = PhasedSequenceBackend(
+        (
+            (1000.0, 50.0),
+            (500.0, 200.0),
+            (400.0, 40.0),
+            (200.0, 500.0),
+        )
+    )
+
+    result = optimize(
+        SPACE,
+        BASE,
+        n_trials=4,
+        seed=0,
+        mode=ObjectiveMode.MULTI,
+        weights=ObjectiveWeights(prefill=_INPUT_LEN, decode=_OUTPUT_LEN),
+        backend=backend,
+        client=FakePodmanClient(),
+    )
+
+    assert list(result.study.directions) == [optuna.study.StudyDirection.MAXIMIZE] * 2
+    assert [trial.values for trial in result.study.trials] == [
+        [1000.0, 50.0],
+        [500.0, 200.0],
+        [400.0, 40.0],
+        [200.0, 500.0],
+    ]
+    # Trial 2's (400, 40) is dominated by trial 0's (1000, 50), so it drops out.
+    assert [solution.trial_number for solution in result.solutions] == [0, 1, 3]
+    assert result.recommended.trial_number == 1
+    assert result.recommended.value == (500.0, 200.0)
+    assert result.best_config is result.recommended.config
+    assert result.best_value == result.recommended.value

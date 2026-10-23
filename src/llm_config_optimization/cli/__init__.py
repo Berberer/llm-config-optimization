@@ -59,6 +59,8 @@ from ..inference.types import (
     InferenceBackend,
 )
 from ..optimization import (
+    ObjectiveMode,
+    ObjectiveWeights,
     OptimizationError,
     OptimizationInterrupted,
     OptimizationResult,
@@ -72,7 +74,7 @@ from ..search_space import (
     validate_space,
 )
 from .arguments import parse_args
-from .config import build_base_config
+from .config import build_base_config, resolve_objective
 from .download import download_model
 from .log import LogReporter
 from .summary import render_summary, write_config
@@ -231,12 +233,13 @@ def _run(
     terminal is a usage error that must fail before any expensive work, and the
     engine next, so an unwired engine or a vLLM-only option paired with
     llama.cpp fails as a usage error before the header is printed or any
-    preparation runs. The base configuration is built after that, so a
-    measurement control outside its valid range is reported as a usage error
-    before the space is loaded, the hardware is probed, or a container is
-    pulled. A caller-supplied backend is used as-is; otherwise the entry's
-    factory builds the selected backend for the duration of the sweep, so
-    resources such as vLLM's compile cache live exactly as long as the run.
+    preparation runs. The base configuration and the objective are resolved
+    after that, so a measurement control outside its valid range or an invalid
+    objective weight is reported as a usage error before the space is loaded,
+    the hardware is probed, or a container is pulled. A caller-supplied backend
+    is used as-is; otherwise the entry's factory builds the selected backend for
+    the duration of the sweep, so resources such as vLLM's compile cache live
+    exactly as long as the run.
     """
     mode = _output_mode(args, out)
     if mode is None:
@@ -254,6 +257,7 @@ def _run(
 
     try:
         base = build_base_config(args)
+        objective_mode, objective_weights = resolve_objective(args, base.benchmark)
     except ValueError as error:
         print(f"error: {error}", file=err)
         return _EXIT_USAGE
@@ -266,6 +270,8 @@ def _run(
                 base,
                 resolved_backend,
                 mode=mode,
+                objective_mode=objective_mode,
+                objective_weights=objective_weights,
                 client=client,
                 benchmark_client=benchmark_client,
                 out=out,
@@ -278,6 +284,8 @@ def _run(
         base,
         backend,
         mode=mode,
+        objective_mode=objective_mode,
+        objective_weights=objective_weights,
         client=client,
         benchmark_client=benchmark_client,
         out=out,
@@ -291,6 +299,8 @@ def _sweep(
     resolved_backend: InferenceBackend,
     *,
     mode: str,
+    objective_mode: ObjectiveMode,
+    objective_weights: ObjectiveWeights | None,
     client: PodmanClient | None,
     benchmark_client: BenchmarkClient | None,
     out: TextIO,
@@ -298,11 +308,12 @@ def _sweep(
 ) -> int:
     """Run the preparation sequence and the sweep, mapping outcomes to exit codes.
 
-    The base configuration was already built and validated by :func:`_run`; the
-    preparation steps run in order and announce themselves, and the sweep is
-    driven through the optimizer with the chosen reporter. Every outcome the
-    plan assigns an exit code to is mapped here; anything else propagates to
-    :func:`main` as an unexpected error.
+    The base configuration and the objective were already resolved and
+    validated by :func:`_run`; the preparation steps run in order and announce
+    themselves, and the sweep is driven through the optimizer with the chosen
+    reporter and objective. Every outcome the plan assigns an exit code to is
+    mapped here; anything else propagates to :func:`main` as an unexpected
+    error.
     """
     try:
         space = _load_space(args.space, resolved_backend, out)
@@ -312,7 +323,7 @@ def _sweep(
         base = replace(base, benchmark=replace(base.benchmark, resolved_path=model))
         _check_model(base, model, resolved_backend, out)
         image = _pull_image(args, hardware.target, resolved_backend, client, out)
-        reporter = _make_reporter(mode, args, out)
+        reporter = _make_reporter(mode, args, out, objective_mode=objective_mode)
         print("preparing study", file=out)
         reporter.start()
         result = optimize(
@@ -321,8 +332,10 @@ def _sweep(
             n_trials=args.n_trials,
             timeout=args.sweep_timeout,
             seed=args.sampler_seed,
+            mode=objective_mode,
+            weights=objective_weights,
             storage=args.storage,
-            study_name=args.study_name or _default_study_name(args.model),
+            study_name=args.study_name or _default_study_name(args.model, objective_mode),
             backend=resolved_backend,
             client=client,
             benchmark_client=benchmark_client,
@@ -521,16 +534,35 @@ def _pull_image(
     return image
 
 
-def _make_reporter(mode: str, args: argparse.Namespace, out: TextIO) -> LogReporter | TuiReporter:
-    """Build the reporter for the resolved mode, writing to ``out``."""
+def _make_reporter(
+    mode: str,
+    args: argparse.Namespace,
+    out: TextIO,
+    *,
+    objective_mode: ObjectiveMode,
+) -> LogReporter | TuiReporter:
+    """Build the reporter for the resolved output mode, writing to ``out``.
+
+    The TUI is told the objective mode because it must choose its view — the
+    prefill-versus-decode scatter or the historical best-so-far line — before
+    the first frame, when its argument-less trial-start hook has no study to
+    read. The log reporter infers the mode from the study on every line.
+    """
     if mode == "tui":
-        return TuiReporter(n_trials=args.n_trials, stream=out)
+        return TuiReporter(n_trials=args.n_trials, mode=objective_mode, stream=out)
     return LogReporter(n_trials=args.n_trials, stream=out)
 
 
-def _default_study_name(model: str) -> str:
-    """Derive a study name from the model, so resuming needs no extra bookkeeping."""
-    return model.replace("/", "_")
+def _default_study_name(model: str, mode: ObjectiveMode) -> str:
+    """Derive a study name from the model and the objective mode.
+
+    The mode is part of the name because a persisted study records the
+    objective that produced its scores and refuses a resume under a different
+    one, so the zero-config path must not collide with a study of the same
+    model scored under another mode. An explicit ``--study-name`` is the
+    user's own choice and is never suffixed.
+    """
+    return f"{model.replace('/', '_')}_{mode.value}"
 
 
 def _finish(
@@ -541,12 +573,13 @@ def _finish(
     image: str,
     out: TextIO,
 ) -> None:
-    """Print the winning-configuration summary and optionally write it to disk.
+    """Print the recommended-configuration summary and optionally write it to disk.
 
     The summary and the file share the resolved target and image, so both name
     the hardware and image that actually ran rather than the ``None`` the
-    optimizer leaves in the reconstructed config.
+    optimizer leaves in the reconstructed config. Both describe the result's
+    recommended point, the one point of the frontier a caller should re-run.
     """
     print(render_summary(result, target=target, image=image), file=out)
     if args.output_config is not None:
-        write_config(args.output_config, result.best_config, target=target, image=image)
+        write_config(args.output_config, result.recommended.config, target=target, image=image)
