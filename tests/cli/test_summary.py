@@ -62,11 +62,14 @@ def result() -> OptimizationResult:
         value=42.0,
         trial_number=3,
     )
+    study = optuna.create_study(direction="maximize")
+    for _ in range(5):
+        study.add_trial(completed_scalar_trial())
     return OptimizationResult(
         solutions=(solution,),
         recommended=solution,
         trial_count=5,
-        study=optuna.create_study(direction="maximize"),
+        study=study,
     )
 
 
@@ -131,8 +134,22 @@ def multi_result() -> OptimizationResult:
     return OptimizationResult(
         solutions=(solutions[2], solutions[0], solutions[1]),
         recommended=solutions[1],
-        trial_count=4,
+        trial_count=3,
         study=study,
+    )
+
+
+def failed_trial() -> optuna.trial.FrozenTrial:
+    """A finished trial whose terminal state is ``FAIL``."""
+    return optuna.trial.create_trial(state=optuna.trial.TrialState.FAIL)
+
+
+def completed_scalar_trial() -> optuna.trial.FrozenTrial:
+    """A finished scalar trial with a value the summary's headline can read."""
+    return optuna.trial.create_trial(
+        state=optuna.trial.TrialState.COMPLETE,
+        value=1.0,
+        distributions={},
     )
 
 
@@ -142,6 +159,45 @@ def test_the_summary_names_the_best_trial_throughput_and_count() -> None:
     assert "best trial: 3" in summary
     assert "best throughput: 42.00 tps" in summary
     assert "trials run: 5" in summary
+
+
+def test_a_clean_summary_reports_zero_failures() -> None:
+    summary = render_summary(result(), target=TARGET, image=IMAGE)
+
+    assert "failed trials: 0/5 (0%)" in summary
+
+
+def test_the_summary_counts_failed_trials_across_the_whole_study() -> None:
+    study = optuna.create_study(direction="maximize")
+    for trial in (completed_scalar_trial(), completed_scalar_trial(), failed_trial()):
+        study.add_trial(trial)
+    summary_result = replace(result(), study=study, trial_count=3)
+
+    summary = render_summary(summary_result, target=TARGET, image=IMAGE)
+
+    assert "failed trials: 1/3 (33%)" in summary
+
+
+def test_the_summary_shows_the_sub_one_percent_floor() -> None:
+    study = optuna.create_study(direction="maximize")
+    for _ in range(199):
+        study.add_trial(completed_scalar_trial())
+    study.add_trial(failed_trial())
+    summary_result = replace(result(), study=study, trial_count=200)
+
+    summary = render_summary(summary_result, target=TARGET, image=IMAGE)
+
+    assert "failed trials: 1/200 (<1%)" in summary
+
+
+def test_a_multi_summary_reports_failed_trials() -> None:
+    result = multi_result()
+    result.study.add_trial(failed_trial())
+    summary_result = replace(result, trial_count=4)
+
+    summary = render_summary(summary_result, target=TARGET, image=IMAGE)
+
+    assert "failed trials: 1/4 (25%)" in summary
 
 
 def test_the_summary_carries_the_winning_configuration() -> None:
@@ -253,7 +309,7 @@ def test_a_multi_summary_names_the_recommended_point_and_the_trial_count() -> No
 
     assert "recommended trial: 1" in summary
     assert "recommended rates: prefill 500.00 tps  decode 200.00 tps" in summary
-    assert "trials run: 4" in summary
+    assert "trials run: 3" in summary
 
 
 def test_a_multi_summary_prints_the_pareto_front_as_a_table() -> None:

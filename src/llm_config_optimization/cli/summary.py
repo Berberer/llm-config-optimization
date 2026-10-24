@@ -8,8 +8,9 @@ The summary follows the objective the study was run under, which its maximize
 directions record: a scalar study prints the best trial and its throughput,
 while a multi-objective study prints the Pareto front as a table — trial
 number, both phase rates, the recorded combined throughput, and a marker on the
-recommended row — under a headline naming the recommended point. Both modes end
-with the recommended configuration.
+recommended row — under a headline naming the recommended point. Both modes
+report how many trials the whole study holds and how many of them failed, then
+end with the recommended configuration.
 
 Both outputs describe the same document, so they cannot disagree. The document
 has the three domains of an experiment:
@@ -42,9 +43,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import optuna
 import yaml
 
 from ..inference.types import BenchmarkConfig, ExperimentConfig, HardwareTarget, LLMConfig
+from ._formatting import failure_text
 
 if TYPE_CHECKING:
     from ..optimization.types import OptimizationResult
@@ -81,11 +84,11 @@ def render_summary(
     definitive record of the objective the stored scores were produced under:
     a multi-objective study gets the Pareto front table, anything else the
     historical single-winner headline. Either way the summary names how many
-    trials the study holds and ends with the recommended point's configuration
-    as the same YAML document :func:`write_config` produces. ``target`` and
-    ``image`` are the values the preparation stage resolved, and replace the
-    ``None`` the optimizer left in the reconstructed config so the printed
-    configuration is explicit.
+    trials the study holds, how many of those failed, and ends with the
+    recommended point's configuration as the same YAML document
+    :func:`write_config` produces. ``target`` and ``image`` are the values the
+    preparation stage resolved, and replace the ``None`` the optimizer left in
+    the reconstructed config so the printed configuration is explicit.
     """
     if len(result.study.directions) > 1:
         return _multi_summary(result, target=target, image=image)
@@ -105,6 +108,7 @@ def _scalar_summary(
         f"best trial: {recommended.trial_number}\n"
         f"best throughput: {recommended.value:.2f} tps\n"
         f"trials run: {result.trial_count}\n"
+        f"{_failure_line(result)}\n"
         f"\nwinning configuration:\n{body}"
     )
 
@@ -130,9 +134,26 @@ def _multi_summary(
         f"recommended trial: {recommended.trial_number}\n"
         f"recommended rates: prefill {prefill} tps  decode {decode} tps\n"
         f"trials run: {result.trial_count}\n"
+        f"{_failure_line(result)}\n"
         f"\npareto front:\n{_front_table(result)}\n"
         f"\nwinning configuration:\n{body}"
     )
+
+
+def _failure_line(result: OptimizationResult) -> str:
+    """Render how many of the study's trials failed, over the whole study.
+
+    The denominator is the same whole-study count as ``trials run``, so a
+    resumed sweep's summary covers every trial it holds rather than only the
+    ones the last invocation added. Failures are the trials whose terminal state
+    is ``FAIL``; pruned trials and a successful run's ``failed_runs`` field are
+    different signals and are not counted. The percentage uses the shared
+    formatting rule, including its ``<1%`` floor.
+    """
+    failed = sum(1 for trial in result.study.trials if trial.state is optuna.trial.TrialState.FAIL)
+    finished = len(result.study.trials)
+    rate = failure_text(failed, finished) or "0%"
+    return f"failed trials: {failed}/{finished} ({rate})"
 
 
 def _front_table(result: OptimizationResult) -> str:

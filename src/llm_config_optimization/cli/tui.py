@@ -21,10 +21,15 @@ reason as the scalar best line.
 A failed trial contributes no raw point in either view but still counts toward
 the trial budget, so the scalar best-so-far line spans the gap and the scatter
 simply has one fewer point. A status line under the graph repeats the headline
-numbers — trial count against the budget, the best value or the two best phase
-rates, mean seconds per successful trial, and elapsed time — so they can be read
-without parsing the plot. The average is omitted until a trial succeeds, and
-failed trials do not contribute to it.
+numbers — trial count against the budget, the share of finished trials that
+failed, the best value or the two best phase rates, mean seconds per successful
+trial, and elapsed time — so they can be read without parsing the plot. The
+failure share counts only the trials finished in this invocation, so a resumed
+study's earlier failures do not distort the current run's health; it is omitted
+entirely while no trial has finished. Its top-level segments are separated by
+the shared live separator ``" | "``, while the phase-rate pair inside the best
+segment keeps its internal double-space separation. The average is omitted
+until a trial succeeds, and failed trials do not contribute to it.
 
 A frame is drawn at the start of each trial as well as when it finishes: the
 optimizer's trial-start hook calls :meth:`TuiReporter.trial_started`, which
@@ -56,6 +61,7 @@ from typing import TYPE_CHECKING, TextIO
 import plotext
 
 from ..optimization import ObjectiveMode
+from ._formatting import LIVE_SEPARATOR, failure_text
 
 if TYPE_CHECKING:
     import optuna
@@ -271,7 +277,10 @@ class TuiReporter:
         An all-failed (or empty) sweep has nothing to plot, so only the axes
         are drawn. ``durations`` are the successful trials' seconds, averaged
         into the status line, and ``running`` is the trial in flight for a
-        running frame, or ``None`` once it has finished.
+        running frame, or ``None`` once it has finished. The failure share is
+        derived from the ``None`` entries in the mode's own series, so it counts
+        the trials finished in this invocation, including the one being
+        rendered.
         """
         figure = plotext.figure
         figure.clear()
@@ -295,6 +304,7 @@ class TuiReporter:
             x_values = [*raw_x, *front_x]
             best_text = "n/a" if rates is None else _rates_text(*rates)
             completed = len(pairs)
+            failed = sum(pair is None for pair in pairs)
         else:
             x = list(range(1, len(values) + 1))
             best_x, best_y = _points(x, best)
@@ -314,6 +324,7 @@ class TuiReporter:
             last_best = best[-1] if best else None
             best_text = "n/a" if last_best is None else f"{last_best:.2f} tps"
             completed = len(values)
+            failed = sum(value is None for value in values)
         if y_values:
             figure.legend(True)
             positions, labels = _axis_ticks(y_values)
@@ -324,30 +335,44 @@ class TuiReporter:
         average = sum(durations) / len(durations) if durations else None
         return (
             f"{graph}\n"
-            f"{self._status(completed, best_text=best_text, running=running, average=average)}"
+            f"{self._status(completed, failed=failed, best_text=best_text, running=running, average=average)}"
         )
 
     def _status(
         self,
         completed: int,
         *,
+        failed: int = 0,
         best_text: str,
         running: int | None = None,
         average: float | None = None,
     ) -> str:
-        """Render the line under the graph: count, best text, average, and elapsed time.
+        """Render the line under the graph: count, failure share, best, average, and elapsed.
 
         ``best_text`` is already formatted for the mode — one value in the
         scalar view, both phase rates in the multi view — and ``running`` is the
         trial currently in flight, or ``None`` once it has finished;
         ``average`` is the mean seconds per successful trial, or ``None`` until
-        one has completed. The running frame and the completion frame share this
-        format and differ only by those fields.
+        one has completed. ``failed`` is the number of failed trials among the
+        ``completed`` finished in this invocation, and is omitted along with the
+        failure segment while nothing has finished. Top-level segments are
+        joined by the shared live separator, and the running and average
+        segments are omitted when their field has no value. The running frame
+        and the completion frame share this format and differ only by those
+        fields.
         """
         progress = f"{completed}/{self._budget}" if self._budget is not None else str(completed)
-        running_text = "" if running is None else f"  running trial {running}"
-        average_text = "" if average is None else f"  avg trial {average:.1f}s"
-        return f"trials {progress}{running_text}  best {best_text}{average_text}  ({self._elapsed():.1f}s)"
+        segments = [f"trials {progress}"]
+        failure = failure_text(failed, completed)
+        if failure is not None:
+            segments.append(f"failed {failure}")
+        if running is not None:
+            segments.append(f"running trial {running}")
+        segments.append(f"best {best_text}")
+        if average is not None:
+            segments.append(f"avg trial {average:.1f}s")
+        segments.append(f"({self._elapsed():.1f}s)")
+        return LIVE_SEPARATOR.join(segments)
 
     def _elapsed(self) -> float:
         """Return the seconds elapsed since the reporter's clock started."""

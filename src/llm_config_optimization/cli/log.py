@@ -9,23 +9,32 @@ line per finished trial, so a redirected log stays easy to parse.
 
 A scalar trial's line is::
 
-    trial <i>/<N>  <STATE>  <tps> tps  [prefill <p> tps  decode <d> tps ] best <best>  (<elapsed>)
+    trial <i>/<N> | <STATE> | <tps> tps  [prefill <p> tps  decode <d> tps ] | failed <pct>% | best <best> | (<elapsed>)
 
 where ``<i>`` counts the trials finished in this invocation, ``<N>`` is the
 trial budget and is omitted when the sweep is unbounded, ``<STATE>`` is the
 trial's terminal state, ``<tps>`` is the objective value the trial submitted,
+``<pct>`` is the share of this invocation's finished trials that failed,
 ``<best>`` is the best objective value the study holds so far (``n/a`` until a
 trial completes), and ``<elapsed>`` is the wall-clock time since the reporter
-started. The phase rates are the engine-reported prefill and decode
-tokens-per-second the optimizer recorded on the trial; they appear as a pair
-when the engine reported both and are omitted — keeping the historical line —
-when it did not.
+started. Top-level segments are separated by the shared live separator
+``" | "``; the phase rates are the engine-reported prefill and decode
+tokens-per-second the optimizer recorded on the trial and form one segment when
+the engine reported both, keeping their internal double-space separation. They
+are omitted — keeping the historical outcome — when only one was reported.
+
+The failure rate counts the trials whose terminal state is ``FAIL`` and only
+those finished in this invocation, so a resumed study does not report an
+earlier run's failures as the current run's health. The current trial's own
+state is included on its line, so a first-trial failure immediately reads
+``failed 100%``. The rate uses the shared whole-percent format, including its
+``<1%`` floor for a small but real failure rate.
 
 A multi-objective study has no single objective value, so the line names the
 trial's two rates instead and its best column reports the highest rate reached
 in each phase::
 
-    trial <i>/<N>  <STATE>  prefill <p> tps  decode <d> tps  best prefill <bp> tps  decode <bd> tps  (<elapsed>)
+    trial <i>/<N> | <STATE> | prefill <p> tps  decode <d> tps | failed <pct>% | best prefill <bp> tps  decode <bd> tps | (<elapsed>)
 
 A failed trial prints the message the optimizer recorded under the trial's
 ``error`` user attribute in place of the value and phase columns, so one bad
@@ -41,10 +50,11 @@ trial index.
 import sys
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, TextIO
+from typing import TextIO
 
-if TYPE_CHECKING:
-    import optuna
+import optuna
+
+from llm_config_optimization.cli._formatting import LIVE_SEPARATOR, failure_text
 
 __all__ = ["LogReporter"]
 
@@ -65,10 +75,11 @@ class LogReporter:
     """Print one line per finished trial, with best-so-far and elapsed time.
 
     The reporter is a callable matching the optimizer's per-trial callback, so
-    it is passed straight through as ``callback``. It tracks two things across
+    it is passed straight through as ``callback``. It tracks three things across
     calls: the number of trials finished in this invocation, which numbers the
-    lines, and the start time used for the elapsed column. The best-so-far value
-    is read from the study on every line rather than remembered here — the best
+    lines, how many of those failed, which feeds the ``failed <pct>%`` segment,
+    and the start time used for the elapsed column. The best-so-far value is
+    read from the study on every line rather than remembered here — the best
     objective in a scalar study, the highest rate of each phase in a
     multi-objective one — so a resumed study reflects the best an earlier run
     found.
@@ -91,6 +102,7 @@ class LogReporter:
         self._clock = clock
         self._started_at = clock()
         self._completed = 0
+        self._failed = 0
 
     def start(self) -> None:
         """Restart the elapsed-time clock, e.g. when the sweep actually begins.
@@ -109,20 +121,40 @@ class LogReporter:
         the lines already printed.
         """
         index = self._completed + 1
+        failed = self._failed + (1 if _is_failed(trial) else 0)
         progress = f"{index}/{self._budget}" if self._budget is not None else str(index)
-        return (
-            f"trial {progress}  {trial.state.name}  {_outcome(trial)}"
-            f"  best {_best_text(study)}  ({self._elapsed():.1f}s)"
+        rate = failure_text(failed, index) or "0%"
+        return LIVE_SEPARATOR.join(
+            (
+                f"trial {progress}",
+                trial.state.name,
+                _outcome(trial),
+                f"failed {rate}",
+                f"best {_best_text(study)}",
+                f"({self._elapsed():.1f}s)",
+            )
         )
 
     def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        """Print the trial's line and advance the index by one."""
+        """Print the trial's line and advance the index and failure count."""
         print(self.render(study, trial), file=self._stream)
         self._completed += 1
+        if _is_failed(trial):
+            self._failed += 1
 
     def _elapsed(self) -> float:
         """Return the seconds elapsed since the reporter's clock started."""
         return self._clock() - self._started_at
+
+
+def _is_failed(trial: optuna.trial.FrozenTrial) -> bool:
+    """Return whether the trial's terminal state is ``FAIL``.
+
+    Only ``FAIL`` counts toward the failure rate. This project does not prune,
+    and a successful trial's run-level ``failed_runs`` is a different signal, so
+    neither is conflated with a failed trial.
+    """
+    return trial.state is optuna.trial.TrialState.FAIL
 
 
 def _best_value(study: optuna.Study) -> float | None:

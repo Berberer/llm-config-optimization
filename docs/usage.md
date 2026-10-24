@@ -300,7 +300,7 @@ line with the raw per-trial points. The running frame's status line marks the
 trial as in flight, so a long trial is visibly running rather than frozen:
 
 ```
-trials 3/10  running trial 3  best prefill 1234.56 tps  decode 45.67 tps  avg trial 12.3s  (36.9s)
+trials 3/10 | failed 0% | running trial 3 | best prefill 1234.56 tps  decode 45.67 tps | avg trial 12.3s | (36.9s)
 ```
 
 `running trial` appears only while a trial is in flight, and `avg trial` — the
@@ -315,7 +315,7 @@ a redirected log stays easy to parse. A multi-mode line names the trial's two
 rates, and its best column reports the highest rate reached in each phase:
 
 ```
-trial 3/10  COMPLETE  prefill 1234.56 tps  decode 45.67 tps  best prefill 1234.56 tps  decode 45.67 tps  (36.9s)
+trial 3/10 | COMPLETE | prefill 1234.56 tps  decode 45.67 tps | failed 0% | best prefill 1234.56 tps  decode 45.67 tps | (36.9s)
 ```
 
 A scalar line keeps the historical objective value and appends the measured
@@ -323,12 +323,37 @@ phase pair when the engine reported both, so the phase split is visible without
 changing the familiar shape:
 
 ```
-trial 3/10  COMPLETE  42.00 tps  prefill 1234.56 tps  decode 45.67 tps  best 42.00  (36.9s)
+trial 3/10 | COMPLETE | 42.00 tps  prefill 1234.56 tps  decode 45.67 tps | failed 0% | best 42.00 | (36.9s)
 ```
 
+A failed trial replaces the value and phase columns with the error message the
+optimizer recorded, collapsed to one line, so one bad configuration is visible
+without ending the sweep:
+
+```
+trial 3/10 | FAIL | container exited with code 1 | failed 33% | best 42.00 | (36.9s)
+```
+
+Both live modes join their top-level fields with ` | ` so the fields stay
+distinct; inner pairs such as the `prefill …  decode …` rates keep their
+spacing. The `failed` segment is the share of trials that failed among those
+finished in **this invocation** (not across a resumed study's earlier trials),
+and the trial being reported is already included, so a first-trial failure
+reads `failed 100%`. The TUI shows the same segment once at least one trial has
+finished — it is absent from the frame drawn before the first trial. `failed`
+counts only `FAIL` trials; pruned trials and individual failed benchmark runs
+are different signals and are not counted. Percentages are whole numbers, and a
+nonzero rate that would round to zero is shown as `<1%` rather than `0%`, so a
+small but real failure rate is never hidden.
+
 The sweep's final summary prints the recommended configuration as the same YAML
-document `--output-config` writes. In multi mode it also prints the Pareto front
-as a table — trial number, both phase rates, the trial's recorded combined
+document `--output-config` writes. It also reports how many of the study's
+trials failed, as `failed trials: n/m (pct)` directly after `trials run`: the
+denominator `m` is the same whole-study count, so a resumed sweep's summary
+covers every trial the study holds rather than only this invocation's, unlike
+the live failure segment. The percentage uses the same whole-percent format,
+including its `<1%` floor. In multi mode the summary also prints the Pareto
+front as a table — trial number, both phase rates, the trial's recorded combined
 throughput, and the recommended row marked — so the whole trade-off can be
 compared at a glance.
 

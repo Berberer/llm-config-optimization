@@ -131,7 +131,9 @@ def test_a_frame_plots_both_series_with_a_status_line() -> None:
     assert "tps" in graph_body(frame)
     assert "best" in graph_body(frame)
     assert "trials" in graph_body(frame)
-    assert status_line(frame) == "trials 1/10  best 42.00 tps  avg trial 0.0s  (0.0s)"
+    assert (
+        status_line(frame) == "trials 1/10 | failed 0% | best 42.00 tps | avg trial 0.0s | (0.0s)"
+    )
 
 
 def test_the_status_line_reports_count_best_and_elapsed() -> None:
@@ -142,7 +144,7 @@ def test_the_status_line_reports_count_best_and_elapsed() -> None:
     clock.now = 3.5
 
     assert status_line(reporter.render(study, trial)) == (
-        "trials 1/10  best 42.00 tps  avg trial 3.5s  (3.5s)"
+        "trials 1/10 | failed 0% | best 42.00 tps | avg trial 3.5s | (3.5s)"
     )
 
 
@@ -157,7 +159,7 @@ def test_the_average_is_omitted_until_a_trial_succeeds() -> None:
     status = status_line(reporter.render(study, trial))
 
     assert "avg" not in status
-    assert status == "trials 1/10  best n/a  (5.0s)"
+    assert status == "trials 1/10 | failed 100% | best n/a | (5.0s)"
 
 
 def test_failed_trials_do_not_contribute_to_the_average() -> None:
@@ -176,7 +178,8 @@ def test_failed_trials_do_not_contribute_to_the_average() -> None:
     reporter(study, bad)
 
     assert (
-        status_line(stream.getvalue()) == "trials 2/10  best 50.00 tps  avg trial 10.0s  (100.0s)"
+        status_line(stream.getvalue())
+        == "trials 2/10 | failed 50% | best 50.00 tps | avg trial 10.0s | (100.0s)"
     )
 
 
@@ -192,7 +195,10 @@ def test_the_average_is_the_mean_of_successful_trial_durations() -> None:
         clock.now += elapsed
         reporter(study, trial)
 
-    assert status_line(stream.getvalue()) == "trials 2/10  best 50.00 tps  avg trial 15.0s  (30.0s)"
+    assert (
+        status_line(stream.getvalue())
+        == "trials 2/10 | failed 0% | best 50.00 tps | avg trial 15.0s | (30.0s)"
+    )
 
 
 def test_an_unbounded_sweep_omits_the_denominator() -> None:
@@ -201,7 +207,7 @@ def test_an_unbounded_sweep_omits_the_denominator() -> None:
     study = study_with(trial)
 
     assert status_line(reporter.render(study, trial)) == (
-        "trials 1  best 42.00 tps  avg trial 0.0s  (0.0s)"
+        "trials 1 | failed 0% | best 42.00 tps | avg trial 0.0s | (0.0s)"
     )
 
 
@@ -215,7 +221,9 @@ def test_a_failed_trial_advances_the_axis_with_the_best_carried_forward() -> Non
 
     frame = reporter.render(study, bad)
 
-    assert status_line(frame) == "trials 2/10  best 50.00 tps  avg trial 0.0s  (0.0s)"
+    assert (
+        status_line(frame) == "trials 2/10 | failed 50% | best 50.00 tps | avg trial 0.0s | (0.0s)"
+    )
     assert "best" in graph_body(frame)
 
 
@@ -226,8 +234,46 @@ def test_a_study_with_no_completed_trial_plots_no_best_line() -> None:
 
     frame = reporter.render(study, trial)
 
-    assert status_line(frame) == "trials 1/10  best n/a  (0.0s)"
+    assert status_line(frame) == "trials 1/10 | failed 100% | best n/a | (0.0s)"
     assert "best" not in graph_body(frame)
+
+
+def test_the_failure_share_rounds_a_mixed_sweep() -> None:
+    stream = io.StringIO()
+    reporter = TuiReporter(n_trials=10, stream=stream, clock=FakeClock())
+    study = optuna.create_study(direction="maximize")
+    for trial in (completed_trial(50.0), failed_trial("oom"), completed_trial(60.0)):
+        study.add_trial(trial)
+        reporter(study, trial)
+
+    assert (
+        status_line(stream.getvalue())
+        == "trials 3/10 | failed 33% | best 60.00 tps | avg trial 0.0s | (0.0s)"
+    )
+
+
+def test_the_failure_share_counts_only_this_invocations_trials() -> None:
+    """A resumed study's earlier failures must not distort the current run."""
+    earlier = failed_trial("oom")
+    trial = completed_trial(42.0)
+    study = study_with(earlier, trial)
+    reporter = TuiReporter(n_trials=10, clock=FakeClock())
+
+    frame = reporter.render(study, trial)
+
+    assert (
+        status_line(frame) == "trials 1/10 | failed 0% | best 42.00 tps | avg trial 0.0s | (0.0s)"
+    )
+
+
+def test_the_pre_first_trial_frame_omits_the_failure_share() -> None:
+    """Nothing has finished, so there is no rate to report yet."""
+    stream = io.StringIO()
+    reporter = TuiReporter(n_trials=10, stream=stream, clock=FakeClock())
+
+    reporter.trial_started()
+
+    assert "failed" not in status_line(stream.getvalue())
 
 
 def test_start_announces_preparation_without_drawing_a_frame() -> None:
@@ -251,7 +297,7 @@ def test_the_running_frame_marks_the_trial_in_flight() -> None:
 
     frame = stream.getvalue()
     assert "tokens per second" in graph_body(frame)
-    assert status_line(frame) == "trials 0/10  running trial 1  best n/a  (0.0s)"
+    assert status_line(frame) == "trials 0/10 | running trial 1 | best n/a | (0.0s)"
 
 
 def test_the_running_frame_keeps_the_summary_columns() -> None:
@@ -270,7 +316,7 @@ def test_the_running_frame_keeps_the_summary_columns() -> None:
     reporter.trial_started()
 
     assert status_line(stream.getvalue()) == (
-        "trials 1/10  running trial 2  best 42.00 tps  avg trial 10.0s  (12.0s)"
+        "trials 1/10 | failed 0% | running trial 2 | best 42.00 tps | avg trial 10.0s | (12.0s)"
     )
 
 
@@ -288,7 +334,9 @@ def test_the_first_completed_trial_draws_the_graph() -> None:
 
     frame = stream.getvalue()
     assert "tokens per second" in graph_body(frame)
-    assert status_line(frame) == "trials 1/10  best 42.00 tps  avg trial 0.0s  (0.0s)"
+    assert (
+        status_line(frame) == "trials 1/10 | failed 0% | best 42.00 tps | avg trial 0.0s | (0.0s)"
+    )
 
 
 def test_a_short_sweep_ticks_every_integer_trial() -> None:
@@ -329,7 +377,10 @@ def test_start_resets_the_series_so_a_restart_does_not_replay_points() -> None:
 
     reporter(study, good)
 
-    assert status_line(stream.getvalue()) == "trials 1/10  best 50.00 tps  avg trial 0.0s  (0.0s)"
+    assert (
+        status_line(stream.getvalue())
+        == "trials 1/10 | failed 0% | best 50.00 tps | avg trial 0.0s | (0.0s)"
+    )
 
 
 def test_a_multi_frame_draws_the_trade_off_with_the_front_highlighted() -> None:
@@ -346,7 +397,7 @@ def test_a_multi_frame_draws_the_trade_off_with_the_front_highlighted() -> None:
     assert "front" in graph
     assert "trials" in graph
     assert status_line(frame) == (
-        "trials 1/10  best prefill 1200.00 tps  decode 50.00 tps  avg trial 0.0s  (0.0s)"
+        "trials 1/10 | failed 0% | best prefill 1200.00 tps  decode 50.00 tps | avg trial 0.0s | (0.0s)"
     )
 
 
@@ -360,7 +411,7 @@ def test_the_multi_status_reports_the_best_rate_of_each_phase() -> None:
     frame = reporter.render(study, high_decode)
 
     assert status_line(frame) == (
-        "trials 1/10  best prefill 1200.00 tps  decode 90.00 tps  avg trial 0.0s  (0.0s)"
+        "trials 1/10 | failed 0% | best prefill 1200.00 tps  decode 90.00 tps | avg trial 0.0s | (0.0s)"
     )
 
 
@@ -378,7 +429,7 @@ def test_a_failed_multi_trial_keeps_the_front_and_the_best_rates() -> None:
 
     assert "front" in graph_body(frame)
     assert status_line(frame) == (
-        "trials 2/10  best prefill 1000.00 tps  decode 40.00 tps  avg trial 0.0s  (0.0s)"
+        "trials 2/10 | failed 50% | best prefill 1000.00 tps  decode 40.00 tps | avg trial 0.0s | (0.0s)"
     )
 
 
@@ -389,7 +440,7 @@ def test_a_multi_study_with_no_completed_trial_plots_no_front() -> None:
 
     frame = reporter.render(study, failed)
 
-    assert status_line(frame) == "trials 1/10  best n/a  (0.0s)"
+    assert status_line(frame) == "trials 1/10 | failed 100% | best n/a | (0.0s)"
     assert "front" not in graph_body(frame)
 
 
@@ -411,8 +462,8 @@ def test_the_running_multi_frame_keeps_the_front_and_the_best_rates() -> None:
     frame = stream.getvalue()
     assert "front" in graph_body(frame)
     assert status_line(frame) == (
-        "trials 1/10  running trial 2  best prefill 1200.00 tps  decode 50.00 tps"
-        "  avg trial 10.0s  (12.0s)"
+        "trials 1/10 | failed 0% | running trial 2 | best prefill 1200.00 tps  decode 50.00 tps"
+        " | avg trial 10.0s | (12.0s)"
     )
 
 
@@ -426,7 +477,9 @@ def test_a_scalar_mode_keeps_the_historical_line_plot() -> None:
 
     assert "tokens per second" in graph_body(frame)
     assert "front" not in graph_body(frame)
-    assert status_line(frame) == "trials 1/10  best 42.00 tps  avg trial 0.0s  (0.0s)"
+    assert (
+        status_line(frame) == "trials 1/10 | failed 0% | best 42.00 tps | avg trial 0.0s | (0.0s)"
+    )
 
 
 def test_start_resets_the_multi_series_so_a_restart_does_not_replay_points() -> None:
@@ -442,7 +495,7 @@ def test_start_resets_the_multi_series_so_a_restart_does_not_replay_points() -> 
     reporter(study, trial)
 
     assert status_line(stream.getvalue()) == (
-        "trials 1/10  best prefill 1200.00 tps  decode 50.00 tps  avg trial 0.0s  (0.0s)"
+        "trials 1/10 | failed 0% | best prefill 1200.00 tps  decode 50.00 tps | avg trial 0.0s | (0.0s)"
     )
 
 

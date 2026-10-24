@@ -169,8 +169,8 @@ def test_two_trial_cpu_sweep_reports_progress_and_writes_the_winner(
     assert f"model: {model}" in stdout
     assert "resolved target: cpu" in stdout
     assert f"pulling container image: {vllm_cpu_image}" in stdout
-    assert f"trial 1/{_N_TRIALS}  COMPLETE" in stdout
-    assert f"trial 2/{_N_TRIALS}  COMPLETE" in stdout
+    assert f"trial 1/{_N_TRIALS} | COMPLETE" in stdout
+    assert f"trial 2/{_N_TRIALS} | COMPLETE" in stdout
     assert "best throughput:" in stdout
     assert "winning configuration:" in stdout
 

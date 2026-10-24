@@ -98,7 +98,10 @@ def test_a_successful_trial_renders_the_documented_line() -> None:
     study = study_with(trial)
     clock.now = 3.5
 
-    assert reporter.render(study, trial) == "trial 1/10  COMPLETE  42.00 tps  best 42.00  (3.5s)"
+    assert (
+        reporter.render(study, trial)
+        == "trial 1/10 | COMPLETE | 42.00 tps | failed 0% | best 42.00 | (3.5s)"
+    )
 
 
 def test_a_scalar_trial_with_recorded_phase_rates_shows_both_on_the_line() -> None:
@@ -107,7 +110,7 @@ def test_a_scalar_trial_with_recorded_phase_rates_shows_both_on_the_line() -> No
     study = study_with(trial)
 
     assert reporter.render(study, trial) == (
-        "trial 1/10  COMPLETE  42.00 tps  prefill 1200.00 tps  decode 50.00 tps  best 42.00  (0.0s)"
+        "trial 1/10 | COMPLETE | 42.00 tps  prefill 1200.00 tps  decode 50.00 tps | failed 0% | best 42.00 | (0.0s)"
     )
 
 
@@ -117,7 +120,10 @@ def test_a_scalar_trial_with_only_one_phase_rate_keeps_the_historical_line() -> 
     trial = completed_trial(42.0, prefill=1200.0)
     study = study_with(trial)
 
-    assert reporter.render(study, trial) == "trial 1/10  COMPLETE  42.00 tps  best 42.00  (0.0s)"
+    assert (
+        reporter.render(study, trial)
+        == "trial 1/10 | COMPLETE | 42.00 tps | failed 0% | best 42.00 | (0.0s)"
+    )
 
 
 def test_an_unbounded_sweep_omits_the_denominator() -> None:
@@ -125,7 +131,10 @@ def test_an_unbounded_sweep_omits_the_denominator() -> None:
     trial = completed_trial(42.0)
     study = study_with(trial)
 
-    assert reporter.render(study, trial) == "trial 1  COMPLETE  42.00 tps  best 42.00  (0.0s)"
+    assert (
+        reporter.render(study, trial)
+        == "trial 1 | COMPLETE | 42.00 tps | failed 0% | best 42.00 | (0.0s)"
+    )
 
 
 def test_a_failed_trial_prints_its_recorded_error_in_place_of_throughput() -> None:
@@ -135,7 +144,7 @@ def test_a_failed_trial_prints_its_recorded_error_in_place_of_throughput() -> No
 
     line = reporter.render(study, trial)
 
-    assert line == "trial 1/10  FAIL  simulated out-of-memory  best n/a  (0.0s)"
+    assert line == "trial 1/10 | FAIL | simulated out-of-memory | failed 100% | best n/a | (0.0s)"
 
 
 def test_a_multiline_error_is_collapsed_to_a_single_line() -> None:
@@ -147,7 +156,7 @@ def test_a_multiline_error_is_collapsed_to_a_single_line() -> None:
     line = reporter.render(study, trial)
 
     assert line == (
-        "trial 1/10  FAIL  container exited with code 1 AssertionError: boom  best n/a  (0.0s)"
+        "trial 1/10 | FAIL | container exited with code 1 AssertionError: boom | failed 100% | best n/a | (0.0s)"
     )
 
 
@@ -158,7 +167,7 @@ def test_a_failure_without_a_recorded_message_uses_a_placeholder() -> None:
 
     line = reporter.render(study, trial)
 
-    assert "  no result  " in line
+    assert "| no result | failed 100% |" in line
     assert "best n/a" in line
 
 
@@ -168,8 +177,8 @@ def test_a_multi_trial_renders_both_objectives_as_phase_rates() -> None:
     study = multi_study_with(trial)
 
     assert reporter.render(study, trial) == (
-        "trial 1/10  COMPLETE  prefill 1200.00 tps  decode 50.00 tps"
-        "  best prefill 1200.00 tps  decode 50.00 tps  (0.0s)"
+        "trial 1/10 | COMPLETE | prefill 1200.00 tps  decode 50.00 tps"
+        " | failed 0% | best prefill 1200.00 tps  decode 50.00 tps | (0.0s)"
     )
 
 
@@ -190,8 +199,8 @@ def test_a_failed_multi_trial_still_reports_its_error_and_the_best_rates() -> No
     reporter = LogReporter(n_trials=10, clock=FakeClock())
 
     assert reporter.render(study, failed) == (
-        "trial 1/10  FAIL  simulated out-of-memory"
-        "  best prefill 1000.00 tps  decode 40.00 tps  (0.0s)"
+        "trial 1/10 | FAIL | simulated out-of-memory"
+        " | failed 100% | best prefill 1000.00 tps  decode 40.00 tps | (0.0s)"
     )
 
 
@@ -202,7 +211,7 @@ def test_a_multi_study_without_a_completed_trial_has_no_best() -> None:
 
     line = reporter.render(study, failed)
 
-    assert "  simulated out-of-memory  best n/a  " in line
+    assert "| simulated out-of-memory | failed 100% | best n/a |" in line
 
 
 def test_best_so_far_is_read_from_the_study_so_a_resumed_sweep_reflects_it() -> None:
@@ -227,8 +236,8 @@ def test_calling_the_reporter_writes_each_line_and_advances_the_index() -> None:
     reporter(study, second)
 
     assert stream.getvalue().splitlines() == [
-        "trial 1/2  COMPLETE  10.00 tps  best 10.00  (0.0s)",
-        "trial 2/2  COMPLETE  20.00 tps  best 20.00  (1.0s)",
+        "trial 1/2 | COMPLETE | 10.00 tps | failed 0% | best 10.00 | (0.0s)",
+        "trial 2/2 | COMPLETE | 20.00 tps | failed 0% | best 20.00 | (1.0s)",
     ]
 
 
@@ -242,3 +251,61 @@ def test_start_restarts_the_elapsed_clock() -> None:
     clock.now = 7.0
 
     assert "(2.0s)" in reporter.render(study, trial)
+
+
+def test_a_mixed_sweep_reports_failures_against_all_finished_trials() -> None:
+    """The denominator is every trial finished in the invocation, not only wins."""
+    stream = io.StringIO()
+    reporter = LogReporter(n_trials=3, stream=stream, clock=FakeClock())
+    study = optuna.create_study(direction="maximize")
+    trials = [failed_trial("boom"), completed_trial(10.0), completed_trial(20.0)]
+    for trial in trials:
+        study.add_trial(trial)
+        reporter(study, trial)
+
+    assert [line.split(" | ")[3] for line in stream.getvalue().splitlines()] == [
+        "failed 100%",
+        "failed 50%",
+        "failed 33%",
+    ]
+
+
+def test_a_small_failure_rate_uses_the_shared_floor_rather_than_zero() -> None:
+    stream = io.StringIO()
+    reporter = LogReporter(n_trials=200, stream=stream, clock=FakeClock())
+    study = optuna.create_study(direction="maximize")
+    first = failed_trial("boom")
+    study.add_trial(first)
+    reporter(study, first)
+    for _ in range(199):
+        trial = completed_trial(10.0)
+        study.add_trial(trial)
+        reporter(study, trial)
+
+    assert "failed <1%" in stream.getvalue().splitlines()[-1]
+
+
+def test_a_resumed_study_excludes_earlier_failures_from_the_invocation_rate() -> None:
+    """A fresh reporter starts its failure count at zero for the current run."""
+    prior_failure = failed_trial("earlier run")
+    prior_success = completed_trial(50.0)
+    current = completed_trial(42.0)
+    study = study_with(prior_failure, prior_success, current)
+    reporter = LogReporter(n_trials=10, clock=FakeClock())
+
+    assert " | failed 0% | " in reporter.render(study, current)
+
+
+def test_a_mixed_multi_objective_sweep_reports_the_failure_rate_on_each_line() -> None:
+    stream = io.StringIO()
+    reporter = LogReporter(n_trials=2, stream=stream, clock=FakeClock())
+    study = optuna.create_study(directions=["maximize", "maximize"])
+    failed = failed_trial("boom")
+    completed = completed_multi_trial(1200.0, 50.0)
+    for trial in (failed, completed):
+        study.add_trial(trial)
+        reporter(study, trial)
+
+    lines = stream.getvalue().splitlines()
+    assert "failed 100%" in lines[0]
+    assert "failed 50%" in lines[1]

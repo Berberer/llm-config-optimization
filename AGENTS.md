@@ -18,7 +18,7 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
 | `inference/`    | Engine-neutral experiment surface (the `InferenceBackend` protocol, `ServerSpec`, and the optional phase-rate metrics) plus the vLLM and llama.cpp backends, the host benchmark client with its Prometheus snapshots, and hardware detection | `types.py`, `_orchestrate.py`, `_benchmark.py`, `_vllm.py`, `_llamacpp.py`, `hardware.py` |
 | `runtime/`      | Backend-agnostic container types, the detached start/stop lifecycle, the Podman client, and the SELinux probe | `types.py`, `_podman.py`, `_selinux.py` |
 | `optimization/` | The engine-neutral objective model plus the Optuna adapter: maps spec kinds to suggestions, scores trials, drives a study, and guards study provenance | `types.py`, `_optuna.py` |
-| `cli/`          | Composition root: argument parsing, the engine registry, base-config construction, model download progress, log/TUI reporters, summary/writer, exit codes | `arguments.py`, `config.py`, `download.py`, `log.py`, `tui.py`, `summary.py`, `__init__.py` |
+| `cli/`          | Composition root: argument parsing, the engine registry, base-config construction, model download progress, log/TUI reporters, summary/writer, exit codes | `arguments.py`, `config.py`, `download.py`, `_formatting.py`, `log.py`, `tui.py`, `summary.py`, `__init__.py` |
 
 ### Invariants
 
