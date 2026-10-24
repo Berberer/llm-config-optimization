@@ -24,7 +24,11 @@ from pathlib import Path
 from types import MappingProxyType
 
 from ..runtime.types import ContainerConfig, ContainerResult, Mount
-from ..search_space.registry import TUNABLE_PARAMETERS
+from ..search_space.registry import (
+    SPECULATIVE_PARAMETERS,
+    TUNABLE_PARAMETERS,
+    speculative_configured,
+)
 from ..search_space.types import (
     Categorical,
     Default,
@@ -32,10 +36,10 @@ from ..search_space.types import (
     ExperimentSpace,
     Fixed,
     Interval,
-    ParameterValue,
     Spec,
 )
 from ._benchmark import _METRICS_AFTER_KEY, _METRICS_BEFORE_KEY, _METRICS_KEY
+from ._tunables import Gate, declared_values, translate_value, unsupported_values
 from .types import (
     AttentionBackend,
     BenchmarkOutcome,
@@ -53,6 +57,8 @@ from .types import (
     QuantizationMethod,
     RunMetrics,
     ServerSpec,
+    SpeculativeMethod,
+    SpeculativeMode,
 )
 
 
@@ -81,7 +87,7 @@ class JsonGroup:
     key: str
 
 
-ParameterTarget = FlatFlag | JsonGroup
+ParameterTarget = FlatFlag | JsonGroup | Gate
 
 
 PARAMETER_TARGETS: Mapping[str, ParameterTarget] = MappingProxyType(
@@ -98,14 +104,21 @@ PARAMETER_TARGETS: Mapping[str, ParameterTarget] = MappingProxyType(
         # Routed through the JSON group form on purpose, to exercise the JSON
         # path end to end; vLLM also exposes an equivalent flat --attention-backend.
         "attention_backend": JsonGroup(flag="--attention-config", key="backend"),
+        "speculative_method": JsonGroup(flag="--speculative-config", key="method"),
+        "draft_model": JsonGroup(flag="--speculative-config", key="model"),
+        "speculative_mode": Gate(),
+        "num_speculative_tokens": JsonGroup(
+            flag="--speculative-config", key="num_speculative_tokens"
+        ),
     }
 )
 """Where each :class:`LLMConfig` field is sent on the vLLM command line.
 
-The table is deliberately code-only and declarative: every field that reaches
-vLLM has exactly one entry, and adding a parameter is an explicit two-step of
-adding a typed field to ``LLMConfig`` and adding its entry here. A field absent
-from the table is never forwarded.
+The table is deliberately code-only and declarative: every field is either
+forwarded by exactly one entry or explicitly gated by a :class:`Gate`, and
+adding a parameter is an explicit two-step of adding a typed field to
+``LLMConfig`` and adding its entry here. A field absent from the table is never
+forwarded.
 """
 
 
@@ -132,6 +145,18 @@ VALUE_MAPS: Mapping[str, Mapping[object, str]] = MappingProxyType(
         "attention_backend": {
             AttentionBackend.FLASH_ATTENTION: "FLASH_ATTN",
             AttentionBackend.FLASH_INFER: "FLASHINFER",
+        },
+        "speculative_method": {
+            SpeculativeMethod.DRAFT_MODEL: "draft_model",
+            SpeculativeMethod.EAGLE3: "eagle3",
+            SpeculativeMethod.MTP: "mtp",
+            SpeculativeMethod.DFLASH: "dflash",
+            SpeculativeMethod.DSPARK: "dspark",
+            SpeculativeMethod.NGRAM: "ngram",
+        },
+        "speculative_mode": {
+            SpeculativeMode.ENABLED: "enabled",
+            SpeculativeMode.DISABLED: "disabled",
         },
     }
 )
@@ -260,9 +285,10 @@ def encode_arguments(
     does not yet model.
 
     Parameters absent from ``targets`` and parameters whose value is ``None``
-    are never forwarded. Flat flags become ``--flag value``; JSON-group fields
-    sharing a flag are merged into a single ``--flag '<json>'`` argument emitted
-    at the group's first position, so the group appears once per run.
+    are never forwarded, and a :class:`Gate` member controls its group without
+    being serialised itself. Flat flags become ``--flag value``; JSON-group
+    fields sharing a flag are merged into a single ``--flag '<json>'`` argument
+    emitted at the group's first position, so the group appears once per run.
 
     Values are normalised before encoding, so enums, path-likes, mappings, sets,
     and arbitrary sequences serialise correctly both as flat flags and inside a
@@ -273,6 +299,8 @@ def encode_arguments(
     for name, target in targets.items():
         value = parameters.get(name)
         if value is None:
+            continue
+        if isinstance(target, Gate):
             continue
         if isinstance(target, FlatFlag):
             arguments.extend(_flat_arguments(name, value))
@@ -291,21 +319,15 @@ def encode_arguments(
     return arguments
 
 
-def _translate_value(field: str, value: object) -> object:
-    """Translate an engine-neutral categorical value into vLLM's spelling.
+_SPECULATIVE_GROUP_FIELDS = frozenset(
+    {"speculative_method", "draft_model", "num_speculative_tokens"}
+)
+"""The fields that make up the ``--speculative-config`` object.
 
-    Values for fields without a value map, and values that are not enum members,
-    pass through unchanged. An enum member absent from its field's map is not
-    supported by this backend and raises rather than being silently dropped, so
-    a requested configuration is never quietly ignored.
-    """
-    mapping = VALUE_MAPS.get(field)
-    if mapping is None or not isinstance(value, Enum):
-        return value
-    try:
-        return mapping[value]
-    except KeyError:
-        raise ExperimentError(f"vLLM does not support {field}={value.value!r}") from None
+The speculative mode is absent because it gates the group instead of being
+forwarded inside it. A disabled mode drops these fields before encoding, so no
+speculative flag reaches the engine at all.
+"""
 
 
 def serve_arguments(
@@ -321,16 +343,38 @@ def serve_arguments(
     mapped parameters as the backend's escape hatch for unmodeled serving
     flags. The workload is assembled separately by the host benchmark client,
     so the server command carries no workload flags.
+
+    The speculative method, draft model, and depth share one
+    ``--speculative-config`` JSON object. A disabled speculative mode suppresses
+    that whole object, leaving the engine with no speculative flags; an unset
+    mode means the configured setup's default and emits it, and an unset depth
+    omits only the depth key so the engine keeps its own default.
     """
     parameters = {
-        field.name: _translate_value(field.name, getattr(config, field.name))
+        field.name: translate_value(
+            field.name, getattr(config, field.name), VALUE_MAPS, engine="vLLM"
+        )
         for field in fields(config)
         if getattr(config, field.name) is not None
     }
+    if config.speculative_mode is SpeculativeMode.DISABLED:
+        parameters = {
+            name: value
+            for name, value in parameters.items()
+            if name not in _SPECULATIVE_GROUP_FIELDS
+        }
     return [*encode_arguments(parameters), *extra_args]
 
 
 _MODEL_MOUNT_PATH = "/model"
+_DRAFT_MODEL_MOUNT_PATH = "/draft-model"
+"""Where a resolved draft checkpoint is mounted inside the container.
+
+The main model keeps :data:`_MODEL_MOUNT_PATH`, so a local draft gets its own
+fixed target and both checkpoints stay addressable at once. A draft that lives
+in the same Hugging Face cache hub root as the main model reuses that root's
+mount instead, keeping the draft's symlinks resolvable without a second mount.
+"""
 _SERVER_PORT = 8000
 _SERVER_BIND_HOST = "0.0.0.0"
 """Where the server binds inside the container.
@@ -591,11 +635,11 @@ def _hub_cache_root(path: Path) -> Path | None:
     return None
 
 
-def _model_mount(path: Path) -> Mount:
+def _model_mount(path: Path, target: str = _MODEL_MOUNT_PATH) -> Mount:
     """Build the read-only mount that exposes a resolved checkpoint to the server."""
     return Mount(
         source=str(path),
-        target=_MODEL_MOUNT_PATH,
+        target=target,
         read_only=True,
         options=_SELINUX_OPTIONS,
     )
@@ -627,6 +671,34 @@ def _resolve_model(model: str, resolved_path: Path | None) -> tuple[str, tuple[M
     return request.repo_id, ()
 
 
+def _resolve_draft(
+    draft_model: str,
+    resolved_draft_path: Path | None,
+    model_mounts: tuple[Mount, ...],
+) -> tuple[str, tuple[Mount, ...]]:
+    """Resolve the draft-model argument and any mount it needs.
+
+    An unresolved draft string is passed through unchanged, just as an
+    unresolved main model is, so the engine fetches it itself. A resolved draft
+    is mounted read-only and the speculative configuration is pointed at its
+    in-container path. When the draft is a Hugging Face snapshot, the cache hub
+    root is mounted so its symlinks resolve: the main model's mount is reused
+    when it already exposes that root, and otherwise the root is mounted at the
+    dedicated draft path. A local draft directory or file is always mounted at
+    that dedicated path, so it never collides with the main model's mount.
+    """
+    if resolved_draft_path is None:
+        return draft_model, ()
+    hub_root = _hub_cache_root(resolved_draft_path)
+    if hub_root is not None:
+        shared = next((mount for mount in model_mounts if Path(mount.source) == hub_root), None)
+        target = shared.target if shared is not None else _DRAFT_MODEL_MOUNT_PATH
+        relative = resolved_draft_path.relative_to(hub_root)
+        mounts = () if shared is not None else (_model_mount(hub_root, target),)
+        return f"{target}/{relative}", mounts
+    return _DRAFT_MODEL_MOUNT_PATH, (_model_mount(resolved_draft_path, _DRAFT_MODEL_MOUNT_PATH),)
+
+
 _ENGINE_BOUNDS: tuple[tuple[str, str], ...] = (("max_num_batched_tokens", "max_num_seqs"),)
 """Numeric constraints vLLM imposes between two tunable parameters.
 
@@ -642,46 +714,18 @@ so it is deliberately not enforced here.
 """
 
 
-def _declared_values(dimension: Dimension) -> list[tuple[str, ParameterValue]]:
-    """Pair each value a dimension declares with the problem path naming it."""
-    spec = dimension.spec
-    if isinstance(spec, Fixed):
-        return [(f"space.{dimension.name}.fixed", spec.value)]
-    if isinstance(spec, Categorical):
-        return [
-            (f"space.{dimension.name}.categorical[{index}]", value)
-            for index, value in enumerate(spec.values)
-        ]
-    return []
-
-
-def _validate_spec_values(dimension: Dimension, field: str) -> list[str]:
-    """Report every declared value vLLM has no spelling for.
-
-    Only enum values are checked: a numeric parameter is forwarded verbatim, so
-    it has nothing to look up in :data:`VALUE_MAPS`. A categorical field with no
-    value map at all cannot translate any member and rejects every enum value.
-    """
-    mapping = VALUE_MAPS.get(field)
-    problems: list[str] = []
-    for path, value in _declared_values(dimension):
-        if isinstance(value, Enum) and (mapping is None or value not in mapping):
-            problems.append(f"{path}: vLLM does not support {field}={value.value!r}")
-    return problems
-
-
 def _validate_target_support(dimension: Dimension, field: str, target: HardwareTarget) -> list[str]:
     """Report every declared value the target's platform does not support.
 
     Only attention backends are platform-specific today, and only for values
     that already have a vLLM spelling: a value with no spelling is reported by
-    :func:`_validate_spec_values` regardless of target, so checking it here too
-    would duplicate the problem.
+    :func:`~llm_config_optimization.inference._tunables.unsupported_values`
+    regardless of target, so checking it here too would duplicate the problem.
     """
     if field != "attention_backend":
         return []
     problems: list[str] = []
-    for path, value in _declared_values(dimension):
+    for path, value in declared_values(dimension):
         if not isinstance(value, AttentionBackend):
             continue
         targets = _ATTENTION_BACKEND_TARGETS.get(value)
@@ -705,7 +749,7 @@ def _validate_device_count(dimension: Dimension, field: str, device_count: int) 
     if field != "tensor_parallel_size":
         return []
     problems: list[str] = []
-    for path, value in _declared_values(dimension):
+    for path, value in declared_values(dimension):
         if isinstance(value, int) and value > device_count:
             problems.append(
                 f"{path}: vLLM cannot run tensor_parallel_size={value} "
@@ -835,33 +879,38 @@ class VLLMBackend:
     cpu_image: str = "docker.io/vllm/vllm-openai-cpu:latest"
     cache_dir: Path | None = None
 
-    @property
-    def applicable_parameters(self) -> frozenset[str]:
-        """Every registered tunable: vLLM forwards all seven.
+    def applicable_parameters(self, llm: LLMConfig) -> frozenset[str]:
+        """Every registered tunable, minus the setup-gated ones when unconfigured.
 
         vLLM is the reference backend and models the whole registry, so its
-        applicable set is exactly
-        :data:`~llm_config_optimization.search_space.registry.TUNABLE_PARAMETERS`.
-        A space must therefore declare every one of them, and each value is
-        still support-checked by :meth:`validate`.
+        applicable set is
+        :data:`~llm_config_optimization.search_space.registry.TUNABLE_PARAMETERS`
+        except that the two speculative dimensions are included only when
+        ``llm`` configures a speculative method or draft model. A space must
+        therefore declare every applicable parameter, and each value is still
+        support-checked by :meth:`validate`.
         """
-        return frozenset(TUNABLE_PARAMETERS)
+        applicable = frozenset(TUNABLE_PARAMETERS) - SPECULATIVE_PARAMETERS
+        if speculative_configured(llm):
+            return applicable | SPECULATIVE_PARAMETERS
+        return applicable
 
     def validate(
         self,
         space: ExperimentSpace,
+        llm: LLMConfig,
         hardware: DetectedHardware | None = None,
     ) -> Sequence[str]:
-        """Report every way vLLM cannot support ``space``.
+        """Report every way vLLM cannot support ``space`` for ``llm``.
 
         The space is assumed to have passed engine-agnostic validation. Every
-        dimension's parameter must be one the backend forwards, and every fixed
-        or categorical enum value must have a vLLM spelling. ``Default``
-        dimensions carry no value to check and are accepted once their
-        parameter is known to the backend. The engine's own numeric constraints
-        between parameters are checked last. Problems are returned as strings
-        so the caller can aggregate them; an empty sequence means vLLM supports
-        every dimension.
+        dimension's parameter must be one the backend forwards for this run, and
+        every fixed or categorical enum value must have a vLLM spelling.
+        ``Default`` dimensions carry no value to check and are accepted once
+        their parameter is known to be applicable. The engine's own numeric
+        constraints between parameters are checked last. Problems are returned
+        as strings so the caller can aggregate them; an empty sequence means
+        vLLM supports every dimension.
 
         ``hardware``, when given, additionally asks whether each declared value
         is supported on that accelerator class and fits its device count, so a
@@ -871,14 +920,15 @@ class VLLMBackend:
         forward the parameter and spell the value.
         """
         problems: list[str] = []
+        applicable = self.applicable_parameters(llm)
         for dimension in space.dimensions:
             field = TUNABLE_PARAMETERS[dimension.name]
-            if field not in PARAMETER_TARGETS:
+            if field not in PARAMETER_TARGETS or dimension.name not in applicable:
                 problems.append(f"space.{dimension.name}: vLLM does not forward {field!r}")
                 continue
             if isinstance(dimension.spec, Default):
                 continue
-            problems.extend(_validate_spec_values(dimension, field))
+            problems.extend(unsupported_values(dimension, field, VALUE_MAPS, engine="vLLM"))
             if hardware is not None:
                 problems.extend(_validate_target_support(dimension, field, hardware.target))
                 problems.extend(_validate_device_count(dimension, field, hardware.device_count))
@@ -944,7 +994,11 @@ class VLLMBackend:
         tensor-parallel size. The Hugging Face cache, the checkpoint itself —
         the resolved path when the composition root set one, otherwise a host
         path — and, when ``cache_dir`` is set, the compile cache are
-        bind-mounted.
+        bind-mounted. A configured draft model is resolved the same way: a
+        resolved draft is mounted (reusing the main model's cache-hub mount
+        when it lives in the same root) and the speculative configuration is
+        pointed at its in-container path, while an unresolved draft string is
+        passed through for the engine to fetch.
 
         The planned container keeps the image's own ``vllm serve`` entrypoint and
         runs it with ``--model``, the published port, and the serving parameters
@@ -968,6 +1022,12 @@ class VLLMBackend:
             experiment.benchmark.model, experiment.benchmark.resolved_path
         )
         llm = experiment.llm
+        draft_mounts: tuple[Mount, ...] = ()
+        if llm.draft_model is not None:
+            draft, draft_mounts = _resolve_draft(
+                llm.draft_model, llm.resolved_draft_path, model_mounts
+            )
+            llm = replace(llm, draft_model=draft)
         if llm.tensor_parallel_size is None:
             llm = replace(llm, tensor_parallel_size=hardware.device_count)
         serve_args = (
@@ -989,6 +1049,7 @@ class VLLMBackend:
                 options=_SELINUX_OPTIONS,
             ),
             *model_mounts,
+            *draft_mounts,
         ]
         env = {**_DEV_MODE_ENV, **container.env}
         if self.cache_dir is not None:

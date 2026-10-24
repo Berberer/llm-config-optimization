@@ -15,9 +15,15 @@ from llm_config_optimization.inference import (
     DType,
     KVCacheDType,
     LLMConfig,
+    SpeculativeMethod,
+    SpeculativeMode,
     VLLMBackend,
 )
-from llm_config_optimization.search_space.registry import TUNABLE_PARAMETERS, expected_kind
+from llm_config_optimization.search_space.registry import (
+    SPECULATIVE_PARAMETERS,
+    TUNABLE_PARAMETERS,
+    expected_kind,
+)
 
 TUNABLES = (
     "dtype",
@@ -27,6 +33,8 @@ TUNABLES = (
     "max_num_batched_tokens",
     "tensor_parallel_size",
     "attention_backend",
+    "speculative_mode",
+    "num_speculative_tokens",
 )
 
 
@@ -53,12 +61,30 @@ def test_registry_maps_every_tunable_to_an_llm_config_field() -> None:
         ("max_num_batched_tokens", int),
         ("tensor_parallel_size", int),
         ("attention_backend", AttentionBackend),
+        ("speculative_mode", SpeculativeMode),
+        ("num_speculative_tokens", int),
     ],
 )
 def test_expected_kind_is_read_from_the_config_annotation(parameter: str, kind: type) -> None:
     assert expected_kind(TUNABLE_PARAMETERS[parameter]) is kind
 
 
-def test_the_vllm_backend_declares_every_registered_tunable_as_applicable() -> None:
-    """vLLM is the reference backend: its applicable set is the whole registry."""
-    assert VLLMBackend().applicable_parameters == frozenset(TUNABLE_PARAMETERS)
+def test_the_vllm_backend_declares_every_ungated_registered_tunable_as_applicable() -> None:
+    """Without a configured setup, only the two gated dimensions are withheld."""
+    assert VLLMBackend().applicable_parameters(LLMConfig()) == (
+        frozenset(TUNABLE_PARAMETERS) - SPECULATIVE_PARAMETERS
+    )
+
+
+@pytest.mark.parametrize(
+    "llm",
+    [
+        LLMConfig(speculative_method=SpeculativeMethod.MTP),
+        LLMConfig(draft_model="org/draft"),
+    ],
+    ids=["method", "draft-model"],
+)
+def test_a_configured_speculative_setup_makes_the_gated_tunables_applicable(
+    llm: LLMConfig,
+) -> None:
+    assert VLLMBackend().applicable_parameters(llm) == frozenset(TUNABLE_PARAMETERS)

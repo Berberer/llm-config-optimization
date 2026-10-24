@@ -15,6 +15,8 @@ client, and the shared fake Podman client, so no daemon, inference engine, or
 specific hardware is required.
 """
 
+from dataclasses import replace
+
 import pytest
 from podman.errors import APIError
 
@@ -32,6 +34,7 @@ from llm_config_optimization.inference import (
     LLMConfig,
     RunMetrics,
     ServerSpec,
+    measure_dataset_request_tokens,
     run_experiment,
 )
 from llm_config_optimization.runtime import ContainerConfig, ContainerResult, ContainerRunError
@@ -257,6 +260,85 @@ def test_a_server_without_a_published_port_cannot_be_measured(
     assert backend.parse_calls == []
     assert client.container is not None
     assert client.container.remove_calls == [True]
+
+
+def test_dataset_preflight_tokenizes_once_and_stops_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The preflight starts a one-slot server, tokenizes, and tears it down."""
+    events: list[str] = []
+    client = RecordingPodmanClient(events)
+    spec = ServerSpec(
+        container=ContainerConfig(
+            image="fake/engine:latest",
+            command=("serve",),
+            ports={"8000": None},
+        ),
+        health_path="/health",
+        health_timeout=600.0,
+        tokenize_path="/tokenize",
+        tokenize_prompt_field="content",
+    )
+    backend = FakeBackend(spec, _result(), events)
+    benchmark = FakeBenchmarkClient(_outcome(), request_tokens=321)
+    experiment = replace(
+        _experiment(),
+        benchmark=replace(
+            _experiment().benchmark, dataset_path="/data/prompts.jsonl", max_request_tokens=None
+        ),
+    )
+    hardware = DetectedHardware(HardwareTarget.CPU, 1)
+
+    tokens = measure_dataset_request_tokens(
+        experiment, backend, hardware, client=client, benchmark_client=benchmark
+    )
+
+    assert tokens == 321
+    assert events == ["plan", "create"]
+    planned, _ = backend.plan_calls[0]
+    assert planned.llm.max_num_seqs == 1
+    assert planned.llm.speculative_method is None
+    base_url, model, measured_spec, measured_benchmark = benchmark.tokenize_calls[0]
+    assert base_url == "http://127.0.0.1:8000"
+    assert model == HUB_MODEL
+    assert measured_spec is spec
+    assert measured_benchmark is experiment.benchmark
+    assert benchmark.liveness[0] is not None
+    assert client.container is not None
+    assert client.container.stopped is True
+
+
+def test_dataset_preflight_is_skipped_without_a_dataset_or_tokenizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No dataset, or a spec without a tokenizer, starts no preflight server."""
+    events: list[str] = []
+    client = RecordingPodmanClient(events)
+    benchmark = FakeBenchmarkClient(_outcome(), request_tokens=321)
+    hardware = DetectedHardware(HardwareTarget.CPU, 1)
+    backend = FakeBackend(_SPEC, _result(), events)
+
+    assert (
+        measure_dataset_request_tokens(
+            _experiment(), backend, hardware, client=client, benchmark_client=benchmark
+        )
+        is None
+    )
+
+    experiment = replace(
+        _experiment(),
+        benchmark=replace(_experiment().benchmark, dataset_path="/data/prompts.jsonl"),
+    )
+    assert (
+        measure_dataset_request_tokens(
+            experiment, backend, hardware, client=client, benchmark_client=benchmark
+        )
+        is None
+    )
+
+    assert events == ["plan"]
+    assert benchmark.tokenize_calls == []
+    assert client.container is None
 
 
 def test_container_start_failure_is_wrapped_without_a_result(

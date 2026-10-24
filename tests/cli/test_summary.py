@@ -208,6 +208,11 @@ def test_unset_values_are_written_as_explicit_nulls(tmp_path: Path) -> None:
     document = yaml.safe_load(text)
     assert document["benchmark"]["dataset_path"] is None
     assert document["llm"]["gpu_memory_utilization"] is None
+    assert document["llm"]["speculative_method"] is None
+    assert document["llm"]["draft_model"] is None
+    assert document["llm"]["speculative_mode"] is None
+    assert document["llm"]["num_speculative_tokens"] is None
+    assert document["llm"]["resolved_draft_path"] is None
     assert "dataset_path: null" in text
     assert "gpu_memory_utilization: null" in text
 

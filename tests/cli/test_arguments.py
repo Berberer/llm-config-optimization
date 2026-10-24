@@ -42,6 +42,8 @@ def test_defaults_match_the_documented_settings() -> None:
     assert args.llm_seed == 0
     assert args.quantization is None
     assert args.gpu_memory_utilization is None
+    assert args.speculative_method is None
+    assert args.draft_model is None
     assert args.sampler_seed is None
     assert args.n_trials is None
     assert args.sweep_timeout is None
@@ -95,6 +97,10 @@ def test_explicit_flags_override_every_default() -> None:
             "awq",
             "--gpu-memory-utilization",
             "0.9",
+            "--speculative-method",
+            "eagle3",
+            "--draft-model",
+            "org/draft",
             "--sampler-seed",
             "42",
             "--n-trials",
@@ -137,6 +143,8 @@ def test_explicit_flags_override_every_default() -> None:
     assert args.llm_seed == 7
     assert args.quantization == "awq"
     assert args.gpu_memory_utilization == 0.9
+    assert args.speculative_method == "eagle3"
+    assert args.draft_model == "org/draft"
     assert args.sampler_seed == 42
     assert args.n_trials == 10
     assert args.sweep_timeout == 600
@@ -148,6 +156,14 @@ def test_explicit_flags_override_every_default() -> None:
     assert args.objective == "combined"
     assert args.prefill_weight == 512.0
     assert args.decode_weight == 64.0
+
+
+def test_a_draft_model_alone_parses_without_a_method() -> None:
+    """The parser leaves the implication to the base-config builder."""
+    args = parse_args(["facebook/opt-125m", "space.yaml", "vllm", "--draft-model", "org/draft"])
+
+    assert args.speculative_method is None
+    assert args.draft_model == "org/draft"
 
 
 def test_engine_scoped_options_parse_before_the_engine_is_known() -> None:
@@ -175,6 +191,7 @@ def test_engine_scoped_options_parse_before_the_engine_is_known() -> None:
         ["model", "space.yaml", "vllm", "--target", "gpu"],
         ["model", "space.yaml", "vllm", "--pull-policy", "sometimes"],
         ["model", "space.yaml", "vllm", "--quantization", "int8"],
+        ["model", "space.yaml", "vllm", "--speculative-method", "eagle"],
         ["model", "space.yaml", "vllm", "--output", "json"],
         ["model", "space.yaml", "vllm", "--objective", "fastest"],
         ["model", "space.yaml", "vllm", "--unknown"],
@@ -187,6 +204,7 @@ def test_engine_scoped_options_parse_before_the_engine_is_known() -> None:
         "bad-target",
         "bad-pull-policy",
         "bad-quantization",
+        "bad-speculative-method",
         "bad-output",
         "bad-objective",
         "unknown-flag",

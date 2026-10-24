@@ -64,10 +64,16 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
   backend defines a phase rate.
 - The llama.cpp backend keeps `max_model_len` a request length at the engine: it
   forwards the sampled value as `--ctx-size` unchanged and cuts `--parallel`
-  to `max_model_len // (input_len + output_len)` (at least one) for the random
-  workload, because llama.cpp splits `--ctx-size` evenly across its slots and
-  rejects a request longer than a slot's share. The cap lives in the backend's
-  plan; the engine-neutral surfaces carry none of it.
+  to `max_model_len // request_tokens` (at least one), because llama.cpp splits
+  `--ctx-size` evenly across its slots and rejects a request longer than a
+  slot's share. The request length is `input_len + output_len` for the random
+  workload and, for a JSONL dataset, the preflight-measured
+  `BenchmarkConfig.max_request_tokens`: the composition root starts the
+  engine's server once before the sweep and tokenizes every dataset prompt
+  through the spec-declared `ServerSpec.tokenize_path`, so the engine's own
+  tokenizer decides the cap. A dataset whose preflight could not run falls back
+  to one slot. The cap lives in the backend's plan; the engine-neutral surfaces
+  carry none of it.
 - A backend owns its model-argument rules through `model_request`: vLLM
   resolves a Hub snapshot directory or a local directory, while llama.cpp
   accepts a local `.gguf` file or a Hub repository with an optional `:QUANT`
@@ -76,15 +82,23 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
 - `InferenceBackend.validate_model` is the model-aware half of backend
   validation: it receives the whole `ExperimentConfig` and the resolved model
   path, returns problems rather than raising, and fails open when the
-  checkpoint's metadata cannot be read. Reading the checkpoint and the
-  method-to-spelling mapping live in the backend modules — vLLM's quantization
-  methods in `inference/_vllm.py`, GGUF metadata in `inference/_llamacpp.py` —
-  so the engine-neutral surfaces carry no checkpoint vocabulary.
+  checkpoint's metadata cannot be read. When the experiment configures a
+  speculative setup it also inspects the resolved draft at
+  `LLMConfig.resolved_draft_path` — llama.cpp rejects a non-GGUF draft and
+  fails open on an unreadable header — before the image is pulled. Reading the
+  checkpoint and the method-to-spelling mapping live in the backend modules —
+  vLLM's quantization methods in `inference/_vllm.py`, GGUF metadata in
+  `inference/_llamacpp.py` — so the engine-neutral surfaces carry no checkpoint
+  vocabulary.
 - The search space is **total over the backend's applicable set**: every
-  parameter the selected backend reports in `applicable_parameters` must be
-  declared, so a value never silently falls back to an engine default. The
+  parameter the selected backend reports in `applicable_parameters(llm)` must
+  be declared, so a value never silently falls back to an engine default. The
   registry itself stays engine-neutral; a backend that lacks a parameter (for
-  example llama.cpp has no `tensor_parallel_size`) simply omits it.
+  example llama.cpp has no `tensor_parallel_size`) simply omits it. `llm` is the
+  run's fixed configuration, because applicability can depend on it: the two
+  speculative tunables `speculative_mode` and `num_speculative_tokens` are in
+  the set exactly when `speculative_method` or `draft_model` is configured, and
+  a definition declaring them without that setup is rejected as unsupported.
 - A trial is host-driven: the backend plans an engine-neutral `ServerSpec` and
   the orchestrator starts the server container, drives it with the host
   benchmark client, stops it, and hands the measured outcome to
@@ -97,9 +111,10 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
 ### Extension recipes
 
 - **New inference engine** — implement `InferenceBackend` (`inference/types.py`):
-  `applicable_parameters`, `validate`, `validate_model`, `model_request`,
-  `image_for`, `plan`, `parse_result`. `plan` returns a `ServerSpec`, so the
-  shared host client and orchestrator need no engine-specific code; an engine
+  `applicable_parameters(llm)`, `validate(space, llm, hardware)`,
+  `validate_model`, `model_request`, `image_for`, `plan`, `parse_result`.
+  `plan` returns a `ServerSpec`, so the shared host client and orchestrator need
+  no engine-specific code; an engine
   with a scrapeable exposition declares `ServerSpec.metrics_path` and derives
   its phase rates from the snapshots in `parse_result`, while one with
   per-response timings derives them from its preserved raw payloads. Register
@@ -109,7 +124,8 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
   unchanged, so a second engine is an addition, not a rewrite.
 - **New tunable parameter** — see the checklist below; the search space is
   total over a backend's applicable set, so this touches code, every example
-  space whose backend forwards it, the README, and the tests in one change.
+  space whose backend forwards it, `docs/search-space.md`, and the tests in one
+  change.
 - **New container runtime** — implement `run_container`, `start_container`
   (the detached lifecycle), and `pull_image` against the types in
   `runtime/types.py`; keep `_podman.py` engine-free.
@@ -121,7 +137,7 @@ space whose backend forwards it, and must be forwarded by every backend whose
 applicable set includes it. Because the search space is **total over a
 backend's applicable set**, adding one is
 not additive for a backend that forwards it: every existing definition for that
-backend (examples, README snippets, test fixtures) becomes invalid until it
+backend (examples, docs snippets, test fixtures) becomes invalid until it
 declares the new parameter, and the loader will report it as a missing tunable.
 
 Code:
@@ -133,7 +149,11 @@ Code:
   the YAML name to the field name. The loader reads the expected kind from the
   field annotation, so there is no second kind to keep in sync. Insertion order
   is canonical (the parser emits dimensions in it), so append at the end unless
-  the canonical order is deliberately being changed.
+  the canonical order is deliberately being changed. If the parameter should be
+  applicable only under a configured setup, add it to the gated set
+  (`SPECULATIVE_PARAMETERS`, whose members are `speculative_mode` and
+  `num_speculative_tokens`) so both backends include it from
+  `applicable_parameters(llm)` exactly then, and `validate` rejects it otherwise.
 - [ ] `inference/_vllm.py` — forward the field via `PARAMETER_TARGETS`
   (`FlatFlag()` for a `--flag value`, `JsonGroup(flag=..., key=...)` for a JSON
   group). For a categorical field, add a vLLM spelling for **every** enum member
@@ -159,15 +179,17 @@ Code:
 
 Docs and examples:
 
-- [ ] `README.md` — add a row to the *Tunable parameters* table, fix the
-  per-engine parameter counts in the surrounding prose ("vLLM forwards all seven
-  parameters below", "llama.cpp forwards all but ..."), and add the new
-  dimension to the example YAML snippets so they stay complete.
+- [ ] `docs/search-space.md` — add a row to the *Tunable parameters* table,
+  fix the per-engine parameter counts in the surrounding prose ("vLLM forwards
+  all seven parameters below", "llama.cpp forwards all but ..."), and add the
+  new dimension to the example YAML snippets so they stay complete. A gated
+  dimension is documented in `docs/speculative-decoding.md` as well, and its
+  applicability rule is noted in `docs/architecture.md`.
 - [ ] Every example space whose backend forwards the parameter — vLLM's
-  `examples/space-vllm-full.yaml` and `examples/space-vllm-all-fixed.yaml`,
-  llama.cpp's
-  `examples/space-llamacpp-full.yaml` and `examples/space-llamacpp-all-fixed.yaml`
-  — declares it, over its full range or pinned to one value respectively.
+  `examples/vllm/space-full.yaml`, `space-all-fixed.yaml`,
+  `space-speculative-defaults.yaml`, and `space-speculative-full.yaml`, and
+  llama.cpp's corresponding four under `examples/llamacpp/` — declares it, over
+  its full range or pinned to one value respectively.
 - [ ] `AGENTS.md` — update this checklist only if the parameter introduces a new
   invariant (for example a new engine-neutral enum, or a new non-tunable field).
 
@@ -191,11 +213,16 @@ Tests:
 ### Data flow
 
 `cli.main` loads and engine-agnostically validates the space against the
-selected backend's `applicable_parameters`, asks the backend to `validate` it
-against the resolved hardware, builds the base configuration, asks the
-backend's `model_request` what to fetch, resolves that to a local path, asks the
-backend to `validate_model` it against that checkpoint, pulls the image, then
-calls `optimization.optimize`. Each trial: Optuna samples a point → `inference`
+selected backend's `applicable_parameters(base.llm)`, asks the backend to
+`validate` it against the same LLM configuration and the resolved hardware,
+builds the base configuration, asks the backend's `model_request` what the main
+model and — when configured — the draft model refer to, resolves or downloads
+both through the shared progress helper, records them on
+`BenchmarkConfig.resolved_path` and `LLMConfig.resolved_draft_path`, asks the
+backend to `validate_model` each, warns when speculation runs on the synthetic
+workload without a dataset, pulls the image, tokenizes a JSONL dataset once
+through the backend's declared tokenizer endpoint so llama.cpp can cap its
+slots, then calls `optimization.optimize`. Each trial: Optuna samples a point → `inference`
 plans a `ServerSpec` → `runtime` starts the server container detached and
 resolves its host port → the host benchmark client waits for health, takes the
 warmup and measured runs, scraping the spec's metrics path around each measured

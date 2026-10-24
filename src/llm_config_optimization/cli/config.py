@@ -29,6 +29,7 @@ from ..inference.types import (
     HardwareTarget,
     LLMConfig,
     QuantizationMethod,
+    SpeculativeMethod,
 )
 from ..optimization import ObjectiveMode, ObjectiveWeights
 
@@ -71,8 +72,58 @@ def build_base_config(args: argparse.Namespace) -> ExperimentConfig:
         ),
         seed=args.llm_seed,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        speculative_method=_speculative_method(args),
+        draft_model=args.draft_model,
     )
+    _check_speculative_setup(llm)
     return ExperimentConfig(container=container, benchmark=benchmark, llm=llm)
+
+
+_DRAFT_REQUIRED_METHODS = frozenset(
+    {
+        SpeculativeMethod.DRAFT_MODEL,
+        SpeculativeMethod.EAGLE3,
+        SpeculativeMethod.DFLASH,
+        SpeculativeMethod.DSPARK,
+    }
+)
+"""Speculative methods that cannot run without a separate draft checkpoint.
+
+``mtp`` uses the target model's own heads and may take an auxiliary draft, and
+``ngram`` is model-free, so neither belongs here.
+"""
+
+
+def _speculative_method(args: argparse.Namespace) -> SpeculativeMethod | None:
+    """Resolve the method, implying the generic draft method from a bare draft flag.
+
+    ``--draft-model`` alone is the common case, so it selects ``draft_model``
+    rather than requiring both flags. An omitted method with no draft leaves
+    speculation unconfigured.
+    """
+    if args.speculative_method is not None:
+        return SpeculativeMethod(args.speculative_method)
+    if args.draft_model is not None:
+        return SpeculativeMethod.DRAFT_MODEL
+    return None
+
+
+def _check_speculative_setup(llm: LLMConfig) -> None:
+    """Reject a method and draft that cannot be served together as a usage error.
+
+    A method that needs a separate checkpoint without one would fail at every
+    server start, and a draft passed to model-free ``ngram`` would be silently
+    ignored. Both are checked here, before the space is loaded or a container is
+    pulled, and raise ``ValueError`` for the caller to map to the usage code.
+    """
+    method = llm.speculative_method
+    if method is SpeculativeMethod.NGRAM and llm.draft_model is not None:
+        raise ValueError(
+            "--draft-model is not valid with the ngram speculative method, which needs no "
+            "draft model"
+        )
+    if method is not None and method in _DRAFT_REQUIRED_METHODS and llm.draft_model is None:
+        raise ValueError(f"the {method.value} speculative method requires --draft-model")
 
 
 def resolve_objective(

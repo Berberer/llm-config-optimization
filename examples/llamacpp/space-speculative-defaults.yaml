@@ -1,0 +1,35 @@
+# The complete llama.cpp search space with speculative decoding enabled at the
+# engine's own default draft depth. Configure the method and the optional draft
+# model on the command line, for example:
+#
+#   --speculative-method draft_model --draft-model path/to/draft.gguf
+#
+# A configured speculative setup makes both speculative dimensions mandatory.
+# `default: true` on `speculative_mode` means *enabled* — the setup's default,
+# not llama.cpp's no-speculation default — and on `num_speculative_tokens` it
+# omits `--spec-draft-n-max` so llama.cpp uses its own built-in depth.
+#
+# Only the five parameters llama-server forwards are declared; `dtype` and
+# `tensor_parallel_size` are not applicable to a GGUF checkpoint. The slot cap
+# and context-size notes from `space-full.yaml` apply unchanged.
+space:
+  kv_cache_dtype:
+    categorical: [float16, bfloat16]
+  max_model_len:
+    interval:
+      min: 1024
+      max: 32768
+  max_num_seqs:
+    interval:
+      min: 1
+      max: 256
+  max_num_batched_tokens:
+    interval:
+      min: 2048
+      max: 8192
+  attention_backend:
+    default: true
+  speculative_mode:
+    default: true
+  num_speculative_tokens:
+    default: true

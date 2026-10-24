@@ -18,6 +18,7 @@ import yaml
 from llm_config_optimization.inference import (
     AttentionBackend,
     DType,
+    SpeculativeMode,
 )
 from llm_config_optimization.search_space import (
     TUNABLE_PARAMETERS,
@@ -39,6 +40,8 @@ VALID_SPACE: dict[str, object] = {
     "max_num_batched_tokens": {"interval": {"min": 2048, "max": 8192}},
     "tensor_parallel_size": {"categorical": [1, 2, 4]},
     "attention_backend": {"default": True},
+    "speculative_mode": {"fixed": "enabled"},
+    "num_speculative_tokens": {"interval": {"min": 1, "max": 5}},
 }
 """A complete, valid definition covering every tunable and every spec kind."""
 
@@ -73,6 +76,8 @@ def test_a_complete_definition_parses_into_the_expected_dimensions() -> None:
         Dimension("max_num_batched_tokens", Interval(2048, 8192)),
         Dimension("tensor_parallel_size", Categorical((1, 2, 4))),
         Dimension("attention_backend", Default()),
+        Dimension("speculative_mode", Fixed(SpeculativeMode.ENABLED)),
+        Dimension("num_speculative_tokens", Interval(1, 5)),
     )
 
 
@@ -280,6 +285,10 @@ def test_top_level_shape_problems_are_reported(document: object, problem: str) -
             "space.max_model_len.interval.min: expected an integer",
         ),
         ({"max_num_seqs": {"fixed": 0}}, "space.max_num_seqs.fixed: value must be at least 1"),
+        (
+            {"num_speculative_tokens": {"fixed": 0}},
+            "space.num_speculative_tokens.fixed: value must be at least 1",
+        ),
         (
             {"max_model_len": {"interval": {"min": 0, "max": 10}}},
             "space.max_model_len.interval.min: value must be at least 1",

@@ -23,6 +23,8 @@ from llm_config_optimization.inference import (
     KVCacheDType,
     LLMConfig,
     QuantizationMethod,
+    SpeculativeMethod,
+    SpeculativeMode,
 )
 from llm_config_optimization.inference._vllm import (
     PARAMETER_TARGETS,
@@ -33,10 +35,18 @@ from llm_config_optimization.inference._vllm import (
     serve_arguments,
 )
 
+_INAPPLICABLE_FIELDS = frozenset({"resolved_draft_path"})
+"""The :class:`LLMConfig` fields vLLM has no target for.
+
+``resolved_draft_path`` is a host-side resolution artifact that an engine never
+receives; the speculative settings reach the engine through their group.
+"""
+
 
 def test_every_llm_config_field_has_a_mapping_entry() -> None:
-    """Every exposed parameter actually reaches the engine, and none are extra."""
-    assert {field.name for field in fields(LLMConfig)} == set(PARAMETER_TARGETS)
+    """Every exposed parameter either reaches the engine or is deliberately ignored."""
+    exposed = {field.name for field in fields(LLMConfig)}
+    assert exposed == set(PARAMETER_TARGETS) | _INAPPLICABLE_FIELDS
 
 
 def test_flat_flags_are_emitted_as_kebab_case_value_pairs() -> None:
@@ -113,6 +123,18 @@ def test_every_curated_value_has_a_vllm_spelling() -> None:
         AttentionBackend.FLASH_ATTENTION: "FLASH_ATTN",
         AttentionBackend.FLASH_INFER: "FLASHINFER",
     }
+    assert VALUE_MAPS["speculative_method"] == {
+        SpeculativeMethod.DRAFT_MODEL: "draft_model",
+        SpeculativeMethod.EAGLE3: "eagle3",
+        SpeculativeMethod.MTP: "mtp",
+        SpeculativeMethod.DFLASH: "dflash",
+        SpeculativeMethod.DSPARK: "dspark",
+        SpeculativeMethod.NGRAM: "ngram",
+    }
+    assert VALUE_MAPS["speculative_mode"] == {
+        SpeculativeMode.ENABLED: "enabled",
+        SpeculativeMode.DISABLED: "disabled",
+    }
 
 
 @pytest.mark.parametrize(
@@ -139,6 +161,36 @@ def test_every_curated_value_has_a_vllm_spelling() -> None:
             "attention_backend",
             AttentionBackend.FLASH_INFER,
             ["--attention-config", '{"backend": "FLASHINFER"}'],
+        ),
+        (
+            "speculative_method",
+            SpeculativeMethod.DRAFT_MODEL,
+            ["--speculative-config", '{"method": "draft_model"}'],
+        ),
+        (
+            "speculative_method",
+            SpeculativeMethod.EAGLE3,
+            ["--speculative-config", '{"method": "eagle3"}'],
+        ),
+        (
+            "speculative_method",
+            SpeculativeMethod.MTP,
+            ["--speculative-config", '{"method": "mtp"}'],
+        ),
+        (
+            "speculative_method",
+            SpeculativeMethod.DFLASH,
+            ["--speculative-config", '{"method": "dflash"}'],
+        ),
+        (
+            "speculative_method",
+            SpeculativeMethod.DSPARK,
+            ["--speculative-config", '{"method": "dspark"}'],
+        ),
+        (
+            "speculative_method",
+            SpeculativeMethod.NGRAM,
+            ["--speculative-config", '{"method": "ngram"}'],
         ),
     ],
 )
@@ -184,6 +236,67 @@ def test_all_fields_assemble_in_the_declared_order() -> None:
         "7",
         "--attention-config",
         '{"backend": "FLASHINFER"}',
+    ]
+
+
+def test_speculative_settings_share_one_json_group() -> None:
+    """Method, draft, and depth become one ``--speculative-config`` object."""
+    config = LLMConfig(
+        speculative_method=SpeculativeMethod.EAGLE3,
+        draft_model="org/eagle3-draft",
+        speculative_mode=SpeculativeMode.ENABLED,
+        num_speculative_tokens=5,
+    )
+
+    assert serve_arguments(config) == [
+        "--speculative-config",
+        '{"method": "eagle3", "model": "org/eagle3-draft", "num_speculative_tokens": 5}',
+    ]
+
+
+def test_an_unset_mode_emits_the_configured_setup() -> None:
+    """An unset mode means the setup's default, which is enabled."""
+    config = LLMConfig(speculative_method=SpeculativeMethod.MTP)
+
+    assert serve_arguments(config) == ["--speculative-config", '{"method": "mtp"}']
+
+
+def test_an_unset_depth_omits_only_the_depth_key() -> None:
+    config = LLMConfig(
+        speculative_method=SpeculativeMethod.DRAFT_MODEL,
+        draft_model="org/draft",
+    )
+
+    assert serve_arguments(config) == [
+        "--speculative-config",
+        '{"method": "draft_model", "model": "org/draft"}',
+    ]
+
+
+def test_a_disabled_mode_suppresses_the_whole_speculative_group() -> None:
+    """No speculative flag reaches the engine, so the draft's memory is freed."""
+    config = LLMConfig(
+        dtype=DType.FLOAT16,
+        speculative_method=SpeculativeMethod.EAGLE3,
+        draft_model="org/eagle3-draft",
+        speculative_mode=SpeculativeMode.DISABLED,
+        num_speculative_tokens=5,
+    )
+
+    assert serve_arguments(config) == ["--dtype", "float16"]
+
+
+def test_a_resolved_draft_path_is_never_forwarded(tmp_path: Path) -> None:
+    """The resolved path is host-side only; the configured draft string is forwarded."""
+    config = LLMConfig(
+        speculative_method=SpeculativeMethod.DRAFT_MODEL,
+        draft_model="org/draft",
+        resolved_draft_path=tmp_path / "draft",
+    )
+
+    assert serve_arguments(config) == [
+        "--speculative-config",
+        '{"method": "draft_model", "model": "org/draft"}',
     ]
 
 

@@ -24,6 +24,7 @@ from llm_config_optimization.inference import (
     ExperimentResult,
     HardwareTarget,
     HubCheckpoint,
+    LLMConfig,
     LocalCheckpoint,
     ModelRequest,
     ServerSpec,
@@ -231,13 +232,15 @@ class FakeBackend:
         self.parse_calls: list[tuple[BenchmarkOutcome, ServerSpec, ContainerResult]] = []
         self.model_request_calls: list[str] = []
 
-    @property
-    def applicable_parameters(self) -> frozenset[str]:
+    def applicable_parameters(self, llm: LLMConfig) -> frozenset[str]:
         """The tunable names the fake declares, every registered one by default."""
         return self._applicable_parameters
 
     def validate(
-        self, space: ExperimentSpace, hardware: DetectedHardware | None = None
+        self,
+        space: ExperimentSpace,
+        llm: LLMConfig,
+        hardware: DetectedHardware | None = None,
     ) -> Sequence[str]:
         self.events.append("validate")
         return ()
@@ -298,10 +301,15 @@ class FakeBenchmarkClient:
         outcome: BenchmarkOutcome | None = None,
         *,
         measure_error: Exception | None = None,
+        request_tokens: int | None = None,
+        tokenize_error: Exception | None = None,
     ) -> None:
         self.outcome = outcome if outcome is not None else BenchmarkOutcome(runs=(), failed_runs=0)
         self.measure_error = measure_error
+        self.request_tokens = request_tokens
+        self.tokenize_error = tokenize_error
         self.calls: list[tuple[str, str, ServerSpec, BenchmarkConfig]] = []
+        self.tokenize_calls: list[tuple[str, str, ServerSpec, BenchmarkConfig]] = []
         self.liveness: list[Callable[[], bool] | None] = []
 
     def measure_sync(
@@ -319,3 +327,18 @@ class FakeBenchmarkClient:
         if self.measure_error is not None:
             raise self.measure_error
         return self.outcome
+
+    def dataset_request_tokens_sync(
+        self,
+        base_url: str,
+        model: str,
+        spec: ServerSpec,
+        benchmark: BenchmarkConfig,
+        *,
+        is_alive: Callable[[], bool] | None = None,
+    ) -> int | None:
+        self.tokenize_calls.append((base_url, model, spec, benchmark))
+        self.liveness.append(is_alive)
+        if self.tokenize_error is not None:
+            raise self.tokenize_error
+        return self.request_tokens

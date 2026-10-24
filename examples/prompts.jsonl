@@ -1,0 +1,12 @@
+{"prompt": "Explain in three short paragraphs why a TCP handshake needs three messages rather than two.", "output_len": 128}
+{"prompt": "Write a Python function that returns the n-th Fibonacci number using memoization, then show two example calls.", "output_len": 160}
+{"prompt": "List five practical ways to reduce memory use when serving a large language model, with one sentence of explanation for each.", "output_len": 160}
+{"prompt": "Rewrite the following sentence more concisely: The reason that the deployment failed was because the configuration file contained a value that was not valid.", "output_len": 64}
+{"prompt": "A train leaves at 09:15 and arrives at 13:45. The journey is 315 kilometres. Calculate the average speed in kilometres per hour and show the steps.", "output_len": 128}
+{"prompt": "Summarise the difference between a process and a thread in operating systems, using a small example for each.", "output_len": 128}
+{"prompt": "Produce a JSON object describing a book with the keys title, author, year, and tags. Use three plausible values and no extra commentary.", "output_len": 96}
+{"prompt": "Write a SQL query that returns the ten customers with the highest total order value, including the customer name and the total.", "output_len": 128}
+{"prompt": "Explain what a Pareto front is and why it is useful when tuning a system with two competing objectives.", "output_len": 128}
+{"prompt": "Give a short code review checklist for a pull request that adds a new database migration, with at most six bullets.", "output_len": 128}
+{"prompt": "Describe how speculative decoding works in a serving engine, including the roles of the draft model and the target model.", "output_len": 160}
+{"prompt": "Turn these notes into a short release note: faster startup, new llama.cpp backend, fixed ROCm detection, clearer error messages.", "output_len": 96}

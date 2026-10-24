@@ -1,0 +1,40 @@
+# The complete vLLM search space with speculative decoding enabled at the
+# engine's own default draft depth. Configure the method and the optional draft
+# model on the command line, for example:
+#
+#   --speculative-method eagle3 --draft-model Qwen/Qwen3.8-27B-EAGLE3
+#
+# A configured speculative setup makes both speculative dimensions mandatory.
+# `default: true` on `speculative_mode` means *enabled* — the setup's default,
+# not vLLM's no-speculation default — and on `num_speculative_tokens` it omits
+# the depth so vLLM infers one where the model metadata allows and fails server
+# startup for methods that require an explicit value.
+#
+# `tensor_parallel_size` and `attention_backend` defer to the engine because
+# both depend on the host. Pin either one only when the target is known to
+# support it.
+space:
+  dtype:
+    categorical: [auto, float16, bfloat16, float32]
+  kv_cache_dtype:
+    categorical: [auto, float16, bfloat16, fp8_e4m3, fp8_e5m2]
+  max_model_len:
+    interval:
+      min: 1024
+      max: 32768
+  max_num_seqs:
+    interval:
+      min: 1
+      max: 256
+  max_num_batched_tokens:
+    interval:
+      min: 2048
+      max: 8192
+  tensor_parallel_size:
+    default: true
+  attention_backend:
+    default: true
+  speculative_mode:
+    default: true
+  num_speculative_tokens:
+    default: true

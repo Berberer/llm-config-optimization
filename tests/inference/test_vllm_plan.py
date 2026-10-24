@@ -11,6 +11,7 @@ measurement controls. The client command is deliberately absent: the host
 benchmark client owns the workload now.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ from llm_config_optimization.inference import (
     LLMConfig,
     LocalCheckpoint,
     ServerSpec,
+    SpeculativeMethod,
     VLLMBackend,
 )
 from llm_config_optimization.runtime import Mount
@@ -35,6 +37,7 @@ HUB_MODEL = "meta-llama/Llama-3.1-8B"
 _HF_CACHE_HOST = Path.home() / ".cache" / "huggingface"
 _HF_CACHE_TARGET = "/root/.cache/huggingface"
 _MODEL_TARGET = "/model"
+_DRAFT_TARGET = "/draft-model"
 _CACHE_TARGET = "/vllm-cache"
 
 
@@ -378,6 +381,97 @@ def test_local_model_is_mounted_read_only_and_addressed_in_container(tmp_path: P
     assert mount.options == ("z",)
     serve = _serve(spec)
     assert serve[serve.index("--model") + 1] == _MODEL_TARGET
+
+
+def test_a_resolved_local_draft_is_mounted_and_addressed_in_container(tmp_path: Path) -> None:
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    experiment = _experiment(
+        llm=LLMConfig(
+            speculative_method=SpeculativeMethod.DRAFT_MODEL,
+            draft_model="org/draft",
+            resolved_draft_path=draft,
+        )
+    )
+
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1))
+
+    mount = _mount_for(spec, _DRAFT_TARGET)
+    assert mount.source == str(draft)
+    assert mount.read_only is True
+    serve = _serve(spec)
+    payload = json.loads(serve[serve.index("--speculative-config") + 1])
+    assert payload["model"] == _DRAFT_TARGET
+
+
+def test_a_resolved_hub_draft_reuses_the_main_models_cache_root_mount(tmp_path: Path) -> None:
+    """A draft beside the model in the cache hub rides the existing mount."""
+    hub = tmp_path / "hub"
+    (hub / "blobs").mkdir(parents=True)
+    model_snapshot = hub / "models--org--target" / "snapshots" / "aaa"
+    draft_snapshot = hub / "models--org--draft" / "snapshots" / "bbb"
+    model_snapshot.mkdir(parents=True)
+    draft_snapshot.mkdir(parents=True)
+    experiment = _experiment(
+        benchmark=BenchmarkConfig(model=HUB_MODEL, resolved_path=model_snapshot),
+        llm=LLMConfig(
+            speculative_method=SpeculativeMethod.DRAFT_MODEL,
+            draft_model="org/draft",
+            resolved_draft_path=draft_snapshot,
+        ),
+    )
+
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1))
+
+    assert _mount_for(spec, _MODEL_TARGET).source == str(hub)
+    assert all(mount.target != _DRAFT_TARGET for mount in spec.container.volumes)
+    serve = _serve(spec)
+    payload = json.loads(serve[serve.index("--speculative-config") + 1])
+    assert payload["model"] == f"{_MODEL_TARGET}/models--org--draft/snapshots/bbb"
+
+
+def test_a_resolved_hub_draft_gets_its_own_mount_when_the_root_differs(
+    tmp_path: Path,
+) -> None:
+    """A draft in another cache root is mounted separately from a local model."""
+    model_path = tmp_path / "checkpoint"
+    model_path.mkdir()
+    hub = tmp_path / "hub"
+    (hub / "blobs").mkdir(parents=True)
+    draft_snapshot = hub / "models--org--draft" / "snapshots" / "bbb"
+    draft_snapshot.mkdir(parents=True)
+    experiment = _experiment(
+        benchmark=BenchmarkConfig(model=str(model_path)),
+        llm=LLMConfig(
+            speculative_method=SpeculativeMethod.DRAFT_MODEL,
+            draft_model="org/draft",
+            resolved_draft_path=draft_snapshot,
+        ),
+    )
+
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1))
+
+    assert _mount_for(spec, _MODEL_TARGET).source == str(model_path.resolve())
+    assert _mount_for(spec, _DRAFT_TARGET).source == str(hub)
+    serve = _serve(spec)
+    payload = json.loads(serve[serve.index("--speculative-config") + 1])
+    assert payload["model"] == f"{_DRAFT_TARGET}/models--org--draft/snapshots/bbb"
+
+
+def test_an_unresolved_draft_is_passed_through_without_a_draft_mount() -> None:
+    experiment = _experiment(
+        llm=LLMConfig(
+            speculative_method=SpeculativeMethod.EAGLE3,
+            draft_model="org/eagle3-draft",
+        )
+    )
+
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1))
+
+    assert all(mount.target != _DRAFT_TARGET for mount in spec.container.volumes)
+    serve = _serve(spec)
+    payload = json.loads(serve[serve.index("--speculative-config") + 1])
+    assert payload["model"] == "org/eagle3-draft"
 
 
 def test_hugging_face_cache_is_mounted_for_weight_reuse() -> None:

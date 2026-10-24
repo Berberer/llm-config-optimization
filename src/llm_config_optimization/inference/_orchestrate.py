@@ -9,6 +9,7 @@ backend and the engine-neutral :class:`ServerSpec` it returns.
 """
 
 import re
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ..runtime import start_container
@@ -28,7 +29,82 @@ from .types import (
 if TYPE_CHECKING:
     from podman import PodmanClient
 
-__all__ = ["run_experiment"]
+__all__ = ["measure_dataset_request_tokens", "run_experiment"]
+
+
+def measure_dataset_request_tokens(
+    config: ExperimentConfig,
+    backend: InferenceBackend,
+    hardware: DetectedHardware,
+    *,
+    client: PodmanClient | None = None,
+    benchmark_client: BenchmarkClient | None = None,
+) -> int | None:
+    """Measure a JSONL dataset's longest request with the engine's tokenizer.
+
+    A dataset's prompts are text, so only the engine knows their token counts.
+    This starts the backend's server once, before the sweep, with a minimal plan
+    (one slot and no speculative setup), asks the spec's tokenizer endpoint for
+    every prompt's length, and returns the largest ``prompt_tokens +
+    output_len``. The result is recorded on the base configuration so every
+    trial can cap its slot count against the real workload instead of a guess.
+
+    A benchmark without a dataset path, or a backend whose spec declares no
+    tokenizer endpoint, needs no preflight and returns ``None`` without
+    starting a container. The one server start is the cost of an accurate cap;
+    a failure is raised as :class:`ExperimentError` with the container output
+    attached, and the CLI may choose to warn and fall back to a conservative
+    slot count.
+    """
+    if config.benchmark.dataset_path is None:
+        return None
+    resolved_client = benchmark_client if benchmark_client is not None else BenchmarkClient()
+    preflight = replace(
+        config,
+        llm=replace(
+            config.llm,
+            max_num_seqs=1,
+            speculative_method=None,
+            draft_model=None,
+            speculative_mode=None,
+            num_speculative_tokens=None,
+            resolved_draft_path=None,
+        ),
+    )
+    spec = backend.plan(preflight, hardware)
+    if spec.tokenize_path is None:
+        return None
+    try:
+        handle = start_container(spec.container, client=client)
+    except ContainerRunError as exc:
+        message = f"benchmark server for model {config.benchmark.model!r} failed to start: {exc}"
+        detail = _failure_output(exc.result)
+        if detail:
+            message = f"{message}\n{detail}"
+        raise ExperimentError(message, raw_result=exc.result) from exc
+    try:
+        base_url = _base_url(spec, handle)
+        tokens = resolved_client.dataset_request_tokens_sync(
+            base_url,
+            config.benchmark.model,
+            spec,
+            config.benchmark,
+            is_alive=handle.is_running,
+        )
+    except ExperimentError as exc:
+        result = _stop_with_logs(handle)
+        detail = _failure_output(result)
+        message = str(exc) if not detail else f"{exc}\n{detail}"
+        raise ExperimentError(message, raw_result=result) from exc
+    except BaseException:
+        handle.remove()
+        raise
+    try:
+        handle.stop()
+    except ContainerRunError as exc:
+        message = f"failed to stop the benchmark server for {config.benchmark.model!r}: {exc}"
+        raise ExperimentError(message, raw_result=exc.result) from exc
+    return tokens
 
 
 def run_experiment(

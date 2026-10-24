@@ -27,7 +27,7 @@ import optuna
 import pytest
 import yaml
 
-from fakes import FakeBackend, FakePodmanClient
+from fakes import FakeBackend, FakeBenchmarkClient, FakePodmanClient
 from llm_config_optimization.cli import main
 from llm_config_optimization.inference import (
     BenchmarkOutcome,
@@ -37,10 +37,12 @@ from llm_config_optimization.inference import (
     ExperimentResult,
     HardwareTarget,
     LlamaCppBackend,
+    LocalCheckpoint,
     ModelRequest,
     QuantizationMethod,
     RunMetrics,
     ServerSpec,
+    SpeculativeMethod,
     VLLMBackend,
 )
 from llm_config_optimization.optimization import ObjectiveMode
@@ -83,7 +85,9 @@ def _backend() -> FakeBackend:
 class UnsupportedBackend(FakeBackend):
     """A backend that reports the space as unsupported during validation."""
 
-    def validate(self, space: object, hardware: DetectedHardware | None = None) -> tuple[str, ...]:
+    def validate(
+        self, space: object, llm: object, hardware: DetectedHardware | None = None
+    ) -> tuple[str, ...]:
         return ("space.dtype: the backend does not support this dtype",)
 
 
@@ -94,7 +98,9 @@ class HardwareRecordingBackend(FakeBackend):
         super().__init__(PLAN, RESULT, [])
         self.validated_hardware: list[DetectedHardware | None] = []
 
-    def validate(self, space: object, hardware: DetectedHardware | None = None) -> tuple[str, ...]:
+    def validate(
+        self, space: object, llm: object, hardware: DetectedHardware | None = None
+    ) -> tuple[str, ...]:
         self.validated_hardware.append(hardware)
         return ()
 
@@ -133,6 +139,28 @@ class UnresolvableModelBackend(FakeBackend):
 
     def model_request(self, model: str) -> ModelRequest:
         raise ExperimentError("the repository holds several GGUF files; select one with :QUANT")
+
+
+class UnresolvableDraftBackend(FakeBackend):
+    """A backend that resolves the main model but rejects the draft source.
+
+    It stands in for llama.cpp's draft rules, which reject a repository with no
+    GGUF file or an ambiguous ``:QUANT`` selector. The composition root must map
+    that rejection to the unsupported-model exit code before anything is
+    planned or pulled, just as it does for the main model.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(PLAN, RESULT, [])
+
+    def model_request(self, model: str) -> ModelRequest:
+        self.model_request_calls.append(model)
+        path = Path(model).expanduser()
+        if path.exists():
+            return LocalCheckpoint(path=path.resolve())
+        raise ExperimentError(
+            "the draft repository holds several GGUF files; select one with :QUANT"
+        )
 
 
 class CheckpointValidatingBackend(FakeBackend):
@@ -407,6 +435,167 @@ def test_invalid_objective_weights_are_a_usage_error_before_any_preparation(
     assert client.pull_calls == []
 
 
+def test_a_missing_dataset_is_a_usage_error_before_any_preparation(
+    tmp_path: Path, model: str
+) -> None:
+    """A dataset that cannot be read fails once, before the first trial."""
+    space = _write_space(tmp_path / "space.yaml")
+    backend = _backend()
+    client = FakePodmanClient()
+    missing = tmp_path / "missing.jsonl"
+
+    code, out, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--dataset-path",
+        str(missing),
+        backend=backend,
+        client=client,
+    )
+
+    assert code == 2
+    assert out == ""
+    assert "could not read the dataset" in err
+    assert str(missing) in err
+    assert backend.model_request_calls == []
+    assert backend.plan_calls == []
+    assert client.pull_calls == []
+
+
+def test_a_malformed_dataset_is_a_usage_error_before_any_preparation(
+    tmp_path: Path, model: str
+) -> None:
+    """A dataset line outside the JSONL contract fails before the sweep."""
+    space = _write_space(tmp_path / "space.yaml")
+    backend = _backend()
+    dataset = tmp_path / "prompts.jsonl"
+    dataset.write_text('{"output_len": 3}\n', encoding="utf-8")
+
+    code, out, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--dataset-path",
+        str(dataset),
+        backend=backend,
+    )
+
+    assert code == 2
+    assert out == ""
+    assert "has no string 'prompt'" in err
+    assert backend.model_request_calls == []
+    assert backend.plan_calls == []
+
+
+def test_a_non_random_dataset_name_with_a_path_is_a_usage_error(tmp_path: Path, model: str) -> None:
+    """A named dataset a custom path would silently ignore is rejected early."""
+    space = _write_space(tmp_path / "space.yaml")
+    dataset = tmp_path / "prompts.jsonl"
+    dataset.write_text('{"prompt": "hello"}\n', encoding="utf-8")
+
+    code, out, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--dataset-name",
+        "sharegpt",
+        "--dataset-path",
+        str(dataset),
+    )
+
+    assert code == 2
+    assert out == ""
+    assert "dataset_path" in err
+
+
+def test_a_dataset_is_tokenized_before_the_sweep(tmp_path: Path, model: str) -> None:
+    """The measured request length reaches every trial's plan."""
+    space = _write_space(tmp_path / "space.yaml")
+    dataset = tmp_path / "prompts.jsonl"
+    dataset.write_text('{"prompt": "hello", "output_len": 4}\n', encoding="utf-8")
+    spec = ServerSpec(
+        container=ContainerConfig(
+            image="fake/engine:latest", command=("serve",), ports={"8000": None}
+        ),
+        health_path="/health",
+        health_timeout=600.0,
+        tokenize_path="/tokenize",
+        tokenize_prompt_field="content",
+    )
+    backend = FakeBackend(spec, RESULT, [])
+    benchmark_client = FakeBenchmarkClient(request_tokens=777)
+    out, err = StringIO(), StringIO()
+
+    code = main(
+        [
+            model,
+            str(space),
+            "vllm",
+            "--target",
+            "cpu",
+            "--n-trials",
+            "1",
+            "--dataset-path",
+            str(dataset),
+        ],
+        backend=backend,
+        client=FakePodmanClient(),
+        benchmark_client=benchmark_client,
+        stdout=out,
+        stderr=err,
+    )
+
+    assert code == 0
+    assert err.getvalue() == ""
+    assert len(benchmark_client.tokenize_calls) == 1
+    assert backend.plan_calls[-1][0].benchmark.max_request_tokens == 777
+
+
+def test_a_failed_dataset_preflight_warns_and_keeps_the_sweep(tmp_path: Path, model: str) -> None:
+    """A tokenization failure falls back to the backend's conservative cap."""
+    space = _write_space(tmp_path / "space.yaml")
+    dataset = tmp_path / "prompts.jsonl"
+    dataset.write_text('{"prompt": "hello"}\n', encoding="utf-8")
+    spec = ServerSpec(
+        container=ContainerConfig(
+            image="fake/engine:latest", command=("serve",), ports={"8000": None}
+        ),
+        health_path="/health",
+        health_timeout=600.0,
+        tokenize_path="/tokenize",
+    )
+    backend = FakeBackend(spec, RESULT, [])
+    benchmark_client = FakeBenchmarkClient(tokenize_error=ExperimentError("the tokenizer failed"))
+    out, err = StringIO(), StringIO()
+
+    code = main(
+        [
+            model,
+            str(space),
+            "vllm",
+            "--target",
+            "cpu",
+            "--n-trials",
+            "1",
+            "--dataset-path",
+            str(dataset),
+        ],
+        backend=backend,
+        client=FakePodmanClient(),
+        benchmark_client=benchmark_client,
+        stdout=out,
+        stderr=err,
+    )
+
+    assert code == 0
+    assert "could not measure the dataset's token lengths" in err.getvalue()
+    assert backend.plan_calls[-1][0].benchmark.max_request_tokens is None
+
+
 def test_the_llamacpp_engine_is_selected_through_the_registry(
     tmp_path: Path, model: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -520,6 +709,98 @@ def test_the_resolved_checkpoint_reaches_the_planned_run(tmp_path: Path, model: 
     assert planned.benchmark.model == model
 
 
+def test_the_resolved_local_draft_reaches_the_planned_run(tmp_path: Path, model: str) -> None:
+    """A host draft is resolved through the backend hook and recorded for planning."""
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    space = _write_space(tmp_path / "space.yaml")
+    backend = _backend()
+
+    code, out, err = _invoke(
+        model, space, "--n-trials", "1", "--draft-model", str(draft), backend=backend
+    )
+
+    assert code == 0
+    assert "synthetic random workload" in err
+    assert backend.model_request_calls == [model, str(draft)]
+    assert f"using local draft model: {draft.resolve()}" in out
+    planned, _ = backend.plan_calls[0]
+    assert planned.llm.speculative_method is SpeculativeMethod.DRAFT_MODEL
+    assert planned.llm.draft_model == str(draft)
+    assert planned.llm.resolved_draft_path == draft.resolve()
+
+
+def test_a_hub_draft_is_downloaded_with_the_shared_helper(
+    tmp_path: Path, model: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both checkpoints are prefetched: a local target and a downloaded draft."""
+    draft = tmp_path / "draft-cache"
+    draft.mkdir()
+    downloads: list[tuple[str, str | None]] = []
+
+    def fake_download(repo_id: str, stream: object, *, filename: str | None = None) -> Path:
+        downloads.append((repo_id, filename))
+        return draft
+
+    monkeypatch.setattr("llm_config_optimization.cli.download_model", fake_download)
+    space = _write_space(tmp_path / "space.yaml")
+    backend = _backend()
+
+    code, out, err = _invoke(
+        model, space, "--n-trials", "1", "--draft-model", "org/draft", backend=backend
+    )
+
+    assert code == 0
+    assert "synthetic random workload" in err
+    assert downloads == [("org/draft", None)]
+    assert "resolving draft model: org/draft" in out
+    planned, _ = backend.plan_calls[0]
+    assert planned.llm.draft_model == "org/draft"
+    assert planned.llm.resolved_draft_path == draft
+
+
+def test_an_unresolvable_draft_argument_is_an_unsupported_model(tmp_path: Path, model: str) -> None:
+    """A draft rejection maps to the unsupported code before any plan or pull."""
+    space = _write_space(tmp_path / "space.yaml")
+    client = FakePodmanClient()
+    backend = UnresolvableDraftBackend()
+
+    code, out, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--draft-model",
+        "org/draft",
+        backend=backend,
+        client=client,
+    )
+
+    assert code == 4
+    assert "unsupported draft model" in err
+    assert "several GGUF files" in err
+    assert "preparing study" not in out
+    assert backend.plan_calls == []
+    assert client.pull_calls == []
+
+
+def test_the_resolved_draft_reaches_model_validation(tmp_path: Path, model: str) -> None:
+    """The draft path is recorded before the backend's model-aware check runs."""
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    space = _write_space(tmp_path / "space.yaml")
+    backend = ModelProblemBackend()
+
+    code, _, err = _invoke(
+        model, space, "--n-trials", "1", "--draft-model", str(draft), backend=backend
+    )
+
+    assert code == 0
+    assert "synthetic random workload" in err
+    experiment, _ = backend.model_calls[0]
+    assert experiment.llm.resolved_draft_path == draft.resolve()
+
+
 def test_an_unresolvable_model_argument_is_an_unsupported_model(tmp_path: Path, model: str) -> None:
     """A backend rejection while resolving MODEL maps to the unsupported code.
 
@@ -594,6 +875,119 @@ def test_the_budget_reports_the_sweep_timeout(tmp_path: Path, model: str) -> Non
     assert code == 0
     assert err == ""
     assert "budget: 2 trials, 30s" in out
+
+
+def test_the_header_names_the_configured_speculative_setup(tmp_path: Path, model: str) -> None:
+    """A configured setup is named with its method and draft source."""
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    space = _write_space(tmp_path / "space.yaml")
+
+    code, out, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--speculative-method",
+        "eagle3",
+        "--draft-model",
+        str(draft),
+    )
+
+    assert code == 0
+    assert "synthetic random workload" in err
+    assert f"speculation: eagle3 ({draft})" in out
+
+
+def test_a_bare_draft_model_names_the_implied_method_in_the_header(
+    tmp_path: Path, model: str
+) -> None:
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    space = _write_space(tmp_path / "space.yaml")
+
+    code, out, err = _invoke(model, space, "--n-trials", "1", "--draft-model", str(draft))
+
+    assert code == 0
+    assert "synthetic random workload" in err
+    assert f"speculation: draft_model ({draft})" in out
+
+
+def test_speculation_on_the_synthetic_workload_warns(tmp_path: Path, model: str) -> None:
+    """A speculative setup without a dataset warns on stderr before the sweep."""
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    space = _write_space(tmp_path / "space.yaml")
+
+    code, out, err = _invoke(model, space, "--n-trials", "1", "--draft-model", str(draft))
+
+    assert code == 0
+    assert "--dataset-path" in err
+    assert "synthetic random workload" in err
+    assert "preparing study" in out
+
+
+def test_speculation_with_a_dataset_prints_no_warning(tmp_path: Path, model: str) -> None:
+    """A real dataset makes the synthetic-workload warning unnecessary."""
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    dataset = tmp_path / "prompts.jsonl"
+    dataset.write_text('{"prompt": "hello"}\n', encoding="utf-8")
+    space = _write_space(tmp_path / "space.yaml")
+
+    code, _, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--draft-model",
+        str(draft),
+        "--dataset-path",
+        str(dataset),
+    )
+
+    assert code == 0
+    assert err == ""
+
+
+def test_an_unconfigured_run_prints_no_speculation_line(tmp_path: Path, model: str) -> None:
+    space = _write_space(tmp_path / "space.yaml")
+
+    code, out, err = _invoke(model, space, "--n-trials", "1")
+
+    assert code == 0
+    assert err == ""
+    assert "speculation:" not in out
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--speculative-method", "eagle3"], "requires --draft-model"),
+        (
+            ["--speculative-method", "ngram", "--draft-model", "org/draft"],
+            "ngram",
+        ),
+    ],
+    ids=["missing-draft", "ngram-with-draft"],
+)
+def test_an_incoherent_speculative_setup_is_a_usage_error(
+    tmp_path: Path, model: str, extra: list[str], message: str
+) -> None:
+    """A setup that cannot be served fails before the space is loaded or anything is pulled."""
+    space = _write_space(tmp_path / "space.yaml")
+    backend = _backend()
+    client = FakePodmanClient()
+
+    code, out, err = _invoke(
+        model, space, "--n-trials", "1", *extra, backend=backend, client=client
+    )
+
+    assert code == 2
+    assert out == ""
+    assert message in err
+    assert backend.plan_calls == []
+    assert client.pull_calls == []
 
 
 @pytest.mark.parametrize(

@@ -24,6 +24,7 @@ from llm_config_optimization.inference import (
     BenchmarkConfig,
     ExperimentError,
     ServerSpec,
+    validate_dataset,
 )
 from llm_config_optimization.runtime import ContainerConfig
 
@@ -75,6 +76,7 @@ class FakeEngine:
         self.health_attempts = 0
         self.metrics_attempts = 0
         self.completions: list[dict[str, object]] = []
+        self.tokenizations: list[str] = []
         self.resets: list[str] = []
         self.events: list[str] = []
         self.in_flight = 0
@@ -103,6 +105,11 @@ class FakeEngine:
             if text is None:
                 return httpx2.Response(500, json={"error": "boom"})
             return httpx2.Response(200, text=text)
+        if path == "/tokenize":
+            body = json.loads(request.content)
+            content = body["content"]
+            self.tokenizations.append(content)
+            return httpx2.Response(200, json={"tokens": [0] * len(content.split())})
         if path == "/v1/completions":
             self.in_flight += 1
             self.max_in_flight = max(self.max_in_flight, self.in_flight)
@@ -136,6 +143,7 @@ def _spec(
     health_timeout: float = 60.0,
     reset_paths: tuple[str, ...] = (),
     metrics_path: str | None = None,
+    tokenize_path: str | None = None,
 ) -> ServerSpec:
     return ServerSpec(
         container=ContainerConfig(image="fake/server:latest"),
@@ -143,6 +151,8 @@ def _spec(
         health_timeout=health_timeout,
         reset_paths=reset_paths,
         metrics_path=metrics_path,
+        tokenize_path=tokenize_path,
+        tokenize_prompt_field="content",
     )
 
 
@@ -271,6 +281,76 @@ def test_a_malformed_dataset_line_is_rejected(tmp_path: Path) -> None:
             _spec(),
             _random_benchmark(dataset_name=None, dataset_path=str(dataset)),
         )
+
+
+def test_validate_dataset_accepts_a_valid_file(tmp_path: Path) -> None:
+    dataset = tmp_path / "data.jsonl"
+    dataset.write_text('{"prompt": "hello"}\n', encoding="utf-8")
+
+    validate_dataset(_random_benchmark(dataset_name=None, dataset_path=str(dataset)))
+
+
+def test_validate_dataset_reports_a_missing_file(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.jsonl"
+
+    with pytest.raises(ExperimentError, match="could not read the dataset"):
+        validate_dataset(_random_benchmark(dataset_name=None, dataset_path=str(missing)))
+
+
+def test_validate_dataset_reports_a_malformed_file(tmp_path: Path) -> None:
+    dataset = tmp_path / "data.jsonl"
+    dataset.write_text('{"output_len": 3}\n', encoding="utf-8")
+
+    with pytest.raises(ExperimentError, match="prompt"):
+        validate_dataset(_random_benchmark(dataset_name=None, dataset_path=str(dataset)))
+
+
+def test_validate_dataset_rejects_a_named_dataset_with_a_path(tmp_path: Path) -> None:
+    dataset = tmp_path / "data.jsonl"
+    dataset.write_text('{"prompt": "hello"}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dataset_path"):
+        validate_dataset(_random_benchmark(dataset_name="sharegpt", dataset_path=str(dataset)))
+
+
+def test_validate_dataset_leaves_the_random_workload_alone() -> None:
+    validate_dataset(_random_benchmark())
+
+
+def test_dataset_request_tokens_measures_the_longest_request(tmp_path: Path) -> None:
+    dataset = tmp_path / "data.jsonl"
+    dataset.write_text(
+        '{"prompt": "one two three", "output_len": 5}\n{"prompt": "a b", "output_len": 10}\n',
+        encoding="utf-8",
+    )
+    engine = FakeEngine()
+    client = _client(engine)
+    benchmark = _random_benchmark(
+        dataset_name=None,
+        dataset_path=str(dataset),
+        num_prompts=None,
+        output_len=1,
+    )
+
+    tokens = client.dataset_request_tokens_sync(
+        "http://engine", MODEL, _spec(tokenize_path="/tokenize"), benchmark
+    )
+
+    assert tokens == 12  # "a b" is 2 tokens plus its 10 requested output tokens
+    assert engine.tokenizations == ["one two three", "a b"]
+
+
+def test_dataset_request_tokens_is_skipped_without_a_tokenizer(tmp_path: Path) -> None:
+    dataset = tmp_path / "data.jsonl"
+    dataset.write_text('{"prompt": "hello"}\n', encoding="utf-8")
+    engine = FakeEngine()
+    client = _client(engine)
+    benchmark = _random_benchmark(dataset_name=None, dataset_path=str(dataset))
+
+    tokens = client.dataset_request_tokens_sync("http://engine", MODEL, _spec(), benchmark)
+
+    assert tokens is None
+    assert engine.tokenizations == []
 
 
 def test_a_run_whose_requests_all_fail_is_counted_as_failed() -> None:

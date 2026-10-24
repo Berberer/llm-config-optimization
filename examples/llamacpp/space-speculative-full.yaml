@@ -1,0 +1,37 @@
+# The complete llama.cpp search space with the speculative trade-off in the
+# sweep: every trial either runs with the configured setup or with no
+# speculative flags at all, and the enabled trials sample one of four draft
+# depths. Configure the method and the optional draft model on the command
+# line, for example:
+#
+#   --speculative-method draft_model --draft-model path/to/draft.gguf
+#
+# A disabled trial frees the draft model's memory, which is what makes an
+# on/off comparison on constrained hardware meaningful. The depth is sampled on
+# every trial but only applied when the mode is enabled, so disabled points can
+# repeat across depth values; this is expected and harmless to the optimizer.
+#
+# Only the five parameters llama-server forwards are declared; `dtype` and
+# `tensor_parallel_size` are not applicable to a GGUF checkpoint. The slot cap
+# and context-size notes from `space-full.yaml` apply unchanged.
+space:
+  kv_cache_dtype:
+    categorical: [float16, bfloat16]
+  max_model_len:
+    interval:
+      min: 1024
+      max: 32768
+  max_num_seqs:
+    interval:
+      min: 1
+      max: 256
+  max_num_batched_tokens:
+    interval:
+      min: 2048
+      max: 8192
+  attention_backend:
+    default: true
+  speculative_mode:
+    categorical: [enabled, disabled]
+  num_speculative_tokens:
+    categorical: [1, 2, 4, 8]

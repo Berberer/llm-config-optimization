@@ -30,7 +30,6 @@ import os
 import struct
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
 from typing import BinaryIO
@@ -38,16 +37,14 @@ from typing import BinaryIO
 from huggingface_hub import list_repo_files as list_hub_files
 
 from ..runtime.types import ContainerConfig, ContainerResult, Mount
-from ..search_space.registry import TUNABLE_PARAMETERS
-from ..search_space.types import (
-    Categorical,
-    Default,
-    Dimension,
-    ExperimentSpace,
-    Fixed,
-    ParameterValue,
+from ..search_space.registry import (
+    SPECULATIVE_PARAMETERS,
+    TUNABLE_PARAMETERS,
+    speculative_configured,
 )
+from ..search_space.types import Default, ExperimentSpace
 from ._benchmark import _RESPONSES_KEY
+from ._tunables import Gate, translate_value, unsupported_values
 from .types import (
     AttentionBackend,
     BenchmarkConfig,
@@ -65,15 +62,21 @@ from .types import (
     QuantizationMethod,
     RunMetrics,
     ServerSpec,
+    SpeculativeMethod,
+    SpeculativeMode,
 )
 
-PARAMETER_TARGETS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+PARAMETER_TARGETS: Mapping[str, tuple[str, ...] | Gate] = MappingProxyType(
     {
         "kv_cache_dtype": ("--cache-type-k", "--cache-type-v"),
         "max_model_len": ("--ctx-size",),
         "max_num_seqs": ("--parallel",),
         "max_num_batched_tokens": ("--batch-size", "--ubatch-size"),
         "attention_backend": ("--flash-attn",),
+        "speculative_method": ("--spec-type",),
+        "draft_model": ("--spec-draft-model",),
+        "speculative_mode": Gate(),
+        "num_speculative_tokens": ("--spec-draft-n-max",),
     }
 )
 """Where each applicable :class:`LLMConfig` field is sent on ``llama-server``.
@@ -85,11 +88,22 @@ symmetric options — ``kv_cache_dtype`` configures both the K and the V cache
 type, which must agree for the cache the user asked for — or applies it at two
 levels, as ``max_num_batched_tokens`` does for the logical ``--batch-size`` and
 the physical ``--ubatch-size``. The latter defaults to 512, which throttles a
-prompt-heavy workload unless the sampled batch raises it. An empty or absent
-entry means the field is never forwarded.
+prompt-heavy workload unless the sampled batch raises it. The speculative
+method, draft model, and depth each map to one ``--spec-*`` flag, while
+``speculative_mode`` is a :class:`Gate`: it is recognised as applicable but
+never forwarded, because it only decides whether the other three are emitted.
+An empty, absent, or gate entry means the field is never serialised.
 
 The insertion order is the canonical argument order: it follows the fields in
 :class:`LLMConfig`, so a run's command is deterministic.
+"""
+
+_SPECULATIVE_FIELDS = frozenset({"speculative_method", "draft_model", "num_speculative_tokens"})
+"""The fields suppressed when the speculative mode is disabled.
+
+``speculative_mode`` is absent because it is the gate rather than a forwarded
+field: a disabled mode drops these fields so the engine starts with no
+speculative flags and the draft model's memory is genuinely freed.
 """
 
 VALUE_MAPS: Mapping[str, Mapping[object, str]] = MappingProxyType(
@@ -100,6 +114,18 @@ VALUE_MAPS: Mapping[str, Mapping[object, str]] = MappingProxyType(
         },
         "attention_backend": {
             AttentionBackend.FLASH_ATTENTION: "on",
+        },
+        "speculative_method": {
+            SpeculativeMethod.DRAFT_MODEL: "draft-simple",
+            SpeculativeMethod.EAGLE3: "draft-eagle3",
+            SpeculativeMethod.MTP: "draft-mtp",
+            SpeculativeMethod.DFLASH: "draft-dflash",
+            SpeculativeMethod.DSPARK: "draft-dspark",
+            SpeculativeMethod.NGRAM: "ngram-simple",
+        },
+        "speculative_mode": {
+            SpeculativeMode.ENABLED: "enabled",
+            SpeculativeMode.DISABLED: "disabled",
         },
     }
 )
@@ -114,31 +140,17 @@ as ``default: true`` instead of naming a value.
 ``kv_cache_dtype`` is curated to the portable element formats llama.cpp accepts:
 ``auto`` and the FP8 members have no equivalent here. For ``attention_backend``
 only the flash-attention implementation is modelled, mapped to the engine's
-``on`` setting; ``flash_infer`` and ``xformers`` are vLLM-only backends.
+``on`` setting; ``flash_infer`` and ``xformers`` are vLLM-only backends. The six
+speculative methods map onto llama.cpp's ``--spec-type`` spellings; the
+engine-only n-gram cache, map, and mod variants stay behind ``extra_args``.
 """
-
-
-def _translate_value(field: str, value: object) -> object:
-    """Translate an engine-neutral categorical value into llama.cpp's spelling.
-
-    Values for fields without a value map, and values that are not enum
-    members, pass through unchanged. An enum member absent from its field's map
-    is not supported by this backend and raises rather than being silently
-    dropped, so a requested configuration is never quietly ignored.
-    """
-    mapping = VALUE_MAPS.get(field)
-    if mapping is None or not isinstance(value, Enum):
-        return value
-    try:
-        return mapping[value]
-    except KeyError:
-        raise ExperimentError(f"llama.cpp does not support {field}={value.value!r}") from None
 
 
 def serve_arguments(
     config: LLMConfig,
     *,
     extra_args: Sequence[str] = (),
+    draft_repository: str | None = None,
 ) -> list[str]:
     """Turn an LLM config into the ``llama-server`` arguments that carry it.
 
@@ -150,16 +162,38 @@ def serve_arguments(
     workload is assembled separately by the host benchmark client, so the server
     command carries no workload flags.
 
+    The speculative method, draft model, and depth target their own
+    ``--spec-*`` flags, translated into llama.cpp's spellings. A disabled
+    speculative mode suppresses all three so no speculative flag reaches the
+    engine; an unset mode means the configured setup's default and emits them,
+    and an unset depth omits only ``--spec-draft-n-max`` so the engine keeps its
+    own draft depth.
+
+    ``draft_repository`` is the repository a plan could not resolve to a local
+    file. It replaces the ``--spec-draft-model`` target at the draft model's
+    position in the canonical order, because llama.cpp fetches a repository
+    through its own ``--spec-draft-hf`` flag rather than through a file path.
+    It is suppressed with the other speculative fields when the mode is
+    disabled.
+
     Raises :class:`ExperimentError` for an enum value the engine has no spelling
     for.
     """
+    suppressed = (
+        _SPECULATIVE_FIELDS if config.speculative_mode is SpeculativeMode.DISABLED else frozenset()
+    )
     arguments: list[str] = []
-    for field, flags in PARAMETER_TARGETS.items():
+    for field, target in PARAMETER_TARGETS.items():
+        if field in suppressed or isinstance(target, Gate):
+            continue
+        if field == "draft_model" and draft_repository is not None:
+            arguments.extend(("--spec-draft-hf", draft_repository))
+            continue
         value = getattr(config, field)
         if value is None:
             continue
-        translated = _translate_value(field, value)
-        for flag in flags:
+        translated = translate_value(field, value, VALUE_MAPS, engine="llama.cpp")
+        for flag in target:
             arguments.extend((flag, str(translated)))
     return [*arguments, *extra_args]
 
@@ -169,26 +203,31 @@ def _planned_llm(config: LLMConfig, benchmark: BenchmarkConfig) -> LLMConfig:
 
     llama.cpp splits ``--ctx-size`` evenly across the ``--parallel`` slots, so a
     request longer than a slot's share is rejected no matter how many slots the
-    engine was asked for. For the random workload the request length is known —
-    ``input_len + output_len`` — so the slot count is capped at
-    ``max_model_len // (input_len + output_len)``, at least one, and only then
-    is ``--parallel`` forwarded. The sampled ``max_model_len`` still reaches the
-    engine as ``--ctx-size`` unchanged; a context smaller than the request
+    engine was asked for. The request length is the random workload's known
+    ``input_len + output_len`` or, for a JSONL dataset, the measured
+    ``max_request_tokens`` a preflight tokenization recorded. The slot count is
+    then capped at ``max_model_len // request_tokens``, at least one, and only
+    then is ``--parallel`` forwarded. The sampled ``max_model_len`` still reaches
+    the engine as ``--ctx-size`` unchanged; a context smaller than the request
     length cannot be served at any slot count, so its trial fails at the engine.
 
-    A workload whose request length this layer cannot know — a JSONL
-    ``dataset_path``, or an unset length — leaves the declared slot count alone,
-    because there is nothing to size it against.
+    A dataset workload whose token length could not be measured — the preflight
+    was skipped or failed — conservatively forwards one slot, which gives every
+    prompt the whole context instead of letting a large sampled slot count
+    reject it. A workload whose request length is genuinely unknown, such as an
+    unset random length, leaves the declared slot count alone because there is
+    nothing to size it against.
     """
-    if (
-        config.max_model_len is None
-        or config.max_num_seqs is None
-        or benchmark.dataset_path is not None
-        or benchmark.input_len is None
-        or benchmark.output_len is None
-    ):
+    if config.max_model_len is None or config.max_num_seqs is None:
         return config
-    request_tokens = benchmark.input_len + benchmark.output_len
+    if benchmark.dataset_path is not None:
+        request_tokens = benchmark.max_request_tokens
+        if request_tokens is None:
+            return replace(config, max_num_seqs=1)
+    elif benchmark.input_len is not None and benchmark.output_len is not None:
+        request_tokens = benchmark.input_len + benchmark.output_len
+    else:
+        return config
     if request_tokens < 1:
         return config
     return replace(
@@ -505,6 +544,14 @@ a snapshot download's relative link cannot dangle inside the container the way
 it would if only its parent directory were mounted.
 """
 
+_DRAFT_MOUNT_PATH = "/models/draft.gguf"
+"""Where a resolved draft GGUF checkpoint is mounted inside the container.
+
+The draft gets its own fixed target so it never contends with the main model's
+``/models/model.gguf``, which also keeps a local target and a local draft
+addressable at the same time.
+"""
+
 _SERVER_PORT = 8080
 """The container port the server binds and the plan publishes.
 
@@ -524,6 +571,14 @@ container loopback.
 
 _HEALTH_PATH = "/health"
 """The llama-server endpoint the host client polls until the model is loaded."""
+
+_TOKENIZE_PATH = "/tokenize"
+"""The llama-server endpoint that returns a text's token ids.
+
+A preflight run uses it to measure a JSONL dataset's real request lengths, so
+slot planning can cap ``--parallel`` from the engine's own tokenizer rather
+than guessing from characters.
+"""
 
 _TIMINGS_KEY = "timings"
 """The per-response key carrying llama.cpp's own phase timings.
@@ -671,11 +726,11 @@ def _with_phase_rates(run: RunMetrics) -> RunMetrics:
     return replace(run, prefill_tokens_per_second=prefill, decode_tokens_per_second=decode)
 
 
-def _model_mount(path: Path) -> Mount:
-    """Build the read-only mount that exposes a GGUF checkpoint to the server."""
+def _model_mount(path: Path, target: str = _MODEL_MOUNT_PATH) -> Mount:
+    """Build the read-only mount that exposes a checkpoint to the server."""
     return Mount(
         source=str(path),
-        target=_MODEL_MOUNT_PATH,
+        target=target,
         read_only=True,
         options=_SELINUX_OPTIONS,
     )
@@ -709,33 +764,43 @@ def _model_arguments(
     return arguments, ()
 
 
-def _declared_values(dimension: Dimension) -> list[tuple[str, ParameterValue]]:
-    """Pair each value a dimension declares with the problem path naming it."""
-    spec = dimension.spec
-    if isinstance(spec, Fixed):
-        return [(f"space.{dimension.name}.fixed", spec.value)]
-    if isinstance(spec, Categorical):
-        return [
-            (f"space.{dimension.name}.categorical[{index}]", value)
-            for index, value in enumerate(spec.values)
-        ]
-    return []
+def _draft_arguments(
+    llm: LLMConfig,
+    list_repo_files: _RepoFileLister,
+) -> tuple[LLMConfig, tuple[Mount, ...], str | None]:
+    """Resolve the draft-model argument and any mount the server needs.
 
+    No configured draft leaves the config and the plan unchanged. A
+    ``resolved_draft_path`` — the draft file the composition root already
+    fetched — is mounted read-only at the fixed draft path and ``--spec-draft-
+    model`` is pointed at it. Without a resolved path, the engine's own
+    model-resolution rules decide: a local GGUF file is mounted the same way,
+    while a Hugging Face repository is returned as the repository string the
+    engine fetches itself through ``--spec-draft-hf``. The draft is mounted even
+    when the sampled mode disables speculation, but its arguments are suppressed
+    there, so the engine never loads it and its memory is genuinely freed.
 
-def _validate_spec_values(dimension: Dimension, field: str) -> list[str]:
-    """Report every declared value llama.cpp has no spelling for.
-
-    Only enum values are checked: a numeric parameter is forwarded verbatim, so
-    it has nothing to look up in :data:`VALUE_MAPS`. A categorical field with
-    no value map at all cannot translate any member and rejects every enum
-    value.
+    The returned config never carries the host draft path into an engine flag: a
+    mounted draft's ``draft_model`` is rewritten to the in-container path, and a
+    repository draft's ``draft_model`` is cleared because the repository is
+    returned separately under the engine's own flag.
     """
-    mapping = VALUE_MAPS.get(field)
-    problems: list[str] = []
-    for path, value in _declared_values(dimension):
-        if isinstance(value, Enum) and (mapping is None or value not in mapping):
-            problems.append(f"{path}: llama.cpp does not support {field}={value.value!r}")
-    return problems
+    if llm.draft_model is None:
+        return llm, (), None
+    if llm.resolved_draft_path is not None:
+        return (
+            replace(llm, draft_model=_DRAFT_MOUNT_PATH),
+            (_model_mount(llm.resolved_draft_path, _DRAFT_MOUNT_PATH),),
+            None,
+        )
+    request = model_request(llm.draft_model, list_repo_files=list_repo_files)
+    if isinstance(request, LocalCheckpoint):
+        return (
+            replace(llm, draft_model=_DRAFT_MOUNT_PATH),
+            (_model_mount(request.path, _DRAFT_MOUNT_PATH),),
+            None,
+        )
+    return replace(llm, draft_model=None), (), llm.draft_model
 
 
 def _quantization_problems(
@@ -763,7 +828,8 @@ class LlamaCppBackend:
 
     ``extra_args`` is the single escape hatch for ``llama-server`` flags the
     engine-neutral config does not model (``--n-gpu-layers``, ``--split-mode``,
-    and speculative decoding, for example). The sequence is appended verbatim
+    and the engine-only speculative variants, for example). The sequence is
+    appended verbatim
     to the assembled command, after the mapped parameters, so a caller can
     experiment without widening :class:`LLMConfig`; values passed this way are
     the caller's responsibility.
@@ -777,34 +843,41 @@ class LlamaCppBackend:
     extra_args: tuple[str, ...] = ()
     list_repo_files: _RepoFileLister = list_hub_files
 
-    @property
-    def applicable_parameters(self) -> frozenset[str]:
-        """Exactly the tunables this backend forwards.
+    def applicable_parameters(self, llm: LLMConfig) -> frozenset[str]:
+        """Exactly the tunables this backend forwards for ``llm``.
 
         llama.cpp can vary ``max_model_len``, ``max_num_seqs``,
         ``max_num_batched_tokens``, ``kv_cache_dtype``, and
         ``attention_backend``; ``dtype`` and ``tensor_parallel_size`` have no
         engine flag, so a definition may omit them and the loader does not
-        require them.
+        require them. The two speculative dimensions are added exactly when
+        ``llm`` configures a speculative method or draft model, so a
+        non-speculative space stays unchanged.
         """
-        return frozenset(
-            name for name, field in TUNABLE_PARAMETERS.items() if field in PARAMETER_TARGETS
+        applicable = frozenset(
+            name
+            for name, field in TUNABLE_PARAMETERS.items()
+            if field in PARAMETER_TARGETS and name not in SPECULATIVE_PARAMETERS
         )
+        if speculative_configured(llm):
+            return applicable | SPECULATIVE_PARAMETERS
+        return applicable
 
     def validate(
         self,
         space: ExperimentSpace,
+        llm: LLMConfig,
         hardware: DetectedHardware | None = None,
     ) -> Sequence[str]:
-        """Report every way llama.cpp cannot support ``space``.
+        """Report every way llama.cpp cannot support ``space`` for ``llm``.
 
         The space is assumed to have passed engine-agnostic validation. Every
-        dimension's parameter must be one the backend forwards, and every fixed
-        or categorical enum value must have a spelling in :data:`VALUE_MAPS`.
-        A ``Default`` dimension defers its value to the engine and carries
-        nothing to support-check. Problems are returned as strings so the
-        caller can aggregate them; an empty sequence means llama.cpp supports
-        every dimension.
+        dimension's parameter must be one the backend forwards for this run,
+        and every fixed or categorical enum value must have a spelling in
+        :data:`VALUE_MAPS`. A ``Default`` dimension defers its value to the
+        engine and carries nothing to support-check. Problems are returned as
+        strings so the caller can aggregate them; an empty sequence means
+        llama.cpp supports every dimension.
 
         ``hardware`` is accepted for the backend seam but adds no checks today:
         the modelled values are not accelerator-specific, and the numeric
@@ -812,37 +885,48 @@ class LlamaCppBackend:
         than rejected, so there is nothing to narrow before a sweep starts.
         """
         problems: list[str] = []
+        applicable = self.applicable_parameters(llm)
         for dimension in space.dimensions:
             field = TUNABLE_PARAMETERS[dimension.name]
-            if field not in PARAMETER_TARGETS:
+            if field not in PARAMETER_TARGETS or dimension.name not in applicable:
                 problems.append(f"space.{dimension.name}: llama.cpp does not forward {field!r}")
                 continue
             if isinstance(dimension.spec, Default):
                 continue
-            problems.extend(_validate_spec_values(dimension, field))
+            problems.extend(unsupported_values(dimension, field, VALUE_MAPS, engine="llama.cpp"))
         return problems
 
     def validate_model(self, experiment: ExperimentConfig, model: Path) -> Sequence[str]:
-        """Report every way the checkpoint at ``model`` cannot serve ``experiment``.
+        """Report every way the checkpoints cannot serve ``experiment``.
 
-        A non-GGUF checkpoint is rejected, because llama.cpp can only serve
-        GGUF. A configured ``quantization`` is rejected too: llama.cpp reads
-        the quantization from the file's metadata rather than from a flag, and
-        the problem names the quantization the checkpoint actually declares. A
-        GGUF whose header cannot be parsed is accepted (fail-open), leaving the
+        A non-GGUF target checkpoint is rejected, because llama.cpp can only
+        serve GGUF. A configured ``quantization`` is rejected too: llama.cpp
+        reads the quantization from the file's metadata rather than from a
+        flag, and the problem names the quantization the checkpoint actually
+        declares. A resolved draft checkpoint is held to the same file-format
+        rule, since llama.cpp loads it through the same GGUF reader. A GGUF
+        whose header cannot be parsed is accepted (fail-open), leaving the
         engine as the final authority rather than rejecting on metadata this
         library could not see.
         """
         quantization = experiment.llm.quantization
+        problems: list[str] = []
         try:
             metadata = read_gguf_metadata(model)
         except ExperimentError as exc:
-            if quantization is None:
-                return [str(exc)]
-            return [*_quantization_problems(quantization, model, None), str(exc)]
-        if quantization is None:
-            return []
-        return _quantization_problems(quantization, model, metadata)
+            if quantization is not None:
+                problems.extend(_quantization_problems(quantization, model, None))
+            problems.append(str(exc))
+        else:
+            if quantization is not None:
+                problems.extend(_quantization_problems(quantization, model, metadata))
+        draft = experiment.llm.resolved_draft_path
+        if draft is not None:
+            try:
+                read_gguf_metadata(draft)
+            except ExperimentError as exc:
+                problems.append(f"draft model: {exc}")
+        return problems
 
     def model_request(self, model: str) -> ModelRequest:
         """Decide whether ``model`` is a local GGUF file or a Hub repository.
@@ -867,9 +951,11 @@ class LlamaCppBackend:
         (or left for the server to fetch itself when no path was resolved), the
         server binds on every interface on the published port, the served name
         is pinned to the configured model string, and the five mapped tunables
-        and ``extra_args`` follow. The slot count is cut beforehand to what the
-        context can serve, so the benchmark's request length always fits a
-        slot's share of ``--ctx-size``.
+        and ``extra_args`` follow. A configured draft is mounted beside it at its
+        own fixed path and pointed at through the speculative arguments, or left
+        for the server to fetch through its draft-repository flag. The slot count
+        is cut beforehand to what the context can serve, so the benchmark's
+        request length always fits a slot's share of ``--ctx-size``.
 
         The returned :class:`ServerSpec` describes the ``/health`` endpoint and
         the startup timeout the host client uses. llama.cpp exposes no
@@ -883,6 +969,7 @@ class LlamaCppBackend:
         model_arguments, model_mounts = _model_arguments(
             benchmark.model, benchmark.resolved_path, self.list_repo_files
         )
+        llm, draft_mounts, draft_repository = _draft_arguments(experiment.llm, self.list_repo_files)
         command = (
             *model_arguments,
             "--alias",
@@ -891,14 +978,18 @@ class LlamaCppBackend:
             _SERVER_BIND_HOST,
             "--port",
             str(_SERVER_PORT),
-            *serve_arguments(_planned_llm(experiment.llm, benchmark), extra_args=self.extra_args),
+            *serve_arguments(
+                _planned_llm(llm, benchmark),
+                extra_args=self.extra_args,
+                draft_repository=draft_repository,
+            ),
         )
         return ServerSpec(
             container=ContainerConfig(
                 image=container.image or self.image_for(target),
                 command=command,
                 env=container.env,
-                volumes=(*container.volumes, *model_mounts),
+                volumes=(*container.volumes, *model_mounts, *draft_mounts),
                 devices=_DEVICE_MAPPINGS[target],
                 ports={str(_SERVER_PORT): None},
                 mem_limit=container.mem_limit,
@@ -909,6 +1000,8 @@ class LlamaCppBackend:
             health_path=_HEALTH_PATH,
             health_timeout=benchmark.startup_timeout,
             reset_paths=(),
+            tokenize_path=_TOKENIZE_PATH,
+            tokenize_prompt_field="content",
         )
 
     def image_for(self, target: HardwareTarget) -> str:

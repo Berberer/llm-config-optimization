@@ -22,6 +22,9 @@ from llm_config_optimization.inference import (
     DetectedHardware,
     DType,
     HardwareTarget,
+    LLMConfig,
+    SpeculativeMethod,
+    SpeculativeMode,
     VLLMBackend,
 )
 from llm_config_optimization.search_space import (
@@ -34,6 +37,7 @@ from llm_config_optimization.search_space import (
     Interval,
     validate_space,
 )
+from llm_config_optimization.search_space.registry import SPECULATIVE_PARAMETERS
 
 SUPPORTED_SPACE = ExperimentSpace(
     dimensions=(
@@ -61,7 +65,10 @@ class StubBackend:
     problems: tuple[str, ...] = ()
 
     def validate(
-        self, space: ExperimentSpace, hardware: DetectedHardware | None = None
+        self,
+        space: ExperimentSpace,
+        llm: LLMConfig,
+        hardware: DetectedHardware | None = None,
     ) -> Sequence[str]:
         """Ignore the space and report the canned problems."""
         return list(self.problems)
@@ -72,8 +79,48 @@ def space(*dimensions: Dimension) -> ExperimentSpace:
     return ExperimentSpace(dimensions=dimensions)
 
 
+def validate(
+    definition: ExperimentSpace, hardware: DetectedHardware | None = None
+) -> Sequence[str]:
+    """Validate ``definition`` against vLLM with a configuration that has no setup."""
+    return VLLMBackend().validate(definition, LLMConfig(), hardware)
+
+
 def test_a_fully_supported_space_has_no_problems() -> None:
-    assert list(VLLMBackend().validate(SUPPORTED_SPACE)) == []
+    assert list(validate(SUPPORTED_SPACE)) == []
+
+
+@pytest.mark.parametrize(
+    "dimension",
+    [
+        Dimension("speculative_mode", Fixed("enabled")),
+        Dimension("num_speculative_tokens", Fixed(4)),
+    ],
+    ids=["mode", "depth"],
+)
+def test_a_gated_tunable_without_a_configured_setup_is_reported(
+    dimension: Dimension,
+) -> None:
+    problems = validate(space(dimension))
+
+    assert any(
+        f"space.{dimension.name}" in problem and "does not forward" in problem
+        for problem in problems
+    ), problems
+
+
+def test_a_gated_tunable_is_checked_against_a_configured_setup() -> None:
+    """With a setup the parameter is applicable, forwardable, and value-checked."""
+    llm = LLMConfig(speculative_method=SpeculativeMethod.MTP)
+    definition = space(
+        Dimension("speculative_mode", Fixed(SpeculativeMode.ENABLED)),
+        Dimension("num_speculative_tokens", Fixed(4)),
+    )
+
+    applicable = VLLMBackend().applicable_parameters(llm)
+
+    assert SPECULATIVE_PARAMETERS.issubset(applicable)
+    assert list(VLLMBackend().validate(definition, llm)) == []
 
 
 @pytest.mark.parametrize(
@@ -96,7 +143,7 @@ def test_a_fully_supported_space_has_no_problems() -> None:
     ],
 )
 def test_each_spec_kind_is_accepted_for_a_supported_parameter(dimension: Dimension) -> None:
-    assert list(VLLMBackend().validate(space(dimension))) == []
+    assert list(validate(space(dimension))) == []
 
 
 def test_a_parameter_the_backend_does_not_forward_is_reported(
@@ -106,7 +153,7 @@ def test_a_parameter_the_backend_does_not_forward_is_reported(
         "llm_config_optimization.inference._vllm.PARAMETER_TARGETS", MappingProxyType({})
     )
 
-    problems = VLLMBackend().validate(space(Dimension("dtype", Fixed(DType.FLOAT16))))
+    problems = validate(space(Dimension("dtype", Fixed(DType.FLOAT16))))
 
     assert any("space.dtype" in problem and "does not forward" in problem for problem in problems)
 
@@ -119,7 +166,7 @@ def test_a_default_dimension_still_requires_a_forwarded_parameter(
         "llm_config_optimization.inference._vllm.PARAMETER_TARGETS", MappingProxyType({})
     )
 
-    problems = VLLMBackend().validate(space(Dimension("attention_backend", Default())))
+    problems = validate(space(Dimension("attention_backend", Default())))
 
     assert any("space.attention_backend" in problem for problem in problems)
 
@@ -140,7 +187,7 @@ def test_an_unsupported_enum_value_is_reported(
         MappingProxyType({"dtype": {DType.AUTO: "auto"}}),
     )
 
-    problems = VLLMBackend().validate(space(Dimension("dtype", spec)))
+    problems = validate(space(Dimension("dtype", spec)))
 
     assert any(problem.startswith(path) for problem in problems), problems
 
@@ -151,7 +198,7 @@ def test_a_space_that_can_violate_an_engine_bound_is_reported() -> None:
         Dimension("max_num_seqs", Interval(1024, 2048)),
     )
 
-    problems = VLLMBackend().validate(violating)
+    problems = validate(violating)
 
     assert any(
         "space.max_num_batched_tokens" in problem and "max_num_seqs" in problem
@@ -165,7 +212,7 @@ def test_a_space_that_satisfies_the_engine_bound_has_no_problems() -> None:
         Dimension("max_num_seqs", Interval(1, 1024)),
     )
 
-    assert list(VLLMBackend().validate(satisfying)) == []
+    assert list(validate(satisfying)) == []
 
 
 def test_a_categorical_engine_bound_is_checked_by_its_extremes() -> None:
@@ -175,7 +222,7 @@ def test_a_categorical_engine_bound_is_checked_by_its_extremes() -> None:
         Dimension("max_num_seqs", Categorical((1024, 2048))),
     )
 
-    problems = VLLMBackend().validate(violating)
+    problems = validate(violating)
 
     assert any("space.max_num_batched_tokens" in problem for problem in problems)
 
@@ -187,7 +234,7 @@ def test_a_non_numeric_engine_bound_value_skips_the_bound_check() -> None:
         Dimension("max_num_seqs", Categorical((1024, "wide"))),
     )
 
-    assert list(VLLMBackend().validate(incomparable)) == []
+    assert list(validate(incomparable)) == []
 
 
 def test_an_enum_engine_bound_value_skips_the_bound_check() -> None:
@@ -197,23 +244,21 @@ def test_an_enum_engine_bound_value_skips_the_bound_check() -> None:
         Dimension("max_num_seqs", Categorical((DType.FLOAT16,))),
     )
 
-    problems = VLLMBackend().validate(incomparable)
+    problems = validate(incomparable)
 
     assert not any("requires" in problem for problem in problems)
     assert any("space.max_num_seqs.categorical[0]" in problem for problem in problems)
 
 
 def test_an_attention_backend_vllm_no_longer_ships_is_reported() -> None:
-    problems = VLLMBackend().validate(
-        space(Dimension("attention_backend", Fixed(AttentionBackend.XFORMERS)))
-    )
+    problems = validate(space(Dimension("attention_backend", Fixed(AttentionBackend.XFORMERS))))
 
     assert any("space.attention_backend.fixed" in problem for problem in problems)
 
 
 def test_a_non_enum_attention_backend_value_skips_the_target_check() -> None:
     """The target check classifies enum members; the kind check owns every other value."""
-    problems = VLLMBackend().validate(
+    problems = validate(
         space(Dimension("attention_backend", Fixed(7))),
         DetectedHardware(HardwareTarget.CUDA, 1),
     )
@@ -227,7 +272,7 @@ def test_a_parameter_absent_from_the_value_maps_rejects_every_enum_member(
     """A field with no curated spelling cannot translate any member."""
     monkeypatch.setattr("llm_config_optimization.inference._vllm.VALUE_MAPS", MappingProxyType({}))
 
-    problems = VLLMBackend().validate(space(Dimension("dtype", Fixed(DType.FLOAT16))))
+    problems = validate(space(Dimension("dtype", Fixed(DType.FLOAT16))))
 
     assert any(problem.startswith("space.dtype.fixed") for problem in problems)
 
@@ -236,7 +281,7 @@ def test_a_parameter_absent_from_the_value_maps_rejects_every_enum_member(
 def test_a_cuda_only_attention_backend_is_reported_on_a_non_cuda_target(
     target: HardwareTarget,
 ) -> None:
-    problems = VLLMBackend().validate(
+    problems = validate(
         space(Dimension("attention_backend", Fixed(AttentionBackend.FLASH_ATTENTION))),
         DetectedHardware(target, 1),
     )
@@ -248,7 +293,7 @@ def test_a_cuda_only_attention_backend_is_reported_on_a_non_cuda_target(
 
 
 def test_a_cuda_attention_backend_is_accepted_on_cuda() -> None:
-    problems = VLLMBackend().validate(
+    problems = validate(
         space(Dimension("attention_backend", Fixed(AttentionBackend.FLASH_ATTENTION))),
         DetectedHardware(HardwareTarget.CUDA, 1),
     )
@@ -257,7 +302,7 @@ def test_a_cuda_attention_backend_is_accepted_on_cuda() -> None:
 
 
 def test_the_hardware_check_is_skipped_when_no_hardware_is_given() -> None:
-    problems = VLLMBackend().validate(
+    problems = validate(
         space(Dimension("attention_backend", Fixed(AttentionBackend.FLASH_ATTENTION)))
     )
 
@@ -265,7 +310,7 @@ def test_the_hardware_check_is_skipped_when_no_hardware_is_given() -> None:
 
 
 def test_a_tensor_parallel_size_larger_than_the_device_count_is_reported() -> None:
-    problems = VLLMBackend().validate(
+    problems = validate(
         space(Dimension("tensor_parallel_size", Categorical((1, 2, 4)))),
         DetectedHardware(HardwareTarget.CUDA, 1),
     )
@@ -275,7 +320,7 @@ def test_a_tensor_parallel_size_larger_than_the_device_count_is_reported() -> No
 
 
 def test_a_tensor_parallel_size_interval_above_the_device_count_is_reported() -> None:
-    problems = VLLMBackend().validate(
+    problems = validate(
         space(Dimension("tensor_parallel_size", Interval(1, 8))),
         DetectedHardware(HardwareTarget.CUDA, 4),
     )
@@ -286,7 +331,7 @@ def test_a_tensor_parallel_size_interval_above_the_device_count_is_reported() ->
 
 
 def test_a_tensor_parallel_size_that_fits_the_device_count_is_accepted() -> None:
-    problems = VLLMBackend().validate(
+    problems = validate(
         space(Dimension("tensor_parallel_size", Categorical((1, 2)))),
         DetectedHardware(HardwareTarget.CUDA, 2),
     )
@@ -295,7 +340,7 @@ def test_a_tensor_parallel_size_that_fits_the_device_count_is_accepted() -> None
 
 
 def test_a_default_tensor_parallel_size_skips_the_device_count_check() -> None:
-    problems = VLLMBackend().validate(
+    problems = validate(
         space(Dimension("tensor_parallel_size", Default())),
         DetectedHardware(HardwareTarget.CUDA, 1),
     )
@@ -304,14 +349,19 @@ def test_a_default_tensor_parallel_size_skips_the_device_count_check() -> None:
 
 
 class RecordingBackend:
-    """A backend that records the hardware it is asked to validate against."""
+    """A backend that records the hardware and configuration it is asked to validate against."""
 
     def __init__(self) -> None:
         self.hardware: list[DetectedHardware | None] = []
+        self.llm: list[LLMConfig] = []
 
     def validate(
-        self, space: ExperimentSpace, hardware: DetectedHardware | None = None
+        self,
+        space: ExperimentSpace,
+        llm: LLMConfig,
+        hardware: DetectedHardware | None = None,
     ) -> Sequence[str]:
+        self.llm.append(llm)
         self.hardware.append(hardware)
         return []
 
@@ -320,9 +370,18 @@ def test_validate_space_forwards_the_hardware_to_the_backend() -> None:
     backend = RecordingBackend()
     hardware = DetectedHardware(HardwareTarget.ROCM, 2)
 
-    validate_space(SUPPORTED_SPACE, backend, hardware)
+    validate_space(SUPPORTED_SPACE, backend, LLMConfig(), hardware)
 
     assert backend.hardware == [hardware]
+
+
+def test_validate_space_forwards_the_run_configuration_to_the_backend() -> None:
+    backend = RecordingBackend()
+    llm = LLMConfig(max_model_len=4096)
+
+    validate_space(SUPPORTED_SPACE, backend, llm)
+
+    assert backend.llm == [llm]
 
 
 def test_a_default_parameter_skips_the_engine_bound() -> None:
@@ -331,17 +390,17 @@ def test_a_default_parameter_skips_the_engine_bound() -> None:
         Dimension("max_num_seqs", Interval(1024, 2048)),
     )
 
-    assert list(VLLMBackend().validate(deferred)) == []
+    assert list(validate(deferred)) == []
 
 
 def test_validate_space_returns_none_when_the_backend_supports_the_space() -> None:
-    assert validate_space(SUPPORTED_SPACE, VLLMBackend()) is None
+    assert validate_space(SUPPORTED_SPACE, VLLMBackend(), LLMConfig()) is None
 
 
 def test_validate_space_raises_every_backend_problem() -> None:
     backend = StubBackend(("space.dtype: first", "space.max_model_len: second"))
 
     with pytest.raises(ExperimentDefinitionError) as excinfo:
-        validate_space(SUPPORTED_SPACE, backend)
+        validate_space(SUPPORTED_SPACE, backend, LLMConfig())
 
     assert excinfo.value.problems == ("space.dtype: first", "space.max_model_len: second")

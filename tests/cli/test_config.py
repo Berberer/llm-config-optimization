@@ -23,6 +23,7 @@ from llm_config_optimization.inference import (
     BenchmarkConfig,
     HardwareTarget,
     QuantizationMethod,
+    SpeculativeMethod,
 )
 from llm_config_optimization.optimization import ObjectiveMode, ObjectiveWeights
 
@@ -60,6 +61,11 @@ def test_tunable_serving_parameters_are_left_unset_for_the_space() -> None:
     assert config.llm.max_num_batched_tokens is None
     assert config.llm.tensor_parallel_size is None
     assert config.llm.attention_backend is None
+    assert config.llm.speculative_method is None
+    assert config.llm.draft_model is None
+    assert config.llm.speculative_mode is None
+    assert config.llm.num_speculative_tokens is None
+    assert config.llm.resolved_draft_path is None
 
 
 def test_explicit_flags_override_the_base_config() -> None:
@@ -125,6 +131,74 @@ def test_explicit_flags_override_the_base_config() -> None:
     assert config.llm.seed == 7
     assert config.llm.quantization is QuantizationMethod.AWQ
     assert config.llm.gpu_memory_utilization == 0.9
+
+
+def test_the_speculative_flags_populate_the_base_config() -> None:
+    config = build_base_config(
+        parse_args(
+            [
+                "facebook/opt-125m",
+                "space.yaml",
+                "vllm",
+                "--speculative-method",
+                "eagle3",
+                "--draft-model",
+                "org/draft",
+            ]
+        )
+    )
+
+    assert config.llm.speculative_method is SpeculativeMethod.EAGLE3
+    assert config.llm.draft_model == "org/draft"
+    assert config.llm.resolved_draft_path is None
+
+
+def test_a_bare_draft_model_implies_the_generic_draft_method() -> None:
+    config = build_base_config(
+        parse_args(["facebook/opt-125m", "space.yaml", "vllm", "--draft-model", "org/draft"])
+    )
+
+    assert config.llm.speculative_method is SpeculativeMethod.DRAFT_MODEL
+    assert config.llm.draft_model == "org/draft"
+
+
+@pytest.mark.parametrize("method", ["mtp", "ngram"], ids=["mtp", "ngram"])
+def test_draft_free_methods_need_no_draft_model(method: str) -> None:
+    config = build_base_config(
+        parse_args(["facebook/opt-125m", "space.yaml", "vllm", "--speculative-method", method])
+    )
+
+    assert config.llm.speculative_method is SpeculativeMethod(method)
+    assert config.llm.draft_model is None
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["draft_model", "eagle3", "dflash", "dspark"],
+)
+def test_a_draft_requiring_method_without_a_draft_is_rejected(method: str) -> None:
+    with pytest.raises(ValueError, match="requires --draft-model"):
+        build_base_config(
+            parse_args(["facebook/opt-125m", "space.yaml", "vllm", "--speculative-method", method])
+        )
+
+
+def test_a_draft_model_with_ngram_is_rejected() -> None:
+    """``ngram`` is model-free, so a draft would be silently ignored."""
+    with pytest.raises(ValueError, match="ngram"):
+        build_base_config(
+            parse_args(
+                [
+                    "facebook/opt-125m",
+                    "space.yaml",
+                    "vllm",
+                    "--speculative-method",
+                    "ngram",
+                    "--draft-model",
+                    "org/draft",
+                ]
+            )
+        )
 
 
 def test_out_of_range_measurement_controls_are_rejected() -> None:

@@ -9,9 +9,9 @@ llama.cpp) live alongside them and are re-exported here so callers need not
 know the module layout.
 """
 
-from ._benchmark import BenchmarkClient
+from ._benchmark import BenchmarkClient, validate_dataset
 from ._llamacpp import LlamaCppBackend
-from ._orchestrate import run_experiment
+from ._orchestrate import measure_dataset_request_tokens, run_experiment
 from ._vllm import VLLMBackend
 from .hardware import detect_hardware
 from .types import (
@@ -34,6 +34,8 @@ from .types import (
     QuantizationMethod,
     RunMetrics,
     ServerSpec,
+    SpeculativeMethod,
+    SpeculativeMode,
 )
 
 __all__ = [
@@ -58,7 +60,11 @@ __all__ = [
     "QuantizationMethod",
     "RunMetrics",
     "ServerSpec",
+    "SpeculativeMethod",
+    "SpeculativeMode",
     "VLLMBackend",
     "detect_hardware",
+    "measure_dataset_request_tokens",
     "run_experiment",
+    "validate_dataset",
 ]

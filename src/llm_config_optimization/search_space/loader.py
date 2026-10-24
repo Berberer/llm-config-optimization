@@ -53,7 +53,13 @@ _SPEC_KIND_SET = frozenset(_SPEC_KINDS)
 _INTERVAL_KEYS = frozenset({"min", "max"})
 _LLM_CONFIG_FIELDS = frozenset(field.name for field in fields(LLMConfig))
 _POSITIVE_PARAMETERS = frozenset(
-    {"max_model_len", "max_num_seqs", "max_num_batched_tokens", "tensor_parallel_size"}
+    {
+        "max_model_len",
+        "max_num_seqs",
+        "max_num_batched_tokens",
+        "tensor_parallel_size",
+        "num_speculative_tokens",
+    }
 )
 
 

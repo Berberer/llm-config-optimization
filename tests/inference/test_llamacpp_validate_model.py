@@ -52,12 +52,14 @@ def _write_gguf(path: Path, file_type: int | None) -> Path:
     return path
 
 
-def _experiment(quantization: QuantizationMethod | None) -> ExperimentConfig:
-    """Build an experiment whose only model-relevant field is the quantization."""
+def _experiment(
+    quantization: QuantizationMethod | None, *, draft: Path | None = None
+) -> ExperimentConfig:
+    """Build an experiment whose model-relevant fields are quant and draft."""
     return ExperimentConfig(
         container=ContainerRuntimeConfig(),
         benchmark=BenchmarkConfig(model=MODEL),
-        llm=LLMConfig(quantization=quantization),
+        llm=LLMConfig(quantization=quantization, resolved_draft_path=draft),
     )
 
 
@@ -150,3 +152,25 @@ def test_a_broken_header_still_rejects_a_configured_quantization(tmp_path: Path)
 
     assert len(problems) == 1
     assert "quantization" in problems[0]
+
+
+def test_a_non_gguf_resolved_draft_is_rejected(tmp_path: Path) -> None:
+    """The draft is loaded by the same GGUF reader, so its format matters too."""
+    model = _write_gguf(tmp_path / "model.gguf", _Q4_K_M)
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(b"this is a safetensors draft, honestly")
+
+    problems = list(LlamaCppBackend().validate_model(_experiment(None, draft=draft), model))
+
+    assert len(problems) == 1
+    assert "draft model" in problems[0]
+    assert "not a GGUF file" in problems[0]
+
+
+def test_a_draft_with_an_unreadable_header_fails_open(tmp_path: Path) -> None:
+    """A header this library cannot parse is not evidence of a mismatch."""
+    model = _write_gguf(tmp_path / "model.gguf", _Q4_K_M)
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(_GGUF_MAGIC + struct.pack("<I", _GGUF_VERSION))
+
+    assert list(LlamaCppBackend().validate_model(_experiment(None, draft=draft), model)) == []

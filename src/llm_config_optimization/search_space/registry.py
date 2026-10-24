@@ -46,6 +46,8 @@ TUNABLE_PARAMETERS: Mapping[str, str] = MappingProxyType(
         "max_num_batched_tokens": "max_num_batched_tokens",
         "tensor_parallel_size": "tensor_parallel_size",
         "attention_backend": "attention_backend",
+        "speculative_mode": "speculative_mode",
+        "num_speculative_tokens": "num_speculative_tokens",
     }
 )
 """Which serving parameters a sweep may vary, and the ``LLMConfig`` field each fills.
@@ -53,8 +55,27 @@ TUNABLE_PARAMETERS: Mapping[str, str] = MappingProxyType(
 The insertion order is canonical: the parser emits dimensions in this order, so
 a space is deterministic regardless of the YAML key order. The mapping is a
 strict allow-list, so a parameter absent from it is either a known non-tunable
-(an ``LLMConfig`` field such as ``seed``) or unknown entirely.
+(an ``LLMConfig`` field such as ``seed``) or unknown entirely. The two
+speculative dimensions are gated: see :data:`SPECULATIVE_PARAMETERS`.
 """
+
+SPECULATIVE_PARAMETERS: frozenset[str] = frozenset({"speculative_mode", "num_speculative_tokens"})
+"""The tunables that are applicable only under a configured speculative setup.
+
+A definition declares these exactly when the run fixes a speculative method or
+draft model; otherwise no value would ever reach the engine, so a definition
+that declares them is rejected by the backend's support check.
+"""
+
+
+def speculative_configured(llm: LLMConfig) -> bool:
+    """Whether ``llm`` configures a speculative-decoding setup.
+
+    A setup exists as soon as a method or a draft model is fixed for the run;
+    a bare draft model implies the generic draft method, so either field alone
+    gates the speculative dimensions in.
+    """
+    return llm.speculative_method is not None or llm.draft_model is not None
 
 
 def expected_kind(field: str) -> ParameterKind:

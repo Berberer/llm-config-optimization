@@ -34,7 +34,7 @@ import json
 import random
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -49,7 +49,7 @@ from .types import (
     ServerSpec,
 )
 
-__all__ = ["DEFAULT_VOCAB_SIZE", "BenchmarkClient"]
+__all__ = ["DEFAULT_VOCAB_SIZE", "BenchmarkClient", "validate_dataset"]
 
 DEFAULT_VOCAB_SIZE = 32000
 """The token-id ceiling the random workload samples from by default.
@@ -195,6 +195,28 @@ def _build_workload(benchmark: BenchmarkConfig, vocab_size: int) -> Callable[[in
         requests = _dataset_requests(benchmark)
         return lambda _seed: requests
     return lambda seed: _random_requests(benchmark, seed, vocab_size)
+
+
+def validate_dataset(benchmark: BenchmarkConfig) -> None:
+    """Validate a benchmark's JSONL dataset before a sweep starts.
+
+    A run whose ``dataset_path`` names a JSONL dataset is read and parsed once
+    up front through the same contract the benchmark client uses during every
+    trial. A missing or unreadable file, malformed JSON, a non-object line, a
+    missing prompt, and an invalid output length are therefore reported before
+    the space is loaded, the model is fetched, or any container is pulled,
+    instead of failing every trial identically. Combining a non-random
+    ``dataset_name`` with a path is rejected here as well.
+
+    A benchmark without a dataset path is left alone: the random workload is
+    built from the run's seed and needs no file to validate. Raises
+    :class:`ExperimentError` for a bad dataset and :class:`ValueError` for the
+    incompatible dataset-name combination, matching the errors a trial would
+    otherwise raise.
+    """
+    if benchmark.dataset_path is None:
+        return
+    _build_workload(benchmark, DEFAULT_VOCAB_SIZE)
 
 
 _EXPOSITION_SAMPLE = re.compile(
@@ -365,6 +387,87 @@ class BenchmarkClient:
                 base_url, model, spec, benchmark, concurrency=concurrency, is_alive=is_alive
             )
         )
+
+    def dataset_request_tokens_sync(
+        self,
+        base_url: str,
+        model: str,
+        spec: ServerSpec,
+        benchmark: BenchmarkConfig,
+        *,
+        is_alive: Callable[[], bool] | None = None,
+    ) -> int | None:
+        """Tokenize a JSONL dataset and return its longest input-plus-output request.
+
+        The engine owns the tokenizer, so this asks the running server through
+        the spec's ``tokenize_path`` rather than guessing from characters. Every
+        request in the workload is tokenized and the largest
+        ``prompt_tokens + output_len`` is returned, which is exactly the length
+        a backend needs to cap a parallel slot count safely. A benchmark with
+        no dataset path, or a spec with no tokenizer endpoint, needs no
+        preflight and returns ``None``.
+
+        Raises :class:`ExperimentError` when the dataset cannot be built or the
+        endpoint cannot tokenize it. The caller decides whether that is fatal
+        or a reason to fall back to a conservative slot count.
+        """
+        if benchmark.dataset_path is None or spec.tokenize_path is None:
+            return None
+        requests = _build_workload(benchmark, self.vocab_size)(0)
+        prompts: list[str] = []
+        for request in requests:
+            if not isinstance(request.prompt, str):
+                raise ExperimentError("the dataset workload contains a non-text prompt")
+            prompts.append(request.prompt)
+        lengths = asyncio.run(
+            self.tokenize_prompts(base_url, model, spec, prompts, is_alive=is_alive)
+        )
+        return max(
+            length + request.output_len for length, request in zip(lengths, requests, strict=True)
+        )
+
+    async def tokenize_prompts(
+        self,
+        base_url: str,
+        model: str,
+        spec: ServerSpec,
+        prompts: Sequence[str],
+        *,
+        is_alive: Callable[[], bool] | None = None,
+    ) -> list[int]:
+        """Return each prompt's token count from the spec's tokenizer endpoint.
+
+        The health wait is the same one the measured runs use, including the
+        optional liveness probe, so a preflight server that dies during startup
+        fails immediately. Each prompt is one request; the response body must
+        carry a ``tokens`` array, whose length is the token count. The request
+        body uses the spec's declared prompt and model field names, keeping
+        every engine's payload shape behind the spec rather than in this
+        client.
+        """
+        if spec.tokenize_path is None:
+            raise ExperimentError("the server spec declares no tokenizer endpoint")
+        async with httpx2.AsyncClient(
+            base_url=base_url,
+            transport=self.transport,
+            timeout=self.request_timeout,
+        ) as client:
+            await self._wait_for_health(client, spec, is_alive)
+            lengths: list[int] = []
+            for prompt in prompts:
+                payload: dict[str, object] = {spec.tokenize_prompt_field: prompt}
+                if spec.tokenize_model_field is not None:
+                    payload[spec.tokenize_model_field] = model
+                response = await client.post(spec.tokenize_path, json=payload)
+                response.raise_for_status()
+                body = response.json()
+                tokens = body.get("tokens") if isinstance(body, Mapping) else None
+                if not isinstance(tokens, list):
+                    raise ExperimentError(
+                        f"the tokenizer at {spec.tokenize_path} returned no 'tokens' array"
+                    )
+                lengths.append(len(tokens))
+            return lengths
 
     async def _measure(
         self,

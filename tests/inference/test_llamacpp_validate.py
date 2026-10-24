@@ -8,6 +8,7 @@ The tests assert on the parameter path and the kind of problem rather than on
 exact wording, so messages can be reworded freely.
 """
 
+from collections.abc import Sequence
 from types import MappingProxyType
 
 import pytest
@@ -19,6 +20,8 @@ from llm_config_optimization.inference import (
     HardwareTarget,
     KVCacheDType,
     LlamaCppBackend,
+    LLMConfig,
+    SpeculativeMethod,
 )
 from llm_config_optimization.search_space import (
     Categorical,
@@ -28,6 +31,7 @@ from llm_config_optimization.search_space import (
     Fixed,
     Interval,
 )
+from llm_config_optimization.search_space.registry import SPECULATIVE_PARAMETERS
 
 APPLICABLE = frozenset(
     {
@@ -57,13 +61,53 @@ def space(*dimensions: Dimension) -> ExperimentSpace:
     return ExperimentSpace(dimensions=dimensions)
 
 
+def validate(
+    definition: ExperimentSpace, hardware: DetectedHardware | None = None
+) -> Sequence[str]:
+    """Validate ``definition`` against llama.cpp with a configuration that has no setup."""
+    return LlamaCppBackend().validate(definition, LLMConfig(), hardware)
+
+
 def test_applicable_parameters_are_exactly_the_five_llama_cpp_forwards() -> None:
     """``dtype`` and ``tensor_parallel_size`` are absent from the set."""
-    assert LlamaCppBackend().applicable_parameters == APPLICABLE
+    assert LlamaCppBackend().applicable_parameters(LLMConfig()) == APPLICABLE
+
+
+@pytest.mark.parametrize(
+    "llm",
+    [
+        LLMConfig(speculative_method=SpeculativeMethod.MTP),
+        LLMConfig(draft_model="org/draft.gguf"),
+    ],
+    ids=["method", "draft-model"],
+)
+def test_a_configured_speculative_setup_makes_the_gated_tunables_applicable(
+    llm: LLMConfig,
+) -> None:
+    assert LlamaCppBackend().applicable_parameters(llm) == APPLICABLE | SPECULATIVE_PARAMETERS
+
+
+@pytest.mark.parametrize(
+    "dimension",
+    [
+        Dimension("speculative_mode", Fixed("enabled")),
+        Dimension("num_speculative_tokens", Fixed(4)),
+    ],
+    ids=["mode", "depth"],
+)
+def test_a_gated_tunable_without_a_configured_setup_is_reported(
+    dimension: Dimension,
+) -> None:
+    problems = validate(space(dimension))
+
+    assert any(
+        f"space.{dimension.name}" in problem and "does not forward" in problem
+        for problem in problems
+    ), problems
 
 
 def test_a_fully_supported_space_has_no_problems() -> None:
-    assert list(LlamaCppBackend().validate(SUPPORTED_SPACE)) == []
+    assert list(validate(SUPPORTED_SPACE)) == []
 
 
 @pytest.mark.parametrize(
@@ -86,7 +130,7 @@ def test_a_fully_supported_space_has_no_problems() -> None:
     ],
 )
 def test_each_spec_kind_is_accepted_for_a_supported_parameter(dimension: Dimension) -> None:
-    assert list(LlamaCppBackend().validate(space(dimension))) == []
+    assert list(validate(space(dimension))) == []
 
 
 @pytest.mark.parametrize(
@@ -100,7 +144,7 @@ def test_each_spec_kind_is_accepted_for_a_supported_parameter(dimension: Dimensi
 )
 def test_a_parameter_llama_cpp_does_not_forward_is_reported(dimension: Dimension) -> None:
     """A deferral skips the value check, not the parameter check."""
-    problems = LlamaCppBackend().validate(space(dimension))
+    problems = validate(space(dimension))
 
     assert any(
         f"space.{dimension.name}" in problem and "does not forward" in problem
@@ -113,7 +157,7 @@ def test_a_parameter_llama_cpp_does_not_forward_is_reported(dimension: Dimension
     [KVCacheDType.AUTO, KVCacheDType.FP8_E4M3, KVCacheDType.FP8_E5M2],
 )
 def test_an_unsupported_kv_cache_value_is_reported(value: KVCacheDType) -> None:
-    problems = LlamaCppBackend().validate(space(Dimension("kv_cache_dtype", Fixed(value))))
+    problems = validate(space(Dimension("kv_cache_dtype", Fixed(value))))
 
     assert any(problem.startswith("space.kv_cache_dtype.fixed") for problem in problems), problems
 
@@ -123,7 +167,7 @@ def test_an_unsupported_kv_cache_value_is_reported(value: KVCacheDType) -> None:
     [AttentionBackend.FLASH_INFER, AttentionBackend.XFORMERS],
 )
 def test_an_unsupported_attention_backend_is_reported(value: AttentionBackend) -> None:
-    problems = LlamaCppBackend().validate(space(Dimension("attention_backend", Fixed(value))))
+    problems = validate(space(Dimension("attention_backend", Fixed(value))))
 
     assert any(problem.startswith("space.attention_backend.fixed") for problem in problems)
 
@@ -133,7 +177,7 @@ def test_an_unsupported_categorical_value_is_reported_at_its_position() -> None:
         "kv_cache_dtype", Categorical((KVCacheDType.FLOAT16, KVCacheDType.FP8_E4M3))
     )
 
-    problems = LlamaCppBackend().validate(space(dimension))
+    problems = validate(space(dimension))
 
     assert any(problem.startswith("space.kv_cache_dtype.categorical[1]") for problem in problems), (
         problems
@@ -145,12 +189,12 @@ def test_supported_categorical_values_are_accepted() -> None:
         "kv_cache_dtype", Categorical((KVCacheDType.FLOAT16, KVCacheDType.BFLOAT16))
     )
 
-    assert list(LlamaCppBackend().validate(space(dimension))) == []
+    assert list(validate(space(dimension))) == []
 
 
 def test_validation_accepts_hardware_without_narrowing_the_modelled_values() -> None:
     """No modelled llama.cpp value is accelerator-specific today."""
-    problems = LlamaCppBackend().validate(SUPPORTED_SPACE, DetectedHardware(HardwareTarget.CPU, 1))
+    problems = validate(SUPPORTED_SPACE, DetectedHardware(HardwareTarget.CPU, 1))
 
     assert list(problems) == []
 
@@ -163,7 +207,7 @@ def test_a_parameter_absent_from_the_value_maps_rejects_every_enum_member(
         "llm_config_optimization.inference._llamacpp.VALUE_MAPS", MappingProxyType({})
     )
 
-    problems = LlamaCppBackend().validate(
+    problems = validate(
         space(Dimension("attention_backend", Fixed(AttentionBackend.FLASH_ATTENTION)))
     )
 

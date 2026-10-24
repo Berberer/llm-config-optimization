@@ -29,6 +29,8 @@ from llm_config_optimization.inference import (
     LLMConfig,
     LocalCheckpoint,
     ServerSpec,
+    SpeculativeMethod,
+    SpeculativeMode,
 )
 from llm_config_optimization.runtime import Mount
 
@@ -36,6 +38,7 @@ REPO = "bartowski/Llama-3.2-1B-Instruct-GGUF"
 """The repository id the fake file lister serves."""
 
 _MODEL_TARGET = "/models/model.gguf"
+_DRAFT_TARGET = "/models/draft.gguf"
 
 
 def _repo(files: Sequence[str]) -> Callable[[str], Sequence[str]]:
@@ -207,6 +210,95 @@ def test_a_resolved_path_takes_precedence_over_the_model_string(model_file: Path
     assert _mount_for(spec, _MODEL_TARGET).source == str(model_file)
 
 
+def test_a_resolved_local_draft_is_mounted_at_its_own_path(
+    model_file: Path, tmp_path: Path
+) -> None:
+    """The draft never contends with the main model's fixed container path."""
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(b"GGUF")
+    experiment = _experiment(
+        str(model_file),
+        llm=LLMConfig(
+            speculative_method=SpeculativeMethod.DRAFT_MODEL,
+            draft_model="org/draft",
+            resolved_draft_path=draft,
+        ),
+    )
+
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1))
+
+    draft_mount = _mount_for(spec, _DRAFT_TARGET)
+    assert draft_mount.source == str(draft)
+    assert draft_mount.read_only is True
+    assert draft_mount.options == ("z",)
+    assert _mount_for(spec, _MODEL_TARGET).source == str(model_file.resolve())
+    serve = _serve(spec)
+    assert serve[serve.index("--spec-draft-model") + 1] == _DRAFT_TARGET
+
+
+def test_an_unresolved_local_draft_is_mounted_too(model_file: Path, tmp_path: Path) -> None:
+    """A direct caller that never prefetched still gets a mounted local draft."""
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(b"GGUF")
+    experiment = _experiment(
+        str(model_file),
+        llm=LLMConfig(
+            speculative_method=SpeculativeMethod.DRAFT_MODEL,
+            draft_model=str(draft),
+        ),
+    )
+
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1))
+
+    assert _mount_for(spec, _DRAFT_TARGET).source == str(draft.resolve())
+    serve = _serve(spec)
+    assert serve[serve.index("--spec-draft-model") + 1] == _DRAFT_TARGET
+
+
+def test_an_unresolved_draft_repository_is_fetched_by_the_server(model_file: Path) -> None:
+    """A Hub draft goes through llama.cpp's own draft-repository flag."""
+    backend = LlamaCppBackend(list_repo_files=_repo(["draft-Q4_K_M.gguf"]))
+    draft = f"{REPO}:Q4_K_M"
+    experiment = _experiment(
+        str(model_file),
+        llm=LLMConfig(
+            speculative_method=SpeculativeMethod.EAGLE3,
+            draft_model=draft,
+        ),
+    )
+
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CUDA, 1), backend=backend)
+
+    assert all(mount.target != _DRAFT_TARGET for mount in spec.container.volumes)
+    serve = _serve(spec)
+    assert "--spec-draft-model" not in serve
+    assert serve[serve.index("--spec-draft-hf") + 1] == draft
+
+
+def test_a_disabled_mode_keeps_the_draft_mount_but_drops_its_flags(
+    model_file: Path, tmp_path: Path
+) -> None:
+    """The mount is harmless when the engine is told not to load the draft."""
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(b"GGUF")
+    experiment = _experiment(
+        str(model_file),
+        llm=LLMConfig(
+            speculative_method=SpeculativeMethod.DRAFT_MODEL,
+            draft_model="org/draft",
+            speculative_mode=SpeculativeMode.DISABLED,
+            resolved_draft_path=draft,
+        ),
+    )
+
+    spec = _plan(experiment, DetectedHardware(HardwareTarget.CPU, 1))
+
+    assert _mount_for(spec, _DRAFT_TARGET).source == str(draft)
+    serve = _serve(spec)
+    assert "--spec-type" not in serve
+    assert "--spec-draft-model" not in serve
+
+
 def test_a_hub_model_without_a_resolved_path_is_fetched_by_the_server() -> None:
     """A direct caller that never prefetched leaves llama-server to fetch the file."""
     backend = LlamaCppBackend(list_repo_files=_repo(["Llama-3.2-1B-Instruct-Q4_K_M.gguf"]))
@@ -355,8 +447,8 @@ def test_declared_parallel_is_kept_when_the_workload_length_is_unknown(
     assert serve[serve.index("--parallel") + 1] == "8"
 
 
-def test_declared_parallel_is_kept_for_a_dataset_workload(model_file: Path) -> None:
-    """A JSONL workload's request length is unknown, so it is not capped."""
+def test_an_unmeasured_dataset_workload_uses_one_slot(model_file: Path) -> None:
+    """A JSONL workload with no measured token length falls back to one slot."""
     benchmark = BenchmarkConfig(
         model=str(model_file),
         dataset_path="/data/prompts.jsonl",
@@ -369,7 +461,39 @@ def test_declared_parallel_is_kept_for_a_dataset_workload(model_file: Path) -> N
 
     serve = _serve(_plan(experiment, DetectedHardware(HardwareTarget.CPU, 1)))
 
+    assert serve[serve.index("--parallel") + 1] == "1"
+
+
+def test_a_measured_dataset_request_caps_the_slot_count(model_file: Path) -> None:
+    """A tokenized dataset caps --parallel from its longest request."""
+    benchmark = BenchmarkConfig(
+        model=str(model_file),
+        dataset_path="/data/prompts.jsonl",
+        max_request_tokens=256,
+    )
+    experiment = _experiment(
+        str(model_file), benchmark=benchmark, llm=LLMConfig(max_model_len=2048, max_num_seqs=8)
+    )
+
+    serve = _serve(_plan(experiment, DetectedHardware(HardwareTarget.CPU, 1)))
+
     assert serve[serve.index("--parallel") + 1] == "8"
+
+
+def test_a_measured_dataset_request_can_reduce_the_slot_count(model_file: Path) -> None:
+    """The measured request length is what the context is divided by."""
+    benchmark = BenchmarkConfig(
+        model=str(model_file),
+        dataset_path="/data/prompts.jsonl",
+        max_request_tokens=1024,
+    )
+    experiment = _experiment(
+        str(model_file), benchmark=benchmark, llm=LLMConfig(max_model_len=2048, max_num_seqs=8)
+    )
+
+    serve = _serve(_plan(experiment, DetectedHardware(HardwareTarget.CPU, 1)))
+
+    assert serve[serve.index("--parallel") + 1] == "2"
 
 
 def test_declared_parallel_is_kept_when_the_context_is_deferred(model_file: Path) -> None:

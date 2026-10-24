@@ -164,7 +164,7 @@ def test_two_trial_sweep_returns_a_usable_best_configuration(
 ) -> None:
     """A real sweep completes its trials and reports the winning configuration."""
     backend = LlamaCppBackend()
-    validate_space(SPACE, backend)
+    validate_space(SPACE, backend, BASE.llm)
     base = replace(BASE, benchmark=replace(BASE.benchmark, resolved_path=checkpoint))
 
     result = optimize(

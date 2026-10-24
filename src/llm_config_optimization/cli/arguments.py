@@ -23,6 +23,8 @@ from collections.abc import Sequence
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+from ..inference.types import SpeculativeMethod
+
 __all__ = ["build_parser", "parse_args"]
 
 _DISTRIBUTION_NAME = "llm-config-optimization"
@@ -184,6 +186,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Fraction of GPU memory the engine may use; the engine's default when omitted. vLLM only; a usage error for llamacpp.",
+    )
+    engine.add_argument(
+        "--speculative-method",
+        choices=tuple(method.value for method in SpeculativeMethod),
+        default=None,
+        help=(
+            "Speculative-decoding method, named engine-neutrally: draft_model, eagle3, mtp, "
+            "dflash, dspark, or ngram. mtp uses the target's own heads and ngram needs no "
+            "draft, so neither requires --draft-model."
+        ),
+    )
+    engine.add_argument(
+        "--draft-model",
+        default=None,
+        help=(
+            "Draft model or speculator, in the same source forms as MODEL; implies "
+            "--speculative-method draft_model when no method is given. A usage error for ngram."
+        ),
     )
     engine.add_argument(
         "--sampler-seed",

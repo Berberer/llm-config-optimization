@@ -228,7 +228,7 @@ def test_two_trial_sweep_returns_a_usable_best_configuration(
 ) -> None:
     """A real sweep completes its trials and reports the winning configuration."""
     backend = VLLMBackend(cpu_image=vllm_cpu_image)
-    validate_space(SPACE, backend)
+    validate_space(SPACE, backend, BASE.llm)
 
     result = optimize(
         SPACE,

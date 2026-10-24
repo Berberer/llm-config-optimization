@@ -8,6 +8,7 @@ ones llama.cpp does not model.
 """
 
 from dataclasses import fields
+from pathlib import Path
 
 import pytest
 
@@ -18,6 +19,8 @@ from llm_config_optimization.inference import (
     KVCacheDType,
     LLMConfig,
     QuantizationMethod,
+    SpeculativeMethod,
+    SpeculativeMode,
 )
 from llm_config_optimization.inference._llamacpp import (
     PARAMETER_TARGETS,
@@ -27,6 +30,7 @@ from llm_config_optimization.inference._llamacpp import (
 from llm_config_optimization.search_space.registry import TUNABLE_PARAMETERS
 
 _INAPPLICABLE_TUNABLES = frozenset({"dtype", "tensor_parallel_size"})
+"""The registry's tunables llama.cpp has no ``llama-server`` flag for."""
 
 _INAPPLICABLE_FIELDS = frozenset(
     {
@@ -35,6 +39,7 @@ _INAPPLICABLE_FIELDS = frozenset(
         "gpu_memory_utilization",
         "tensor_parallel_size",
         "seed",
+        "resolved_draft_path",
     }
 )
 """The :class:`LLMConfig` fields this backend has no ``llama-server`` target for.
@@ -42,13 +47,17 @@ _INAPPLICABLE_FIELDS = frozenset(
 ``dtype`` is carried by the GGUF weights and ``quantization`` by the file's
 metadata, tensor parallelism and the VRAM fraction are vLLM-only knobs, and the
 sampling seed is not forwarded because the host client measures with greedy
-decoding.
+decoding. ``resolved_draft_path`` is a host-side resolution artifact that an
+engine never receives; the speculative settings reach the engine through their
+``--spec-*`` flags.
 """
 
 
 def test_applicable_parameters_are_the_registry_minus_llama_cpp_inapplicable_ones() -> None:
-    """The backend declares exactly the tunables llama.cpp has a flag for."""
-    assert set(PARAMETER_TARGETS) == set(TUNABLE_PARAMETERS) - _INAPPLICABLE_TUNABLES
+    """The forwarding table covers exactly the tunables llama.cpp can serve."""
+    forwarded_tunables = {name for name in TUNABLE_PARAMETERS if name in PARAMETER_TARGETS}
+    assert forwarded_tunables == set(TUNABLE_PARAMETERS) - _INAPPLICABLE_TUNABLES
+    assert set(PARAMETER_TARGETS) == forwarded_tunables | {"speculative_method", "draft_model"}
 
 
 def test_every_llm_config_field_is_classified_as_mapped_or_inapplicable() -> None:
@@ -129,6 +138,105 @@ def test_every_supported_value_has_a_map_entry_and_no_unsupported_one_does() -> 
         KVCacheDType.BFLOAT16: "bf16",
     }
     assert VALUE_MAPS["attention_backend"] == {AttentionBackend.FLASH_ATTENTION: "on"}
+    assert VALUE_MAPS["speculative_method"] == {
+        SpeculativeMethod.DRAFT_MODEL: "draft-simple",
+        SpeculativeMethod.EAGLE3: "draft-eagle3",
+        SpeculativeMethod.MTP: "draft-mtp",
+        SpeculativeMethod.DFLASH: "draft-dflash",
+        SpeculativeMethod.DSPARK: "draft-dspark",
+        SpeculativeMethod.NGRAM: "ngram-simple",
+    }
+    assert VALUE_MAPS["speculative_mode"] == {
+        SpeculativeMode.ENABLED: "enabled",
+        SpeculativeMode.DISABLED: "disabled",
+    }
+
+
+@pytest.mark.parametrize(
+    ("value", "spelling"),
+    [
+        (SpeculativeMethod.DRAFT_MODEL, "draft-simple"),
+        (SpeculativeMethod.EAGLE3, "draft-eagle3"),
+        (SpeculativeMethod.MTP, "draft-mtp"),
+        (SpeculativeMethod.DFLASH, "draft-dflash"),
+        (SpeculativeMethod.DSPARK, "draft-dspark"),
+        (SpeculativeMethod.NGRAM, "ngram-simple"),
+    ],
+)
+def test_every_speculative_method_translates(value: SpeculativeMethod, spelling: str) -> None:
+    assert serve_arguments(LLMConfig(speculative_method=value)) == ["--spec-type", spelling]
+
+
+def test_speculative_settings_reach_their_own_flags() -> None:
+    config = LLMConfig(
+        speculative_method=SpeculativeMethod.EAGLE3,
+        draft_model="org/eagle3-draft",
+        speculative_mode=SpeculativeMode.ENABLED,
+        num_speculative_tokens=5,
+    )
+
+    assert serve_arguments(config) == [
+        "--spec-type",
+        "draft-eagle3",
+        "--spec-draft-model",
+        "org/eagle3-draft",
+        "--spec-draft-n-max",
+        "5",
+    ]
+
+
+def test_an_unset_mode_emits_the_configured_setup() -> None:
+    """An unset mode means the setup's default, which is enabled."""
+    config = LLMConfig(speculative_method=SpeculativeMethod.MTP)
+
+    assert serve_arguments(config) == ["--spec-type", "draft-mtp"]
+
+
+def test_an_unset_depth_omits_only_the_depth_flag() -> None:
+    config = LLMConfig(
+        speculative_method=SpeculativeMethod.DRAFT_MODEL,
+        draft_model="org/draft.gguf",
+    )
+
+    assert serve_arguments(config) == [
+        "--spec-type",
+        "draft-simple",
+        "--spec-draft-model",
+        "org/draft.gguf",
+    ]
+
+
+def test_the_mode_is_never_forwarded_itself() -> None:
+    assert serve_arguments(LLMConfig(speculative_mode=SpeculativeMode.ENABLED)) == []
+
+
+def test_a_disabled_mode_suppresses_every_speculative_flag() -> None:
+    """No speculative flag reaches the engine, so the draft's memory is freed."""
+    config = LLMConfig(
+        max_model_len=4096,
+        speculative_method=SpeculativeMethod.EAGLE3,
+        draft_model="org/eagle3-draft",
+        speculative_mode=SpeculativeMode.DISABLED,
+        num_speculative_tokens=5,
+    )
+
+    assert serve_arguments(config) == ["--ctx-size", "4096"]
+
+
+def test_a_resolved_draft_path_is_never_forwarded(tmp_path: Path) -> None:
+    """The resolved path is host-side only; the configured draft string is forwarded."""
+    config = LLMConfig(
+        speculative_method=SpeculativeMethod.DRAFT_MODEL,
+        draft_model="org/draft.gguf",
+        resolved_draft_path=tmp_path / "draft.gguf",
+    )
+
+    assert serve_arguments(config) == [
+        "--spec-type",
+        "draft-simple",
+        "--spec-draft-model",
+        "org/draft.gguf",
+    ]
 
 
 def test_all_tunables_assemble_in_the_declared_order() -> None:
@@ -138,6 +246,10 @@ def test_all_tunables_assemble_in_the_declared_order() -> None:
         max_num_seqs=4,
         max_num_batched_tokens=4096,
         attention_backend=AttentionBackend.FLASH_ATTENTION,
+        speculative_method=SpeculativeMethod.DRAFT_MODEL,
+        draft_model="org/draft.gguf",
+        speculative_mode=SpeculativeMode.ENABLED,
+        num_speculative_tokens=3,
     )
 
     assert serve_arguments(config) == [
@@ -155,6 +267,12 @@ def test_all_tunables_assemble_in_the_declared_order() -> None:
         "4096",
         "--flash-attn",
         "on",
+        "--spec-type",
+        "draft-simple",
+        "--spec-draft-model",
+        "org/draft.gguf",
+        "--spec-draft-n-max",
+        "3",
     ]
 
 

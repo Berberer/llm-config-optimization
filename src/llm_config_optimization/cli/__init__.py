@@ -50,6 +50,8 @@ from ..inference import (
     LocalCheckpoint,
     VLLMBackend,
     detect_hardware,
+    measure_dataset_request_tokens,
+    validate_dataset,
 )
 from ..inference.types import (
     DetectedHardware,
@@ -57,6 +59,7 @@ from ..inference.types import (
     ExperimentError,
     HardwareTarget,
     InferenceBackend,
+    LLMConfig,
 )
 from ..optimization import (
     ObjectiveMode,
@@ -236,10 +239,12 @@ def _run(
     preparation runs. The base configuration and the objective are resolved
     after that, so a measurement control outside its valid range or an invalid
     objective weight is reported as a usage error before the space is loaded,
-    the hardware is probed, or a container is pulled. A caller-supplied backend
-    is used as-is; otherwise the entry's factory builds the selected backend for
-    the duration of the sweep, so resources such as vLLM's compile cache live
-    exactly as long as the run.
+    the hardware is probed, or a container is pulled. A JSONL ``--dataset-path``
+    is read and validated at the same point, so a missing or malformed dataset
+    is a usage error before the first trial rather than a failure repeated by
+    every trial. A caller-supplied backend is used as-is; otherwise the entry's
+    factory builds the selected backend for the duration of the sweep, so
+    resources such as vLLM's compile cache live exactly as long as the run.
     """
     mode = _output_mode(args, out)
     if mode is None:
@@ -258,12 +263,16 @@ def _run(
     try:
         base = build_base_config(args)
         objective_mode, objective_weights = resolve_objective(args, base.benchmark)
+        validate_dataset(base.benchmark)
     except ValueError as error:
+        print(f"error: {error}", file=err)
+        return _EXIT_USAGE
+    except ExperimentError as error:
         print(f"error: {error}", file=err)
         return _EXIT_USAGE
 
     if backend is None:
-        _print_header(args, out)
+        _print_header(args, base, out)
         with engine.factory() as resolved_backend:
             return _sweep(
                 args,
@@ -278,7 +287,7 @@ def _run(
                 err=err,
             )
 
-    _print_header(args, out)
+    _print_header(args, base, out)
     return _sweep(
         args,
         base,
@@ -316,13 +325,25 @@ def _sweep(
     error.
     """
     try:
-        space = _load_space(args.space, resolved_backend, out)
+        space = _load_space(args.space, resolved_backend, base.llm, out)
         hardware = _detect_hardware(args, out)
-        _check_supported(space, resolved_backend, hardware, out)
+        _check_supported(space, resolved_backend, base.llm, hardware, out)
         model = _prefetch_model(args.model, resolved_backend, out)
         base = replace(base, benchmark=replace(base.benchmark, resolved_path=model))
+        if base.llm.draft_model is not None:
+            draft = _prefetch_draft(base.llm.draft_model, resolved_backend, out)
+            base = replace(base, llm=replace(base.llm, resolved_draft_path=draft))
         _check_model(base, model, resolved_backend, out)
+        _warn_speculation_without_dataset(base, err)
         image = _pull_image(args, hardware.target, resolved_backend, client, out)
+        base = _with_dataset_request_tokens(
+            base,
+            resolved_backend,
+            hardware,
+            client=client,
+            benchmark_client=benchmark_client,
+            err=err,
+        )
         reporter = _make_reporter(mode, args, out, objective_mode=objective_mode)
         print("preparing study", file=out)
         reporter.start()
@@ -386,18 +407,24 @@ def _output_mode(args: argparse.Namespace, out: TextIO) -> str | None:
     return "tui" if out.isatty() else "log"
 
 
-def _print_header(args: argparse.Namespace, out: TextIO) -> None:
+def _print_header(args: argparse.Namespace, base: ExperimentConfig, out: TextIO) -> None:
     """Print the startup header naming the run's inputs and budget.
 
     The target and image are the requested values — ``auto`` and ``default``
     when the flags were omitted — while the preparation steps that follow report
-    what they actually resolved to.
+    what they actually resolved to. A configured speculative setup is named with
+    its method and, when it has one, its draft source.
     """
     print(f"model: {args.model}", file=out)
     print(f"space: {args.space}", file=out)
     print(f"engine: {args.engine}", file=out)
     print(f"target: {args.target or 'auto'}", file=out)
     print(f"image: {args.image or 'default'}", file=out)
+    if base.llm.speculative_method is not None:
+        setup = base.llm.speculative_method.value
+        if base.llm.draft_model is not None:
+            setup += f" ({base.llm.draft_model})"
+        print(f"speculation: {setup}", file=out)
     print(f"budget: {_budget_text(args)}", file=out)
 
 
@@ -411,19 +438,22 @@ def _budget_text(args: argparse.Namespace) -> str:
     return ", ".join(bounds) if bounds else "unbounded"
 
 
-def _load_space(path: Path, backend: InferenceBackend, out: TextIO) -> ExperimentSpace:
+def _load_space(
+    path: Path, backend: InferenceBackend, llm: LLMConfig, out: TextIO
+) -> ExperimentSpace:
     """Load and parse the search space, mapping a bad file to the definition code.
 
-    The selected backend's :attr:`applicable_parameters` is the required set, so
-    the definition is checked to be total over exactly the parameters the engine
-    forwards: a parameter it does not support may be omitted, and one it does
-    must be declared. A missing or unreadable file is reported as a definition
-    failure rather than a usage error, because the path was syntactically valid
-    but the definition behind it could not be read.
+    The selected backend's :meth:`applicable_parameters` is the required set for
+    the run's fixed configuration, so the definition is checked to be total over
+    exactly the parameters the engine forwards: a parameter it does not support
+    may be omitted, and one it does must be declared. A missing or unreadable
+    file is reported as a definition failure rather than a usage error, because
+    the path was syntactically valid but the definition behind it could not be
+    read.
     """
     print(f"loading search space: {path}", file=out)
     try:
-        return load_experiment_space(path, required=backend.applicable_parameters)
+        return load_experiment_space(path, required=backend.applicable_parameters(llm))
     except (ExperimentDefinitionError, OSError) as error:
         raise _CliFailure(str(error), _EXIT_DEFINITION) from error
 
@@ -431,6 +461,7 @@ def _load_space(path: Path, backend: InferenceBackend, out: TextIO) -> Experimen
 def _check_supported(
     space: ExperimentSpace,
     backend: InferenceBackend,
+    llm: LLMConfig,
     hardware: DetectedHardware,
     out: TextIO,
 ) -> None:
@@ -443,7 +474,7 @@ def _check_supported(
     """
     print("validating search space", file=out)
     try:
-        validate_space(space, backend, hardware)
+        validate_space(space, backend, llm, hardware)
     except ExperimentDefinitionError as error:
         raise _CliFailure(str(error), _EXIT_UNSUPPORTED) from error
 
@@ -495,18 +526,100 @@ def _prefetch_model(model: str, backend: InferenceBackend, out: TextIO) -> Path:
     code 4) reported before any download, and a download failure fails the run
     before any trial.
     """
-    print(f"resolving model: {model}", file=out)
+    return _prefetch_checkpoint("model", model, backend, out)
+
+
+def _prefetch_draft(draft_model: str, backend: InferenceBackend, out: TextIO) -> Path:
+    """Resolve the draft model to a local path, downloading it if needed.
+
+    A draft follows the same model-argument rules as the main checkpoint, so
+    the backend's resolution hook decides what the draft source refers to and
+    the shared download helper fetches it with the same single progress line.
+    The resolved path is recorded on the base configuration, which is what the
+    backend later mounts into the container and inspects for compatibility. A
+    draft the backend refuses to resolve is an unsupported-model failure (exit
+    code 4) before any download, just like an unresolvable main model.
+    """
+    return _prefetch_checkpoint("draft model", draft_model, backend, out)
+
+
+def _prefetch_checkpoint(role: str, source: str, backend: InferenceBackend, out: TextIO) -> Path:
+    """Resolve one checkpoint source and download it when the backend says to.
+
+    ``role`` names the checkpoint in the progress line and the failure
+    messages — ``model`` or ``draft model`` — so the main model and its draft
+    share one resolution path rather than duplicating the download and error
+    handling. The backend's hook decides between a local checkpoint and a Hub
+    repository; anything it rejects is the unsupported exit code, and a download
+    failure is an ordinary run failure.
+    """
+    print(f"resolving {role}: {source}", file=out)
     try:
-        request = backend.model_request(model)
+        request = backend.model_request(source)
     except ExperimentError as error:
-        raise _CliFailure(f"unsupported model: {error}", _EXIT_UNSUPPORTED) from error
+        raise _CliFailure(f"unsupported {role}: {error}", _EXIT_UNSUPPORTED) from error
     if isinstance(request, LocalCheckpoint):
-        print(f"using local model: {request.path}", file=out)
+        print(f"using local {role}: {request.path}", file=out)
         return request.path
     try:
         return download_model(request.repo_id, out, filename=request.filename)
     except Exception as error:
-        raise _CliFailure(f"failed to download model {model!r}: {error}", _EXIT_ERROR) from error
+        raise _CliFailure(f"failed to download {role} {source!r}: {error}", _EXIT_ERROR) from error
+
+
+def _with_dataset_request_tokens(
+    base: ExperimentConfig,
+    backend: InferenceBackend,
+    hardware: DetectedHardware,
+    *,
+    client: PodmanClient | None,
+    benchmark_client: BenchmarkClient | None,
+    err: TextIO,
+) -> ExperimentConfig:
+    """Record a JSONL dataset's measured request length on the base config.
+
+    The engine tokenizes the dataset once before the sweep, so every trial's
+    backend can cap its slot count against the real workload instead of the
+    text length. A backend without a tokenizer endpoint returns ``None`` and
+    leaves the config alone. A failed preflight is a warning rather than a
+    fatal error: the sweep can still run with the backend's conservative
+    fallback, and aborting would hide an otherwise viable configuration behind
+    a diagnostic-only failure.
+    """
+    if base.benchmark.dataset_path is None:
+        return base
+    try:
+        request_tokens = measure_dataset_request_tokens(
+            base,
+            backend,
+            hardware,
+            client=client,
+            benchmark_client=benchmark_client,
+        )
+    except ExperimentError as error:
+        print(f"warning: could not measure the dataset's token lengths: {error}", file=err)
+        return base
+    if request_tokens is None:
+        return base
+    return replace(base, benchmark=replace(base.benchmark, max_request_tokens=request_tokens))
+
+
+def _warn_speculation_without_dataset(base: ExperimentConfig, err: TextIO) -> None:
+    """Warn that the synthetic workload cannot show speculation's benefit.
+
+    Speculative decoding earns its overhead from accepted draft tokens, and the
+    default random-token workload proposes drafts the target almost always
+    rejects. The warning is advisory rather than an error because measuring the
+    worst case can be deliberate; a caller who supplies a dataset is already
+    measuring with real prompts, so it stays silent.
+    """
+    if base.llm.speculative_method is None or base.benchmark.dataset_path is not None:
+        return
+    print(
+        "warning: speculative decoding rarely helps on the synthetic random workload; "
+        "pass `--dataset-path` with real prompts",
+        file=err,
+    )
 
 
 def _pull_image(

@@ -89,6 +89,40 @@ class AttentionBackend(StrEnum):
     XFORMERS = "xformers"
 
 
+class SpeculativeMethod(StrEnum):
+    """Drafting strategy for speculative decoding, named engine-neutrally.
+
+    A backend maps these members to its own spellings; vLLM spells them on its
+    ``--speculative-config`` object and llama.cpp on ``--spec-type``. The set is
+    curated to the methods both engines serve: engine-only variants and
+    per-model aliases remain reachable through the backend's raw-argument
+    escape hatch.
+
+    :attr:`MTP` uses the target model's own multi-token-prediction heads, so it
+    needs no separate draft checkpoint; the other members take a draft model,
+    except :attr:`NGRAM`, which is model-free.
+    """
+
+    DRAFT_MODEL = "draft_model"
+    EAGLE3 = "eagle3"
+    MTP = "mtp"
+    DFLASH = "dflash"
+    DSPARK = "dspark"
+    NGRAM = "ngram"
+
+
+class SpeculativeMode(StrEnum):
+    """Whether a trial runs with the configured speculative setup.
+
+    The members are spelled ``enabled``/``disabled`` rather than ``on``/``off``
+    because PyYAML parses bare ``on`` and ``off`` as booleans, which the search
+    space loader's string coercion would reject.
+    """
+
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+
+
 @dataclass(frozen=True, slots=True)
 class DetectedHardware:
     """The accelerator class and usable device count resolved for a host.
@@ -218,8 +252,12 @@ class BenchmarkConfig:
     bounds the wait for the served model to become healthy, in seconds.
     ``timeout`` is the overall wall-clock limit for the whole run — startup,
     warmup, and every measured run together — in seconds; ``None`` leaves the
-    run unbounded. The constructor rejects a ``repetitions`` below one, a
-    negative ``warmup``, and a non-positive ``startup_timeout``.
+    run unbounded. ``max_request_tokens`` is the longest request the workload
+    will send — input plus generation — when that is known before planning, for
+    example after a JSONL dataset has been tokenized by the engine. It is
+    ``None`` until then, so a backend that needs the length can choose a safe
+    fallback rather than guessing. The constructor rejects a ``repetitions``
+    below one, a negative ``warmup``, and a non-positive ``startup_timeout``.
     """
 
     model: str
@@ -229,6 +267,7 @@ class BenchmarkConfig:
     num_prompts: int | None = None
     input_len: int | None = None
     output_len: int | None = None
+    max_request_tokens: int | None = None
     repetitions: int = 3
     warmup: int = 1
     startup_timeout: float = 600.0
@@ -273,6 +312,15 @@ class ServerSpec:
     client does nothing extra, while a declared path is the client's
     instruction to snapshot it. Which series the engine publishes and how they
     are interpreted stay in the backend that owns the engine.
+
+    ``tokenize_path`` is the optional HTTP path that tokenizes text. When it is
+    declared, a preflight run can ask the server for a dataset's real token
+    lengths before the sweep. ``tokenize_prompt_field`` and
+    ``tokenize_model_field`` describe the request body: the prompt is sent under
+    the former and, when the latter is not ``None``, the served model name under
+    it. A response is expected to carry a ``tokens`` array. ``None`` for the
+    path means the engine has no tokenizer endpoint this layer can use, so the
+    preflight is skipped.
     """
 
     container: ContainerConfig
@@ -280,6 +328,9 @@ class ServerSpec:
     health_timeout: float
     reset_paths: tuple[str, ...] = ()
     metrics_path: str | None = None
+    tokenize_path: str | None = None
+    tokenize_prompt_field: str = "prompt"
+    tokenize_model_field: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +356,22 @@ class LLMConfig:
     rather than engine strings, so an experiment never carries one engine's
     vocabulary. Each backend translates the members it supports to its own
     spellings and rejects the rest.
+
+    The speculative fields describe the speculative-decoding setup. The method
+    and the draft model are fixed for a run and are not tunable: they are
+    checkpoint-specific, so sweeping them would mostly produce server-startup
+    failures. The mode and the depth are the sweep's genuine questions, so
+    :attr:`speculative_mode` and :attr:`num_speculative_tokens` are filled by
+    the search space. An unset mode means the configured setup's default, which
+    is enabled; an unset depth leaves the engine's own default in place. A
+    disabled mode starts the engine with no speculative flags at all, so the
+    draft model's memory is genuinely freed.
+
+    :attr:`resolved_draft_path` is a resolution artifact like
+    :class:`BenchmarkConfig`'s ``resolved_path``: it holds the local path the
+    composition root fetched the draft to, and a backend never forwards it to
+    the engine. It is set on the base configuration before backend validation
+    and planning.
     """
 
     dtype: DType | None = None
@@ -317,6 +384,11 @@ class LLMConfig:
     tensor_parallel_size: int | None = None
     seed: int | None = None
     attention_backend: AttentionBackend | None = None
+    speculative_method: SpeculativeMethod | None = None
+    draft_model: str | None = None
+    speculative_mode: SpeculativeMode | None = None
+    num_speculative_tokens: int | None = None
+    resolved_draft_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -581,14 +653,15 @@ class InferenceBackend(Protocol):
     calls, and the orchestrator never learns an engine's vocabulary.
 
     The search space is total over the backend's *applicable* parameters rather
-    than over every tunable, so :attr:`applicable_parameters` tells the loader
+    than over every tunable, so :meth:`applicable_parameters` tells the loader
     which parameters the selected engine requires. A definition declares exactly
     those, and a value can still never silently fall back to an engine default.
+    Applicability is asked for the run's fixed :class:`LLMConfig`, because a
+    parameter can be applicable only under a configured setup.
     """
 
-    @property
-    def applicable_parameters(self) -> frozenset[str]:
-        """The tunable parameter names this engine forwards.
+    def applicable_parameters(self, llm: LLMConfig) -> frozenset[str]:
+        """The tunable parameter names this engine forwards for ``llm``.
 
         The composition root passes this set to the search-space loader as the
         required set, so a definition may omit a parameter the engine does not
@@ -597,19 +670,28 @@ class InferenceBackend(Protocol):
         :data:`~llm_config_optimization.search_space.registry.TUNABLE_PARAMETERS`.
         A backend that forwards the whole registry returns all of it; one that
         lacks a parameter (llama.cpp has no tensor parallelism, for example)
-        omits it. Declaring a parameter outside this set is a separate,
-        backend-specific problem reported by :meth:`validate`.
+        omits it. A parameter that is only meaningful under a configured setup
+        is included exactly then, so the same space can stay unchanged for a
+        run that does not use that setup. Declaring a parameter outside this set
+        is a separate, backend-specific problem reported by :meth:`validate`.
         """
         ...
 
     def validate(
-        self, space: ExperimentSpace, hardware: DetectedHardware | None = None
+        self,
+        space: ExperimentSpace,
+        llm: LLMConfig,
+        hardware: DetectedHardware | None = None,
     ) -> Sequence[str]:
-        """Report every way this backend cannot support ``space``.
+        """Report every way this backend cannot support ``space`` for ``llm``.
 
         The space is assumed to have already passed engine-agnostic validation;
         this is the engine-specific half, asking whether the backend can forward
-        each declared parameter and value. Problems are returned as
+        each declared parameter and value. ``llm`` is the run's fixed
+        configuration, so a declared parameter is support-checked against
+        :meth:`applicable_parameters` for the same run rather than against the
+        raw forwarding table; a gated tunable declared without its setup is
+        therefore reported as unsupported. Problems are returned as
         human-readable strings rather than raised, so the caller can aggregate
         them across the whole space and report them at once. An empty sequence
         means the backend supports every dimension.

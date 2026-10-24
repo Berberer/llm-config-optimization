@@ -18,15 +18,16 @@ from typing import TYPE_CHECKING
 from .types import ExperimentDefinitionError, ExperimentSpace
 
 if TYPE_CHECKING:
-    from ..inference.types import DetectedHardware, InferenceBackend
+    from ..inference.types import DetectedHardware, InferenceBackend, LLMConfig
 
 
 def validate_space(
     space: ExperimentSpace,
     backend: InferenceBackend,
+    llm: LLMConfig,
     hardware: DetectedHardware | None = None,
 ) -> None:
-    """Check that ``backend`` supports every dimension of ``space``.
+    """Check that ``backend`` supports every dimension of ``space`` for ``llm``.
 
     The space is assumed to have passed engine-agnostic validation when it was
     parsed. The backend's
@@ -36,11 +37,15 @@ def validate_space(
     the caller can correct the whole definition in a single pass. An empty
     result returns ``None``, meaning the backend supports the space.
 
+    ``llm`` is the run's fixed configuration, forwarded so the backend checks a
+    declared parameter against the applicable set of the same run; a tunable
+    gated behind a configured setup is reported as unsupported without one.
+
     ``hardware`` is forwarded to the backend so it can also reject a value the
     engine supports in general but the resolved accelerator class or device
     count does not; it is optional so the definition workflow stays usable
     before hardware has been resolved.
     """
-    problems = tuple(backend.validate(space, hardware))
+    problems = tuple(backend.validate(space, llm, hardware))
     if problems:
         raise ExperimentDefinitionError(problems)
