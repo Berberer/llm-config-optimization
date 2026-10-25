@@ -13,7 +13,8 @@ report how many trials the whole study holds and how many of them failed, then
 end with the recommended configuration.
 
 Both outputs describe the same document, so they cannot disagree. The document
-has the three domains of an experiment:
+is rendered by the output package's YAML writer, which owns the three domains
+of an experiment:
 
 - a curated ``container`` section holding only the host-facing settings a user
   would re-supply — ``target``, ``image``, ``shm_size``, ``mem_limit``, and
@@ -21,11 +22,9 @@ has the three domains of an experiment:
 - the full ``benchmark`` section; and
 - the full ``llm`` section.
 
-The benchmark and LLM sections are emitted from the config's own fields, so a
-new field appears here automatically and an unset value is written as an
-explicit ``null`` rather than omitted, keeping the file self-describing. Enum
-values are written in their engine-neutral spellings, so the document never
-carries one engine's vocabulary.
+This module keeps the human-readable summary and delegates the document's
+construction and serialisation to the registered YAML writer, so the printed and
+written configuration share one renderer with the other output formats.
 
 The recommended config reconstructed by the optimizer deliberately leaves an
 auto-detected ``target`` and an image resolved by the backend as ``None``. Both
@@ -38,15 +37,13 @@ Writing overwrites silently, matching how the rest of the CLI treats an output
 path, and never creates parent directories.
 """
 
-from dataclasses import fields
-from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import optuna
-import yaml
 
-from ..inference.types import BenchmarkConfig, ExperimentConfig, HardwareTarget, LLMConfig
+from ..inference.types import ExperimentConfig, HardwareTarget
+from ..output import OutputFormat, RenderContext, writer_for
 from ._formatting import failure_text
 
 if TYPE_CHECKING:
@@ -63,13 +60,16 @@ _COMBINED_KEY = "tokens_per_second"
 _FRONT_HEADER = ("trial", "prefill tps", "decode tps", "combined tps", "recommended")
 """The Pareto front table's columns, in render order."""
 
-_CONTAINER_FIELDS = ("shm_size", "mem_limit", "pull_policy")
-"""Container settings written besides the resolved ``target`` and ``image``.
 
-The container domain is curated rather than exhaustive: ``selinux_opts``,
-``env``, and ``volumes`` are backend- or runtime-filled and would only add noise
-to a file a user is meant to re-run, so they are left out.
-"""
+def _yaml_text(
+    config: ExperimentConfig,
+    *,
+    target: HardwareTarget,
+    image: str,
+) -> str:
+    """Render the shared winning-configuration document through the YAML writer."""
+    writer = writer_for(OutputFormat.YAML)
+    return writer.render(RenderContext(config=config, target=target, image=image))
 
 
 def render_summary(
@@ -103,7 +103,7 @@ def _scalar_summary(
 ) -> str:
     """Render the historical single-winner headline and the recommended configuration."""
     recommended = result.recommended
-    body = _dump(_config_document(recommended.config, target=target, image=image)).rstrip("\n")
+    body = _yaml_text(recommended.config, target=target, image=image).rstrip("\n")
     return (
         f"best trial: {recommended.trial_number}\n"
         f"best throughput: {recommended.value:.2f} tps\n"
@@ -129,7 +129,7 @@ def _multi_summary(
     """
     recommended = result.recommended
     prefill, decode = _phase_cells(recommended.value)
-    body = _dump(_config_document(recommended.config, target=target, image=image)).rstrip("\n")
+    body = _yaml_text(recommended.config, target=target, image=image).rstrip("\n")
     return (
         f"recommended trial: {recommended.trial_number}\n"
         f"recommended rates: prefill {prefill} tps  decode {decode} tps\n"
@@ -236,54 +236,6 @@ def write_config(
     assumed to exist.
     """
     path.write_text(
-        _dump(_config_document(config, target=target, image=image)),
+        _yaml_text(config, target=target, image=image),
         encoding="utf-8",
     )
-
-
-def _config_document(
-    config: ExperimentConfig,
-    *,
-    target: HardwareTarget,
-    image: str,
-) -> dict[str, dict[str, object]]:
-    """Build the three-domain mapping the summary and the file share.
-
-    The container section is curated and always carries the resolved target and
-    image; the benchmark and LLM sections are built from every config field, in
-    declaration order, with enum members reduced to their string values and
-    unset values kept as ``None`` for YAML's explicit ``null``.
-    """
-    container: dict[str, object] = {"target": _scalar(target), "image": image}
-    container.update({name: _scalar(getattr(config.container, name)) for name in _CONTAINER_FIELDS})
-    return {
-        "container": container,
-        "benchmark": _section(config.benchmark),
-        "llm": _section(config.llm),
-    }
-
-
-def _section(config: BenchmarkConfig | LLMConfig) -> dict[str, object]:
-    """Return every field of a frozen config dataclass, keyed by field name."""
-    return {field.name: _scalar(getattr(config, field.name)) for field in fields(config)}
-
-
-def _scalar(value: object) -> object:
-    """Reduce a config value to something PyYAML's safe dumper can represent.
-
-    A :class:`~enum.StrEnum` member is unwrapped to its engine-neutral string
-    value and a :class:`~pathlib.Path` is rendered as its string form; every
-    other value passes through unchanged. This keeps the document carrying
-    ``cuda``, ``float16``, and a plain path string rather than Python tags
-    PyYAML's safe dumper could not represent.
-    """
-    if isinstance(value, StrEnum):
-        return value.value
-    if isinstance(value, Path):
-        return str(value)
-    return value
-
-
-def _dump(document: dict[str, dict[str, object]]) -> str:
-    """Serialise the document as block-style YAML, preserving field order."""
-    return yaml.safe_dump(document, sort_keys=False, default_flow_style=False)

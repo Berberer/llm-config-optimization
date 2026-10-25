@@ -18,7 +18,8 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
 | `inference/`    | Engine-neutral experiment surface (the `InferenceBackend` protocol, `ServerSpec`, and the optional phase-rate metrics) plus the vLLM and llama.cpp backends, the host benchmark client with its Prometheus snapshots, and hardware detection | `types.py`, `_orchestrate.py`, `_benchmark.py`, `_vllm.py`, `_llamacpp.py`, `hardware.py` |
 | `runtime/`      | Backend-agnostic container types, the detached start/stop lifecycle, the Podman client, and the SELinux probe | `types.py`, `_podman.py`, `_selinux.py` |
 | `optimization/` | The engine-neutral objective model plus the Optuna adapter: maps spec kinds to suggestions, scores trials, drives a study, and guards study provenance | `types.py`, `_optuna.py` |
-| `cli/`          | Composition root: argument parsing, the engine registry, base-config construction, model download progress, log/TUI reporters, summary/writer, exit codes | `arguments.py`, `config.py`, `download.py`, `_formatting.py`, `log.py`, `tui.py`, `summary.py`, `__init__.py` |
+| `output/`       | Engine-neutral winning-configuration writers: the historical YAML experiment document, the Podman quadlet, and the Docker/Podman Compose file, plus the pure-renderer contract and the format registry | `types.py`, `_yaml.py`, `_quadlet.py`, `_compose.py`, `_registry.py` |
+| `cli/`          | Composition root: argument parsing, the engine registry, base-config construction, model download progress, log/TUI reporters, summary and output-writer selection, exit codes | `arguments.py`, `config.py`, `download.py`, `_formatting.py`, `log.py`, `tui.py`, `summary.py`, `__init__.py` |
 
 ### Invariants
 
@@ -107,6 +108,34 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
   polls the runtime handle's `is_running` during the health wait so a container
   that died on startup fails the run immediately instead of waiting out the
   timeout.
+- The output layer (`output/`) is engine-neutral and side-effect free: it
+  imports no inference backend, no engine module, and no container runtime
+  implementation (only the engine-neutral runtime types), and its writers are
+  pure renderers that return text. `output/types.py` holds
+  `OutputFormat`, `RenderContext`, and the `ConfigWriter` protocol with
+  `requires_plan` and `render`; `output/_registry.py` maps every format to a
+  shared writer instance, so the composition root selects one with `writer_for`
+  and never imports a concrete writer. The YAML writer needs no plan and keeps
+  the historical config-only document; the quadlet and Compose writers need the
+  `ServerSpec` a trial planned, because that is the only place the engine
+  command, environment, and host mounts exist. The composition root owns
+  planning and the filesystem write, so a planning or write failure exits
+  non-zero on both the normal and interrupted finish paths. Executable artifacts
+  are planned through the engine's deployment backend, which omits trial-scoped
+  scratch resources such as vLLM's temporary compile cache, so every path a file
+  names outlives the run and the rendered document is deterministic. Generated
+  files carry no provenance header and use `curl` for the healthcheck; the
+  Compose pull-policy translation (`newer` → `always`) is the only emitted
+  comment. The writers are **parameter-agnostic**: adding an
+  `LLMConfig` tunable needs no output change, because the backend encodes it
+  into `ServerSpec.container.command` and the writers copy that verbatim, while
+  the YAML writer reflects every `LLMConfig` field automatically. A new
+  **`ContainerConfig` field**, by contrast, must be considered by every container
+  writer (`_quadlet.py`, `_compose.py`): a field that describes the deployed
+  container must be rendered by both, while a trial-scoped field (`timeout`, the
+  blocking-run limit) is deliberately omitted because it has no meaning in a
+  long-running service. A deployed field belongs in `_CONTAINER_FIELDS` in
+  `_yaml.py` when it also belongs in the curated YAML `container` section.
 
 ### Extension recipes
 
@@ -119,9 +148,10 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
   its phase rates from the snapshots in `parse_result`, while one with
   per-response timings derives them from its preserved raw payloads. Register
   the engine token in `_ENGINES` (`cli/__init__.py`) with its context-manager
-  backend factory and any command-line options it rejects, and export the
-  backend from `inference/__init__.py`. The file format and the layers above are
-  unchanged, so a second engine is an addition, not a rewrite.
+  backend factory, a deployment factory that plans artifacts without
+  trial-scoped resources, and any command-line options it rejects, and export
+  the backend from `inference/__init__.py`. The file format and the layers above
+  are unchanged, so a second engine is an addition, not a rewrite.
 - **New tunable parameter** — see the checklist below; the search space is
   total over a backend's applicable set, so this touches code, every example
   space whose backend forwards it, `docs/search-space.md`, and the tests in one
@@ -129,6 +159,13 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
 - **New container runtime** — implement `run_container`, `start_container`
   (the detached lifecycle), and `pull_image` against the types in
   `runtime/types.py`; keep `_podman.py` engine-free.
+- **New config output format** — implement `ConfigWriter` (`output/types.py`)
+  with `requires_plan` and a pure `render`, add the member to `OutputFormat`,
+  and register the shared instance in `output/_registry.py`. A renderer that
+  reproduces the server reads the planned `ServerSpec`; one that describes the
+  experiment reads the config and declares `requires_plan = False`. The
+  `--output-format` choice follows automatically from the enum; document its
+  conventional suffix in `docs/usage.md` and cover it with formatter tests.
 
 ### Checklist: adding a new tunable parameter
 
@@ -229,8 +266,14 @@ warmup and measured runs, scraping the spec's metrics path around each measured
 run when one is declared, and aggregates them → `runtime` stops the container →
 the backend parses the outcome into a result and enriches it with the phase
 rates its engine reported → the selected objective maps the result to the trial
-value → the reporter callback runs. `cli/__init__.py` maps outcomes onto exit
-codes.
+value → the reporter callback runs. After the sweep — or on an interrupt — the
+finish path prints the summary and, when `--output-config` is set, renders the
+recommended configuration through the format's writer: YAML from the config
+plus the resolved target and image alone, while `quadlet` and `compose` first
+re-plan the recommended config through the engine's deployment backend — which
+omits trial-scoped scratch resources such as vLLM's compile cache — so the
+artifact reproduces the server the trial ran without naming a path the run
+deletes. `cli/__init__.py` maps outcomes onto exit codes.
 
 ## Code style
 
@@ -269,5 +312,15 @@ Always run tools through `uv run` so they use the project environment.
 ## Testing conventions
 
 - Unit tests must not require a daemon: inject the fake Podman client.
+- Generated container artifacts have a hermetic conformance layer in the default
+  suite (`tests/output/test_artifact_conformance.py`): it rejects any quadlet
+  `[Container]` key outside Podman's documented allowlist, checks the JSON-array
+  entrypoint and health-command form, and checks the Compose structure and
+  device classification. The allowlist lives in the tests, so the writer layer
+  stays tool-neutral; a key or value-format change must update it deliberately.
 - Integration tests carry `@pytest.mark.integration` and skip when Podman is
-  unavailable.
+  unavailable. The artifact ones (`tests/output/test_artifact_integration.py`)
+  run rendered files through `docker compose config`, `podman-compose config`,
+  and the Podman quadlet generator (`QUADLET_UNIT_DIRS` + `--dryrun`, optionally
+  `systemd-analyze verify`); each locates its binary through `tests/tooling.py`
+  and skips when it is missing, so a partial install stays runnable.

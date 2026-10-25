@@ -221,6 +221,41 @@ class InterruptingBackend(FakeBackend):
         return super().parse_result(outcome, spec, result)
 
 
+class FinishPlanningFailureBackend(FakeBackend):
+    """A backend that plans every trial but refuses the finish path's re-plan.
+
+    Executable output formats re-plan the recommended configuration after the
+    sweep, and that planning failure must be reported and exit non-zero rather
+    than escaping as an unexpected error.
+    """
+
+    def __init__(self, *, trial_plans: int) -> None:
+        super().__init__(PLAN, RESULT, [])
+        self._trial_plans = trial_plans
+
+    def plan(
+        self,
+        experiment: ExperimentConfig,
+        hardware: DetectedHardware,
+    ) -> ServerSpec:
+        if len(self.plan_calls) >= self._trial_plans:
+            raise ExperimentError("cannot re-plan the winning configuration")
+        return super().plan(experiment, hardware)
+
+
+class InterruptingFinishPlanningFailureBackend(InterruptingBackend):
+    """An interrupt whose finish path then fails to re-plan the winning point."""
+
+    def plan(
+        self,
+        experiment: ExperimentConfig,
+        hardware: DetectedHardware,
+    ) -> ServerSpec:
+        if len(self.plan_calls) >= 1:
+            raise ExperimentError("cannot re-plan the winning configuration")
+        return super().plan(experiment, hardware)
+
+
 def _write_space(path: Path, **overrides: object) -> Path:
     """Write a complete, valid space file, mostly deferring to the engine.
 
@@ -855,6 +890,53 @@ def test_the_cli_gives_the_default_backend_a_temporary_cache_directory(
     assert not cache_dir.exists()
 
 
+def test_artifact_planning_uses_a_cache_free_deployment_backend(
+    tmp_path: Path, model: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An executable artifact is planned without the sweep's temporary compile cache."""
+    space = _write_space(tmp_path / "space.yaml")
+    destination = tmp_path / "server.container"
+    created: list[FakeBackend] = []
+
+    class CacheRecordingBackend(FakeBackend):
+        def __init__(self, *, cache_dir: Path | None = None, **kwargs: object) -> None:
+            super().__init__(PLAN, RESULT, [])
+            self.cache_dir = cache_dir
+            created.append(self)
+
+    monkeypatch.setattr("llm_config_optimization.cli.VLLMBackend", CacheRecordingBackend)
+    out, err = StringIO(), StringIO()
+
+    code = main(
+        [
+            model,
+            str(space),
+            "vllm",
+            "--target",
+            "cpu",
+            "--n-trials",
+            "1",
+            "--output",
+            "log",
+            "--output-config",
+            str(destination),
+            "--output-format",
+            "quadlet",
+        ],
+        client=FakePodmanClient(),
+        stdout=out,
+        stderr=err,
+    )
+
+    assert code == 0
+    assert err.getvalue() == ""
+    assert len(created) == 2
+    sweep_backend, deployment_backend = created
+    assert sweep_backend.cache_dir is not None
+    assert deployment_backend.cache_dir is None
+    assert destination.exists()
+
+
 def test_the_output_mode_defaults_to_log_without_a_terminal(tmp_path: Path, model: str) -> None:
     """With no ``--output`` flag a redirected stream gets one line per trial."""
     space = _write_space(tmp_path / "space.yaml")
@@ -1048,6 +1130,149 @@ def test_a_successful_sweep_writes_the_winning_configuration(tmp_path: Path, mod
     assert set(document) == {"container", "benchmark", "llm"}
     assert document["container"]["target"] == "cpu"
     assert document["container"]["image"] == PLAN.container.image
+
+
+def test_yaml_output_never_replans_the_winning_configuration(tmp_path: Path, model: str) -> None:
+    """The YAML description keeps its config-only path, so only trials plan."""
+    space = _write_space(tmp_path / "space.yaml")
+    backend = _backend()
+
+    code, _, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--output",
+        "log",
+        "--output-config",
+        str(tmp_path / "best.yaml"),
+        backend=backend,
+    )
+
+    assert code == 0
+    assert err == ""
+    assert len(backend.plan_calls) == 1
+
+
+def test_quadlet_output_replans_the_winner_and_writes_its_container(
+    tmp_path: Path, model: str
+) -> None:
+    """The quadlet reproduces the planned server, not just the experiment document."""
+    space = _write_space(tmp_path / "space.yaml")
+    destination = tmp_path / "server.container"
+    backend = _backend()
+
+    code, _, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--output",
+        "log",
+        "--output-config",
+        str(destination),
+        "--output-format",
+        "quadlet",
+        backend=backend,
+    )
+
+    assert code == 0
+    assert err == ""
+    text = destination.read_text(encoding="utf-8")
+    assert "[Unit]" in text
+    assert "[Container]" in text
+    assert f"Image={PLAN.container.image}" in text
+    assert "Exec=serve" in text
+    assert "PublishPort=8000:8000" in text
+    assert "HealthCmd=curl -fsS http://127.0.0.1:8000/health" in text
+    assert "[Install]" not in text
+    assert len(backend.plan_calls) == 2
+    assert backend.plan_calls[-1][1].target is HardwareTarget.CPU
+
+
+def test_compose_output_replans_the_winner_and_writes_its_service(
+    tmp_path: Path, model: str
+) -> None:
+    """Compose output selects the compose writer and carries the planned image."""
+    space = _write_space(tmp_path / "space.yaml")
+    destination = tmp_path / "docker-compose.yml"
+    backend = _backend()
+
+    code, _, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--output",
+        "log",
+        "--output-config",
+        str(destination),
+        "--output-format",
+        "compose",
+        backend=backend,
+    )
+
+    assert code == 0
+    assert err == ""
+    document = yaml.safe_load(destination.read_text(encoding="utf-8"))
+    assert "version" not in document
+    assert set(document["services"]) == {"server"}
+    server = document["services"]["server"]
+    assert server["image"] == PLAN.container.image
+    assert server["command"] == ["serve"]
+    assert server["ports"] == ["8000:8000"]
+    assert len(backend.plan_calls) == 2
+
+
+def test_a_finish_planning_failure_is_reported_and_exits_non_zero(
+    tmp_path: Path, model: str
+) -> None:
+    """A requested executable artifact that cannot be planned fails the command."""
+    space = _write_space(tmp_path / "space.yaml")
+    destination = tmp_path / "server.container"
+    backend = FinishPlanningFailureBackend(trial_plans=1)
+
+    code, _, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--output",
+        "log",
+        "--output-config",
+        str(destination),
+        "--output-format",
+        "quadlet",
+        backend=backend,
+    )
+
+    assert code == 1
+    assert "failed to render the winning configuration as quadlet" in err
+    assert "cannot re-plan the winning configuration" in err
+    assert not destination.exists()
+
+
+def test_a_finish_write_failure_is_reported_and_exits_non_zero(tmp_path: Path, model: str) -> None:
+    """Writing into a missing directory fails loudly instead of being swallowed."""
+    space = _write_space(tmp_path / "space.yaml")
+    destination = tmp_path / "missing" / "docker-compose.yml"
+
+    code, _, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "1",
+        "--output",
+        "log",
+        "--output-config",
+        str(destination),
+        "--output-format",
+        "compose",
+    )
+
+    assert code == 1
+    assert f"failed to write {destination}" in err
+    assert not destination.exists()
 
 
 def test_a_space_the_backend_rejects_returns_the_unsupported_code(
@@ -1353,6 +1578,58 @@ def test_an_interrupt_reports_the_best_point_and_returns_the_interrupt_code(
     assert "recommended trial: 0" in out
     assert "recommended rates: prefill 1000.00 tps  decode 50.00 tps" in out
     assert "trials run: 2" in out
+
+
+def test_an_interrupted_sweep_writes_the_requested_executable_artifact(
+    tmp_path: Path, model: str
+) -> None:
+    """The interrupted path follows the same output semantics as the normal one."""
+    space = _write_space(tmp_path / "space.yaml")
+    destination = tmp_path / "server.container"
+    backend = InterruptingBackend()
+
+    code, _, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "2",
+        "--output",
+        "log",
+        "--output-config",
+        str(destination),
+        "--output-format",
+        "quadlet",
+        backend=backend,
+    )
+
+    assert code == 130
+    assert err == ""
+    assert f"Image={PLAN.container.image}" in destination.read_text(encoding="utf-8")
+    assert len(backend.plan_calls) == 3
+
+
+def test_a_finish_failure_during_an_interrupt_exits_non_zero(tmp_path: Path, model: str) -> None:
+    """An interrupted sweep that cannot produce its artifact does not report success."""
+    space = _write_space(tmp_path / "space.yaml")
+    destination = tmp_path / "server.container"
+
+    code, _, err = _invoke(
+        model,
+        space,
+        "--n-trials",
+        "2",
+        "--output",
+        "log",
+        "--output-config",
+        str(destination),
+        "--output-format",
+        "quadlet",
+        backend=InterruptingFinishPlanningFailureBackend(),
+    )
+
+    assert code == 1
+    assert "cannot re-plan the winning configuration" in err
+    assert not destination.exists()
 
 
 def test_an_explicit_tui_request_without_a_terminal_is_a_usage_error(

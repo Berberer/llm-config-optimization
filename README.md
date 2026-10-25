@@ -10,7 +10,8 @@ reports **prefill** and **decode** throughput separately, and by default the
 sweep maximizes both at once, producing a Pareto front rather than committing
 to a trade-off before the run. Progress is shown live as either a per-trial log
 or a terminal graph, and the recommended configuration is printed and
-optionally written to a YAML file when the sweep ends.
+optionally written as a YAML experiment document or as an executable Podman
+quadlet or Docker Compose file when the sweep ends.
 
 ![Screenshot of the optimization tool TUI in scalar mode, showing a plot with number of trials on the X-axis and tokens per second on the Y-axis; the default multi-objective view is a prefill-versus-decode scatter.](./assets/optimization_plot_example.png)
 
@@ -81,6 +82,14 @@ $ llm-config-optimization Qwen/Qwen3.8-27B examples/vllm/space-full.yaml vllm \
     --n-trials 50 --output-config best.yaml
 ```
 
+The winning configuration can be written as an experiment document or as a
+runnable artifact: add `--output-format quadlet` for a Podman `.container` unit,
+or `--output-format compose` for a Docker/Podman Compose file. The executable
+formats re-plan the winning configuration through the selected engine, so they
+carry the exact image, command, environment, mounts, devices, and healthcheck of
+the benchmarked server; trial-only scratch mounts such as the temporary compile
+cache are left out. The YAML format is the default and is unchanged.
+
 Runs execute through Podman, so a running Podman daemon is required. A remote
 model id is downloaded to the host cache before the first trial; a local path is
 bind-mounted instead. More example calls are in the [usage reference](docs/usage.md#example-calls).
@@ -91,7 +100,7 @@ Detailed guides are linked here:
 
 | Guide | Contents |
 | ----- | -------- |
-| [Usage reference](docs/usage.md) | Engine selection, benchmark workload, objectives and phase metrics, every CLI option, study persistence, exit codes, and complete example calls. |
+| [Usage reference](docs/usage.md) | Engine selection, benchmark workload, objectives and phase metrics, every CLI option, winning-configuration output formats, study persistence, exit codes, and complete example calls. |
 | [Search-space YAML format](docs/search-space.md) | Definition format, spec kinds, tunable parameters, per-engine mappings, validation, shipped example spaces, and the shared prompt corpus. |
 | [Speculative decoding](docs/speculative-decoding.md) | Methods and draft sources, the gated mode and depth dimensions, engine flag mappings, end-to-end examples, and the random-workload caveat. |
 | [Architecture and tech stack](docs/architecture.md) | Layer boundaries, the engine extension surface, and the technology stack. |

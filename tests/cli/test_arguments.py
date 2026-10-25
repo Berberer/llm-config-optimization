@@ -52,6 +52,7 @@ def test_defaults_match_the_documented_settings() -> None:
     assert args.n_jobs == 1
     assert args.output is None
     assert args.output_config is None
+    assert args.output_format == "yaml"
     assert args.objective == "multi"
     assert args.prefill_weight is None
     assert args.decode_weight is None
@@ -117,6 +118,8 @@ def test_explicit_flags_override_every_default() -> None:
             "log",
             "--output-config",
             "best.yaml",
+            "--output-format",
+            "compose",
             "--objective",
             "combined",
             "--prefill-weight",
@@ -153,6 +156,7 @@ def test_explicit_flags_override_every_default() -> None:
     assert args.n_jobs == 2
     assert args.output == "log"
     assert args.output_config == Path("best.yaml")
+    assert args.output_format == "compose"
     assert args.objective == "combined"
     assert args.prefill_weight == 512.0
     assert args.decode_weight == 64.0
@@ -193,6 +197,7 @@ def test_engine_scoped_options_parse_before_the_engine_is_known() -> None:
         ["model", "space.yaml", "vllm", "--quantization", "int8"],
         ["model", "space.yaml", "vllm", "--speculative-method", "eagle"],
         ["model", "space.yaml", "vllm", "--output", "json"],
+        ["model", "space.yaml", "vllm", "--output-format", "json"],
         ["model", "space.yaml", "vllm", "--objective", "fastest"],
         ["model", "space.yaml", "vllm", "--unknown"],
         ["model", "space.yaml", "tensorrt"],
@@ -206,6 +211,7 @@ def test_engine_scoped_options_parse_before_the_engine_is_known() -> None:
         "bad-quantization",
         "bad-speculative-method",
         "bad-output",
+        "bad-output-format",
         "bad-objective",
         "unknown-flag",
         "unknown-engine",
@@ -228,6 +234,35 @@ def test_output_rejects_auto(capsys: pytest.CaptureFixture[str]) -> None:
 
     assert excinfo.value.code == 2
     assert "invalid choice" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("output_format", ["yaml", "quadlet", "compose"])
+def test_every_output_format_parses_with_an_output_path(output_format: str) -> None:
+    args = parse_args(
+        [
+            "model",
+            "space.yaml",
+            "vllm",
+            "--output-config",
+            "best.out",
+            "--output-format",
+            output_format,
+        ]
+    )
+
+    assert args.output_format == output_format
+
+
+@pytest.mark.parametrize("output_format", ["yaml", "quadlet", "compose"])
+def test_an_explicit_output_format_without_a_path_is_a_usage_error(
+    output_format: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The default only applies when the flag is omitted, so a forgotten path fails."""
+    with pytest.raises(SystemExit) as excinfo:
+        parse_args(["model", "space.yaml", "vllm", "--output-format", output_format])
+
+    assert excinfo.value.code == 2
+    assert "--output-format requires --output-config" in capsys.readouterr().err
 
 
 def test_help_exits_zero_and_documents_the_invocation(
@@ -256,6 +291,7 @@ def test_help_exits_zero_and_documents_the_invocation(
         "--decode-weight",
         "--output",
         "--output-config",
+        "--output-format",
     ):
         assert flag in text, flag
     assert "(default: 8g)" in text

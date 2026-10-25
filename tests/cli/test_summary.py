@@ -16,6 +16,7 @@ from dataclasses import fields, replace
 from pathlib import Path
 
 import optuna
+import pytest
 import yaml
 
 from llm_config_optimization.cli.summary import render_summary, write_config
@@ -28,6 +29,7 @@ from llm_config_optimization.inference import (
     LLMConfig,
 )
 from llm_config_optimization.optimization import OptimizationResult, OptimizationSolution
+from llm_config_optimization.output import OutputFormat
 
 TARGET = HardwareTarget.CUDA
 IMAGE = "vllm/vllm-openai:latest"
@@ -292,6 +294,31 @@ def test_write_config_overwrites_an_existing_file_silently(tmp_path: Path) -> No
     document = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert "stale" not in document
     assert set(document) == {"container", "benchmark", "llm"}
+
+
+def test_write_config_uses_the_registered_yaml_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The summary selects its renderer through the registry, never a concrete class."""
+    selected: list[OutputFormat] = []
+
+    class RecordingWriter:
+        requires_plan = False
+
+        def render(self, context: object) -> str:
+            return "rendered: true\n"
+
+    def fake_writer_for(output_format: OutputFormat) -> RecordingWriter:
+        selected.append(output_format)
+        return RecordingWriter()
+
+    monkeypatch.setattr("llm_config_optimization.cli.summary.writer_for", fake_writer_for)
+    path = tmp_path / "best.yaml"
+
+    write_config(path, base_config(), target=TARGET, image=IMAGE)
+
+    assert selected == [OutputFormat.YAML]
+    assert path.read_text(encoding="utf-8") == "rendered: true\n"
 
 
 def test_the_summary_and_the_file_share_the_same_document(tmp_path: Path) -> None:

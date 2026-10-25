@@ -269,16 +269,77 @@ under, so a future change to the phase definitions stays detectable.
 
 ### Output
 
-| Flag              | Values        | Default                | Description                                                     |
-| ----------------- | ------------- | ---------------------- | --------------------------------------------------------------- |
-| `--output`        | `tui`, `log`  | auto (tty → `tui`)     | Progress output mode.                                            |
-| `--output-config` | path          | unset                  | Write the winning configuration to this YAML path.               |
-| `--version`       | —             | —                      | Print the version and exit.                                      |
-| `-h`, `--help`    | —             | —                      | Print help and exit.                                             |
+| Flag              | Values                       | Default                | Description                                                          |
+| ----------------- | ---------------------------- | ---------------------- | -------------------------------------------------------------------- |
+| `--output`        | `tui`, `log`                 | auto (tty → `tui`)     | Progress output mode.                                                 |
+| `--output-config` | path                         | unset                  | Write the winning configuration to this path.                         |
+| `--output-format` | `yaml`, `quadlet`, `compose` | `yaml`                 | Artifact to write to `--output-config`; requires `--output-config`.   |
+| `--version`       | —                            | —                      | Print the version and exit.                                           |
+| `-h`, `--help`    | —                            | —                      | Print help and exit.                                                  |
 
 There is no `auto` value: when `--output` is omitted the mode is chosen
 automatically. A terminal gets the TUI graph, a redirected stream gets the log
 lines. Asking for `--output tui` without a terminal is a usage error.
+
+`--output-config` writes **one** artifact per invocation, and `--output-format`
+selects it. The format defaults to `yaml` when only the path is given, so
+existing invocations are unchanged; giving the format without a path is a usage
+error (exit code `2`), so a forgotten path never silently writes nothing. The
+explicit format is authoritative — the path may carry any suffix (or none).
+
+| Format    | Conventional filename | Contents |
+| --------- | --------------------- | -------- |
+| `yaml`    | `best.yaml`           | The three-domain experiment document: curated `container` section plus the full `benchmark` and `llm` sections. It is built from the recommended configuration and the resolved target and image, and never invokes backend planning. |
+| `quadlet` | `best.container`      | A minimal Podman systemd unit describing the server that actually ran: image, command, entrypoint, environment, mounts, published port, devices, memory and shared-memory limits, pull policy, SELinux options, and a `curl` healthcheck. It carries `[Unit]`, `[Container]`, and `[Service]` with `Restart=on-failure`, and has **no `[Install]`** section, so a benchmark artifact never starts at boot. |
+| `compose` | `docker-compose.yml`  | The same server as a modern Compose document: no obsolete `version:` key, one service keyed `server`, the same container data, and the healthcheck. |
+
+The two executable formats **re-plan the recommended configuration through the
+selected backend**, so the artifact carries the exact image, command,
+entrypoint, environment, host mounts, devices, and resource settings of the
+trial rather than values re-derived from the YAML document. That planning uses a
+deployment backend without the sweep's trial-only scratch resources, so the
+temporary vLLM compile cache and its redirect environment never appear in the
+artifact; the generated file names only paths that outlive the run. Planning can
+create host cache directories, which is why the YAML format deliberately keeps
+its config-only path and only these formats pay that cost. A planned host port
+of `None` — a trial asks the runtime for an unused port — is replaced by the
+container port, so the endpoint is predictable (`8080/tcp` becomes
+`8080:8080/tcp`). Devices are written verbatim, so Podman CDI strings such as
+`nvidia.com/gpu=all` and the ROCm `/dev/kfd`/`/dev/dri` nodes survive; older
+Docker Compose versions may not understand CDI device strings. Generated files
+carry no provenance header or timestamp, so they are deterministic and
+diff-friendly. A planning or write failure is reported and exits non-zero
+(`1`), including on the interrupted-sweep path, so a missing artifact is never
+silent.
+
+The **healthcheck** probes
+`curl -fsS http://127.0.0.1:<container-port><health-path>` — the backend's real
+health path, so readiness means the engine is serving rather than merely that a
+socket is open. Its start period is `--startup-timeout`, the interval is fixed
+at 10 seconds, and it retries 3 times; the official vLLM and llama.cpp images
+(including their CPU and ROCm variants) all ship `curl`. The quadlet uses the
+native `HealthCmd`/`HealthInterval`/`HealthRetries`/`HealthStartPeriod` keys,
+and Compose uses `healthcheck`. SELinux options are preserved in both:
+`disable` becomes the quadlet's native `SecurityLabelDisable=true`, any other
+option is passed through as a `PodmanArgs=--security-opt label=…` argument, and
+Compose writes them as `security_opt: label=…`. The only comment a generated
+file carries is the Compose pull-policy note: Podman's `newer` is Podman-only,
+so Compose gets `always`, a documented approximation that still checks the
+registry.
+
+The artifacts are validated against the real consuming tools in the opt-in
+integration suite (`uv run pytest -m integration`). That pass was recorded with
+Podman 5.8.9 (its quadlet generator, plus the `docker compose` CLI on that host
+is Podman's Docker-compatible shim of the same version) and `systemd-analyze`
+259.10; `podman-compose` was not installed there, so its provider was not
+exercised. Every test skips cleanly when its tool is absent, so a partial install
+stays runnable. The CDI limitation is part of that matrix: a portable device list
+such as `/dev/kfd` and `/dev/dri` must pass every installed Compose provider,
+while a CDI string such as `nvidia.com/gpu=all` passes `podman-compose` and is
+expected to be rejected by real Docker Compose. The generated file keeps the
+verbatim CDI spelling rather than switching to Docker-specific GPU reservations,
+so use Podman (or Docker Compose on a Podman-backed host) for such a
+configuration.
 
 Progress and the summary go to **stdout**; warnings and errors go to **stderr**,
 so `> run.log` captures a clean record.
@@ -346,16 +407,17 @@ are different signals and are not counted. Percentages are whole numbers, and a
 nonzero rate that would round to zero is shown as `<1%` rather than `0%`, so a
 small but real failure rate is never hidden.
 
-The sweep's final summary prints the recommended configuration as the same YAML
-document `--output-config` writes. It also reports how many of the study's
-trials failed, as `failed trials: n/m (pct)` directly after `trials run`: the
-denominator `m` is the same whole-study count, so a resumed sweep's summary
-covers every trial the study holds rather than only this invocation's, unlike
-the live failure segment. The percentage uses the same whole-percent format,
-including its `<1%` floor. In multi mode the summary also prints the Pareto
-front as a table — trial number, both phase rates, the trial's recorded combined
-throughput, and the recommended row marked — so the whole trade-off can be
-compared at a glance.
+The sweep's final summary always prints the recommended configuration as the
+three-domain YAML document, whichever `--output-format` was chosen, so an
+executable artifact does not remove the human-readable result. It also reports
+how many of the study's trials failed, as `failed trials: n/m (pct)` directly
+after `trials run`: the denominator `m` is the same whole-study count, so a
+resumed sweep's summary covers every trial the study holds rather than only
+this invocation's, unlike the live failure segment. The percentage uses the
+same whole-percent format, including its `<1%` floor. In multi mode the summary
+also prints the Pareto front as a table — trial number, both phase rates, the
+trial's recorded combined throughput, and the recommended row marked — so the
+whole trade-off can be compared at a glance.
 
 With `--n-jobs` greater than one the reporters are driven from several worker
 threads; they are not thread-safe, so frames and lines can interleave. Use log
@@ -367,7 +429,7 @@ mode with a single job when a clean record matters.
 | ----- | -------------------------------------------------------------- |
 | `0`   | Success.                                                       |
 | `1`   | Unexpected error.                                              |
-| `2`   | Usage error (including an explicit TUI request without a terminal). |
+| `2`   | Usage error (including an explicit TUI request without a terminal, or `--output-format` without `--output-config`). |
 | `3`   | Invalid or unreadable search-space definition.                 |
 | `4`   | A configuration the backend does not support — the search space or the resolved model. |
 | `5`   | Sweep finished with no completed trial.                        |
@@ -388,6 +450,22 @@ $ llm-config-optimization Qwen/Qwen3.8-27B space.yaml vllm \
     --n-trials 50 \
     --output log \
     --output-config best.yaml > run.log
+```
+
+**Write the winner as a Podman quadlet to drop into `~/.config/containers/systemd/`:**
+
+```console
+$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml vllm \
+    --n-trials 50 \
+    --output-config qwen.container --output-format quadlet
+```
+
+**Write the same winner as a Docker/Podman Compose file:**
+
+```console
+$ llm-config-optimization Qwen/Qwen3.8-27B space.yaml vllm \
+    --n-trials 50 \
+    --output-config docker-compose.yml --output-format compose
 ```
 
 **Large local checkpoint on an explicit ROCm target with more memory headroom:**
@@ -483,6 +561,7 @@ benchmark begins. The cache is mounted into every trial's container, so the
 first trial populates it and the rest reuse it, and it is removed when the run
 ends (including on interrupt or failure). Nothing is left behind. The cache is
 vLLM-only; llama.cpp needs no host directory, so a llama.cpp run places nothing
-on the host.
+on the host. Executable artifacts are planned without this cache, because it is
+benchmark scratch space rather than part of the served configuration.
 
 ---

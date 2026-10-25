@@ -60,6 +60,7 @@ from ..inference.types import (
     HardwareTarget,
     InferenceBackend,
     LLMConfig,
+    ServerSpec,
 )
 from ..optimization import (
     ObjectiveMode,
@@ -69,6 +70,7 @@ from ..optimization import (
     OptimizationResult,
     optimize,
 )
+from ..output import OutputFormat, RenderContext, writer_for
 from ..runtime import ContainerRunError, pull_image
 from ..search_space import (
     ExperimentDefinitionError,
@@ -80,7 +82,7 @@ from .arguments import parse_args
 from .config import build_base_config, resolve_objective
 from .download import download_model
 from .log import LogReporter
-from .summary import render_summary, write_config
+from .summary import render_summary
 from .tui import TuiReporter
 
 if TYPE_CHECKING:
@@ -110,6 +112,18 @@ def _vllm_backend() -> Generator[InferenceBackend]:
         yield VLLMBackend(cache_dir=Path(cache_directory))
 
 
+def _vllm_deployment_backend() -> InferenceBackend:
+    """Build vLLM without the trial-scoped compile cache for an artifact plan.
+
+    A generated quadlet or Compose file describes the server to deploy, not the
+    scratch resources a benchmark run used. Planning through a cache-less
+    backend keeps the ephemeral compile-cache mount and its redirect environment
+    out of the artifact, so the rendered file is deterministic and every host
+    path in it outlives the run.
+    """
+    return VLLMBackend()
+
+
 @contextmanager
 def _llamacpp_backend() -> Generator[InferenceBackend]:
     """Build the llama.cpp backend for the duration of a sweep.
@@ -121,26 +135,42 @@ def _llamacpp_backend() -> Generator[InferenceBackend]:
     yield LlamaCppBackend()
 
 
+def _llamacpp_deployment_backend() -> InferenceBackend:
+    """Build llama.cpp for an artifact plan.
+
+    llama.cpp owns no trial-scoped host resources, so its deployment plan is its
+    regular plan; the factory exists to keep the registry contract uniform.
+    """
+    return LlamaCppBackend()
+
+
 @dataclass(frozen=True, slots=True)
 class _EngineEntry:
-    """One registered engine: its backend factory and the options it rejects.
+    """One registered engine: its sweep and deployment factories and rejected options.
 
     ``factory`` builds the backend for the duration of a sweep and is a context
     manager, so an engine can own the resources it needs (vLLM's per-run compile
-    cache) without leaking that detail into the CLI. ``rejected_options`` names
-    the command-line options that are meaningful only for other engines; passing
-    one of them selects a usage error instead of a value the backend would
-    silently ignore.
+    cache) without leaking that detail into the CLI. ``deployment_factory``
+    builds a backend used only to plan a written artifact: it must omit
+    trial-scoped resources, because a deployed server must not depend on a cache
+    the runner removes. ``rejected_options`` names the command-line options that
+    are meaningful only for other engines; passing one of them selects a usage
+    error instead of a value the backend would silently ignore.
     """
 
     factory: Callable[[], AbstractContextManager[InferenceBackend]]
+    deployment_factory: Callable[[], InferenceBackend]
     rejected_options: tuple[str, ...] = ()
 
 
 _ENGINES: Mapping[str, _EngineEntry] = {
-    "vllm": _EngineEntry(factory=_vllm_backend),
+    "vllm": _EngineEntry(
+        factory=_vllm_backend,
+        deployment_factory=_vllm_deployment_backend,
+    ),
     "llamacpp": _EngineEntry(
         factory=_llamacpp_backend,
+        deployment_factory=_llamacpp_deployment_backend,
         rejected_options=("quantization", "gpu-memory-utilization"),
     ),
 }
@@ -150,7 +180,8 @@ The registry is the only place that knows which engines exist and which
 engine-scoped options they reject; the rest of the composition root selects a
 backend by token and never imports an engine class. A factory is a context
 manager so it can own the resources a backend needs for the whole sweep
-(vLLM's compile cache) without leaking that detail into the CLI.
+(vLLM's compile cache) without leaking that detail into the CLI. The separate
+deployment factory plans artifacts without those trial-only resources.
 """
 
 
@@ -242,9 +273,11 @@ def _run(
     the hardware is probed, or a container is pulled. A JSONL ``--dataset-path``
     is read and validated at the same point, so a missing or malformed dataset
     is a usage error before the first trial rather than a failure repeated by
-    every trial. A caller-supplied backend is used as-is; otherwise the entry's
-    factory builds the selected backend for the duration of the sweep, so
-    resources such as vLLM's compile cache live exactly as long as the run.
+    every trial. A caller-supplied backend is used as-is for both the sweep and
+    any artifact plan; otherwise the entry's factory builds the selected backend
+    for the duration of the sweep, so resources such as vLLM's compile cache live
+    exactly as long as the run, while its deployment factory plans written
+    artifacts without those trial-only resources.
     """
     mode = _output_mode(args, out)
     if mode is None:
@@ -281,6 +314,7 @@ def _run(
                 mode=mode,
                 objective_mode=objective_mode,
                 objective_weights=objective_weights,
+                output_planning_factory=engine.deployment_factory,
                 client=client,
                 benchmark_client=benchmark_client,
                 out=out,
@@ -295,6 +329,7 @@ def _run(
         mode=mode,
         objective_mode=objective_mode,
         objective_weights=objective_weights,
+        output_planning_factory=lambda: backend,
         client=client,
         benchmark_client=benchmark_client,
         out=out,
@@ -310,6 +345,7 @@ def _sweep(
     mode: str,
     objective_mode: ObjectiveMode,
     objective_weights: ObjectiveWeights | None,
+    output_planning_factory: Callable[[], InferenceBackend],
     client: PodmanClient | None,
     benchmark_client: BenchmarkClient | None,
     out: TextIO,
@@ -368,14 +404,32 @@ def _sweep(
         print(failure, file=err)
         return failure.exit_code
     except OptimizationInterrupted as interrupted:
-        _finish(interrupted.result, args, target=hardware.target, image=image, out=out)
-        return _EXIT_INTERRUPTED
+        return _finish(
+            interrupted.result,
+            args,
+            target=hardware.target,
+            image=image,
+            hardware=hardware,
+            output_planning_factory=output_planning_factory,
+            out=out,
+            err=err,
+            exit_code=_EXIT_INTERRUPTED,
+        )
     except OptimizationError as error:
         print(f"error: {error}", file=err)
         return _EXIT_EMPTY_SWEEP
 
-    _finish(result, args, target=hardware.target, image=image, out=out)
-    return _EXIT_SUCCESS
+    return _finish(
+        result,
+        args,
+        target=hardware.target,
+        image=image,
+        hardware=hardware,
+        output_planning_factory=output_planning_factory,
+        out=out,
+        err=err,
+        exit_code=_EXIT_SUCCESS,
+    )
 
 
 def _rejected_option(args: argparse.Namespace, engine: _EngineEntry) -> str | None:
@@ -684,15 +738,76 @@ def _finish(
     *,
     target: HardwareTarget,
     image: str,
+    hardware: DetectedHardware,
+    output_planning_factory: Callable[[], InferenceBackend],
     out: TextIO,
-) -> None:
+    err: TextIO,
+    exit_code: int,
+) -> int:
     """Print the recommended-configuration summary and optionally write it to disk.
 
     The summary and the file share the resolved target and image, so both name
     the hardware and image that actually ran rather than the ``None`` the
     optimizer leaves in the reconstructed config. Both describe the result's
     recommended point, the one point of the frontier a caller should re-run.
+
+    The finish path runs on both a completed and an interrupted sweep, so it
+    returns the exit code to use: the caller's ``exit_code`` on success, or the
+    output failure's code when the requested artifact could not be produced.
     """
     print(render_summary(result, target=target, image=image), file=out)
     if args.output_config is not None:
-        write_config(args.output_config, result.recommended.config, target=target, image=image)
+        try:
+            _write_output(
+                result,
+                args,
+                target=target,
+                image=image,
+                hardware=hardware,
+                output_planning_factory=output_planning_factory,
+            )
+        except _CliFailure as failure:
+            print(failure, file=err)
+            return failure.exit_code
+    return exit_code
+
+
+def _write_output(
+    result: OptimizationResult,
+    args: argparse.Namespace,
+    *,
+    target: HardwareTarget,
+    image: str,
+    hardware: DetectedHardware,
+    output_planning_factory: Callable[[], InferenceBackend],
+) -> None:
+    """Render the winning configuration in the selected format and write it.
+
+    The writer is selected from the format's registry entry, so this path never
+    imports a concrete renderer. The YAML description is built from the
+    recommended config plus the resolved target and image alone and declares
+    that it needs no plan, so it keeps its historical side effects and never
+    invokes backend planning. An executable format needs the server plan a trial
+    ran, so the recommended configuration is re-planned through the deployment
+    backend before its writer renders it. That backend omits trial-only scratch
+    resources, so the artifact does not reference a cache directory the run
+    deletes. Planning and writing failures are reported as :class:`_CliFailure`
+    so both the normal and interrupted finish paths exit non-zero.
+    """
+    output_format = OutputFormat(args.output_format)
+    config = result.recommended.config
+    writer = writer_for(output_format)
+    spec: ServerSpec | None = None
+    try:
+        if writer.requires_plan:
+            spec = output_planning_factory().plan(config, hardware)
+        text = writer.render(RenderContext(config=config, target=target, image=image, spec=spec))
+    except Exception as error:
+        raise _CliFailure(
+            f"failed to render the winning configuration as {output_format.value}: {error}",
+            _EXIT_ERROR,
+        ) from error
+    try:
+        args.output_config.write_text(text, encoding="utf-8")
+    except OSError as error:
+        raise _CliFailure(f"failed to write {args.output_config}: {error}", _EXIT_ERROR) from error

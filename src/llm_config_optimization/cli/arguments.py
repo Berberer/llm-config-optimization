@@ -24,6 +24,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from ..inference.types import SpeculativeMethod
+from ..output import OutputFormat
 
 __all__ = ["build_parser", "parse_args"]
 
@@ -39,6 +40,7 @@ _EPILOG = """\
 examples:
   llm-config-optimization facebook/opt-125m space.yaml vllm
   llm-config-optimization facebook/opt-125m space.yaml vllm --n-trials 50 --output-config best.yaml
+  llm-config-optimization facebook/opt-125m space.yaml vllm --output-config server.container --output-format quadlet
   llm-config-optimization /models/Llama-3.1-8B space.yaml vllm --target cuda --sweep-timeout 3600
 """
 
@@ -286,7 +288,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-config",
         type=Path,
         default=None,
-        help="Write the winning configuration to this YAML path.",
+        help="Write the winning configuration to this path; requires no particular suffix.",
+    )
+    output.add_argument(
+        "--output-format",
+        choices=tuple(format.value for format in OutputFormat),
+        default=None,
+        help=(
+            "Artifact to write to --output-config: yaml for the experiment document "
+            "(.yaml), quadlet for a Podman .container unit, or compose for a "
+            "docker-compose.yml; requires --output-config."
+        ),
     )
     output.add_argument(
         "--version",
@@ -302,6 +314,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse ``argv`` (defaulting to ``sys.argv[1:]``) into a settings namespace.
 
     Invalid input is reported by argparse on stderr and exits with status ``2``;
-    ``-h``/``--help`` and ``--version`` print and exit ``0``.
+    ``-h``/``--help`` and ``--version`` print and exit ``0``. ``--output-format``
+    defaults to ``yaml`` only when it is omitted: an explicit format without
+    ``--output-config`` is a usage error rather than a silent no-op.
     """
-    return build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.output_format is not None and args.output_config is None:
+        parser.error("--output-format requires --output-config")
+    if args.output_format is None:
+        args.output_format = OutputFormat.YAML.value
+    return args
