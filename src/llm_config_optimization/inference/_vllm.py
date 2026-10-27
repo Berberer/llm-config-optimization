@@ -39,7 +39,14 @@ from ..search_space.types import (
     Spec,
 )
 from ._benchmark import _METRICS_AFTER_KEY, _METRICS_BEFORE_KEY, _METRICS_KEY
-from ._tunables import Gate, declared_values, translate_value, unsupported_values
+from ._tunables import (
+    Gate,
+    Toggle,
+    declared_values,
+    toggle_arguments,
+    translate_value,
+    unsupported_values,
+)
 from .types import (
     AttentionBackend,
     BenchmarkOutcome,
@@ -87,7 +94,7 @@ class JsonGroup:
     key: str
 
 
-ParameterTarget = FlatFlag | JsonGroup | Gate
+ParameterTarget = FlatFlag | JsonGroup | Gate | Toggle
 
 
 PARAMETER_TARGETS: Mapping[str, ParameterTarget] = MappingProxyType(
@@ -98,6 +105,8 @@ PARAMETER_TARGETS: Mapping[str, ParameterTarget] = MappingProxyType(
         "max_model_len": FlatFlag(),
         "max_num_seqs": FlatFlag(),
         "max_num_batched_tokens": FlatFlag(),
+        "max_num_active_seqs": FlatFlag(),
+        "max_num_scheduled_tokens": FlatFlag(),
         "gpu_memory_utilization": FlatFlag(),
         "tensor_parallel_size": FlatFlag(),
         "seed": FlatFlag(),
@@ -109,6 +118,9 @@ PARAMETER_TARGETS: Mapping[str, ParameterTarget] = MappingProxyType(
         "speculative_mode": Gate(),
         "num_speculative_tokens": JsonGroup(
             flag="--speculative-config", key="num_speculative_tokens"
+        ),
+        "prefix_caching": Toggle(
+            enabled="--enable-prefix-caching", disabled="--no-enable-prefix-caching"
         ),
     }
 )
@@ -169,7 +181,8 @@ rather than silently forwarded, while the long tail of engine-specific values
 is reached through :attr:`VLLMBackend.extra_args`. ``XFORMERS`` is deliberately
 absent: current vLLM releases no longer ship an xFormers attention backend, so
 the member is rejected instead of being forwarded to a flag the engine will
-not accept.
+not accept. ``AUTO`` and ``OFF`` are llama.cpp's flash-attention settings and
+have no vLLM attention-config spelling.
 """
 
 _CHECKPOINT_QUANTIZATION_METHODS: Mapping[QuantizationMethod, frozenset[str]] = MappingProxyType(
@@ -212,6 +225,20 @@ vLLM's ROCm and CPU platforms select from their own backend sets
 not model, so the modelled members are CUDA-only. A member with no entry here
 is either unsupported everywhere or has no vLLM spelling at all; the latter is
 already reported by :data:`VALUE_MAPS` before a target is consulted.
+"""
+
+_FLOAT_CACHE_DTYPES: Mapping[KVCacheDType, DType] = MappingProxyType(
+    {
+        KVCacheDType.FLOAT16: DType.FLOAT16,
+        KVCacheDType.BFLOAT16: DType.BFLOAT16,
+    }
+)
+"""Non-quantized KV-cache formats and the model dtype each must match.
+
+vLLM stores a non-quantized KV cache in the model's dtype, so an explicit
+float16 or bfloat16 cache is only safe when the model dtype is pinned to the
+same value. The FP8 formats are absent because they are stored differently and
+may differ from the model dtype.
 """
 
 
@@ -304,6 +331,9 @@ def encode_arguments(
             continue
         if isinstance(target, FlatFlag):
             arguments.extend(_flat_arguments(name, value))
+            continue
+        if isinstance(target, Toggle):
+            arguments.extend(toggle_arguments(value, target))
             continue
         if target.flag in emitted_groups:
             continue
@@ -699,7 +729,11 @@ def _resolve_draft(
     return _DRAFT_MODEL_MOUNT_PATH, (_model_mount(resolved_draft_path, _DRAFT_MODEL_MOUNT_PATH),)
 
 
-_ENGINE_BOUNDS: tuple[tuple[str, str], ...] = (("max_num_batched_tokens", "max_num_seqs"),)
+_ENGINE_BOUNDS: tuple[tuple[str, str], ...] = (
+    ("max_num_batched_tokens", "max_num_seqs"),
+    ("max_num_seqs", "max_num_active_seqs"),
+    ("max_num_batched_tokens", "max_num_scheduled_tokens"),
+)
 """Numeric constraints vLLM imposes between two tunable parameters.
 
 Each pair ``(upper, lower)`` records that ``upper`` must be at least ``lower``.
@@ -707,10 +741,13 @@ The engine-agnostic ``>= 1`` floor is already enforced by the loader; these are
 the extra limits vLLM's own configuration validation adds.
 ``SchedulerConfig.verify_max_model_len`` rejects
 ``max_num_batched_tokens < max_num_seqs`` unconditionally, so a space that
-allows a violating pair would fail partway through a series. vLLM's other
-scheduler rule, ``max_num_batched_tokens >= max_model_len``, applies only when
-chunked prefill is disabled, which the default vLLM v1 scheduler does not do,
-so it is deliberately not enforced here.
+allows a violating pair would fail partway through a series. The scheduler's
+optional caps are bounded by the values they narrow:
+``max_num_active_seqs`` cannot exceed ``max_num_seqs`` and
+``max_num_scheduled_tokens`` cannot exceed ``max_num_batched_tokens``. vLLM's
+other scheduler rule, ``max_num_batched_tokens >= max_model_len``, applies only
+when chunked prefill is disabled, which the default vLLM v1 scheduler does not
+do, so it is deliberately not enforced here.
 """
 
 
@@ -784,6 +821,37 @@ def _numeric_range(spec: Spec) -> tuple[int, int] | None:
     if len(numeric) != len(values):
         return None
     return min(numeric), max(numeric)
+
+
+def _validate_float_cache_dtype(space: ExperimentSpace) -> list[str]:
+    """Report an explicit float KV cache that cannot be proved to match the model dtype.
+
+    vLLM stores a non-quantized KV cache in the model's dtype, so an explicit
+    ``float16`` or ``bfloat16`` cache is only safe when the ``dtype`` dimension
+    is pinned to exactly that model dtype. A ``Default``, ``auto``, ``float32``,
+    or multi-value dtype dimension leaves at least one combination unverifiable
+    or mismatched, so it is rejected rather than failing at server startup. The
+    FP8 cache formats are exempt because they are stored differently. A space
+    missing either dimension is left to the per-dimension checks.
+    """
+    dimensions = {dimension.name: dimension for dimension in space.dimensions}
+    dtype = dimensions.get("dtype")
+    cache = dimensions.get("kv_cache_dtype")
+    if dtype is None or cache is None:
+        return []
+    dtype_values = [value for _, value in declared_values(dtype)]
+    pinned = dtype_values[0] if len(dtype_values) == 1 else None
+    problems: list[str] = []
+    for path, value in declared_values(cache):
+        expected = _FLOAT_CACHE_DTYPES.get(value) if isinstance(value, KVCacheDType) else None
+        if expected is None or pinned is expected:
+            continue
+        problems.append(
+            f"{path}: vLLM stores an explicit float KV cache in the model dtype, "
+            f"but the dtype dimension does not pin {expected.value!r}; pin "
+            f"dtype={expected.value!r} or use kv_cache_dtype=auto"
+        )
+    return problems
 
 
 def _validate_engine_bounds(space: ExperimentSpace) -> list[str]:
@@ -880,17 +948,20 @@ class VLLMBackend:
     cache_dir: Path | None = None
 
     def applicable_parameters(self, llm: LLMConfig) -> frozenset[str]:
-        """Every registered tunable, minus the setup-gated ones when unconfigured.
+        """Every registered tunable this backend forwards, minus the gated ones.
 
-        vLLM is the reference backend and models the whole registry, so its
-        applicable set is
-        :data:`~llm_config_optimization.search_space.registry.TUNABLE_PARAMETERS`
-        except that the two speculative dimensions are included only when
-        ``llm`` configures a speculative method or draft model. A space must
-        therefore declare every applicable parameter, and each value is still
-        support-checked by :meth:`validate`.
+        vLLM models the whole registry except llama.cpp's GPU-layer dimension,
+        which has no vLLM flag, so its applicable set is every tunable present
+        in :data:`PARAMETER_TARGETS`. The two speculative dimensions are added
+        only when ``llm`` configures a speculative method or draft model. A
+        space must therefore declare every applicable parameter, and each value
+        is still support-checked by :meth:`validate`.
         """
-        applicable = frozenset(TUNABLE_PARAMETERS) - SPECULATIVE_PARAMETERS
+        applicable = frozenset(
+            name
+            for name, field in TUNABLE_PARAMETERS.items()
+            if field in PARAMETER_TARGETS and name not in SPECULATIVE_PARAMETERS
+        )
         if speculative_configured(llm):
             return applicable | SPECULATIVE_PARAMETERS
         return applicable
@@ -908,9 +979,11 @@ class VLLMBackend:
         every fixed or categorical enum value must have a vLLM spelling.
         ``Default`` dimensions carry no value to check and are accepted once
         their parameter is known to be applicable. The engine's own numeric
-        constraints between parameters are checked last. Problems are returned
-        as strings so the caller can aggregate them; an empty sequence means
-        vLLM supports every dimension.
+        constraints between parameters are checked last. A space that can pair
+        an explicit float16 or bfloat16 KV cache with a model dtype that is not
+        pinned to the same value is rejected too, because vLLM stores the cache
+        in the model dtype. Problems are returned as strings so the caller can
+        aggregate them; an empty sequence means vLLM supports every dimension.
 
         ``hardware``, when given, additionally asks whether each declared value
         is supported on that accelerator class and fits its device count, so a
@@ -933,6 +1006,7 @@ class VLLMBackend:
                 problems.extend(_validate_target_support(dimension, field, hardware.target))
                 problems.extend(_validate_device_count(dimension, field, hardware.device_count))
         problems.extend(_validate_engine_bounds(space))
+        problems.extend(_validate_float_cache_dtype(space))
         return problems
 
     def validate_model(self, experiment: ExperimentConfig, model: Path) -> Sequence[str]:

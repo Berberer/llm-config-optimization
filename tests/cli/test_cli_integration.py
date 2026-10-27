@@ -51,6 +51,7 @@ _CPU_SEED = 0
 _MAX_MODEL_LEN = 2048
 _MAX_NUM_BATCHED_TOKENS = 2048
 _MAX_NUM_SEQS = (2, 4)
+_MAX_NUM_ACTIVE_SEQS = 2
 
 SPACE = {
     "space": {
@@ -59,8 +60,11 @@ SPACE = {
         "max_model_len": {"fixed": _MAX_MODEL_LEN},
         "max_num_seqs": {"categorical": list(_MAX_NUM_SEQS)},
         "max_num_batched_tokens": {"fixed": _MAX_NUM_BATCHED_TOKENS},
+        "max_num_active_seqs": {"fixed": _MAX_NUM_ACTIVE_SEQS},
+        "max_num_scheduled_tokens": {"fixed": _MAX_NUM_BATCHED_TOKENS},
         "tensor_parallel_size": {"fixed": 1},
         "attention_backend": {"default": True},
+        "prefix_caching": {"fixed": True},
     }
 }
 """A mostly-fixed CPU-safe space with one dimension the sweep varies."""
@@ -194,6 +198,8 @@ def test_two_trial_cpu_sweep_reports_progress_and_writes_the_winner(
     assert document["llm"]["max_model_len"] == _MAX_MODEL_LEN
     assert document["llm"]["max_num_seqs"] in _MAX_NUM_SEQS
     assert document["llm"]["max_num_batched_tokens"] == _MAX_NUM_BATCHED_TOKENS
+    assert document["llm"]["max_num_active_seqs"] == _MAX_NUM_ACTIVE_SEQS
+    assert document["llm"]["max_num_scheduled_tokens"] == _MAX_NUM_BATCHED_TOKENS
     assert document["llm"]["tensor_parallel_size"] == 1
     assert document["llm"]["gpu_memory_utilization"] == _CPU_MEMORY_UTILIZATION
     assert document["llm"]["seed"] == _CPU_SEED

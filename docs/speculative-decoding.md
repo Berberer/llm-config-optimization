@@ -33,34 +33,41 @@ $ llm-config-optimization Qwen/Qwen3.8-27B examples/vllm/space-speculative-full.
     --output-config best-eagle3.yaml
 ```
 
-The matching space declares the seven base vLLM tunables **and** both gated
+The matching space declares the ten base vLLM tunables **and** both gated
 speculative dimensions:
 
 ```yaml
 space:
   dtype:
-    categorical: [auto, float16, bfloat16, float32]
+    categorical: [auto, float16, bfloat16]
   kv_cache_dtype:
-    categorical: [auto, float16, bfloat16, fp8_e4m3, fp8_e5m2]
+    categorical: [auto, fp8_e4m3, fp8_e5m2]
   max_model_len:
     interval: {min: 1024, max: 32768}
   max_num_seqs:
-    interval: {min: 1, max: 256}
+    interval: {min: 16, max: 256}
   max_num_batched_tokens:
-    interval: {min: 2048, max: 8192}
+    interval: {min: 4096, max: 8192}
+  max_num_active_seqs:
+    interval: {min: 1, max: 16}
+  max_num_scheduled_tokens:
+    interval: {min: 2048, max: 4096}
   tensor_parallel_size:
     default: true
   attention_backend:
     default: true
+  prefix_caching:
+    fixed: true
   speculative_mode:
     categorical: [enabled, disabled]
   num_speculative_tokens:
     categorical: [1, 2, 4, 8]
 ```
 
-For llama.cpp the space is the five base tunables for that engine plus the same
-two speculative dimensions, and `--draft-model` takes a local `.gguf` file or a
-Hub repository with the optional `:QUANT` selector, exactly like `MODEL`:
+For llama.cpp the space is the seven base tunables for that engine — including
+`n_gpu_layers` — plus the same two speculative dimensions, and `--draft-model`
+takes a local `.gguf` file or a Hub repository with the optional `:QUANT`
+selector, exactly like `MODEL`:
 
 ```console
 $ llm-config-optimization /models/Qwen3.5-8B-Q4_K_M.gguf examples/llamacpp/space-speculative-full.yaml llamacpp \

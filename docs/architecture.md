@@ -24,7 +24,10 @@ Part of the [README](../README.md) documentation.
 The codebase is layered so engine details stay at the edges:
 
 - `search_space/`: Engine-neutral definition types, the tunable registry, the
-  YAML loader, and validation.
+  YAML loader, and validation. Each tunable's kind is derived from its
+  `LLMConfig` annotation — enum, integer, boolean, or an int-or-enum union such
+  as `n_gpu_layers` — so `interval` constrains only a numeric branch and
+  booleans stay strict.
 - `inference/`: The engine-neutral experiment surface (the `InferenceBackend`
   `Protocol` and the `ServerSpec` a backend plans) plus the `VLLMBackend` and
   `LlamaCppBackend`, the host-side benchmark client, and hardware detection. A
@@ -83,6 +86,15 @@ resolved draft is validated where the backend can inspect it cheaply — for
 example, llama.cpp rejects a non-GGUF draft through its metadata reader before
 the image is pulled — and a space that can sample speculation off still resolves
 the draft once per run, because resolution does not consult the space.
+llama.cpp's `n_gpu_layers` validation follows the same split: a CPU target
+rejects `all` and positive exact counts before the run, while a count above the
+resolved checkpoint's GGUF block count is caught once the metadata is readable,
+failing open otherwise. Its KV-cache validation rejects a space that can pair a
+quantized `kv_cache_dtype` with `attention_backend: off`, because llama.cpp
+refuses to build a quantized V cache without flash attention. vLLM's space
+validation likewise rejects an explicit `float16`/`bfloat16` cache unless
+`dtype` pins the matching model dtype, since the engine stores a non-quantized
+KV cache in the model dtype.
 
 ## Data flow
 

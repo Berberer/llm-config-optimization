@@ -14,8 +14,8 @@ are identical, but their defaults and scoped options differ.
 
 | Engine     | Checkpoint                                              | Applicable tunables                                    | Cache reset between runs      | Phase rates from               |
 | ---------- | ------------------------------------------------------- | ------------------------------------------------------ | ----------------------------- | ------------------------------ |
-| `vllm`     | A Hugging Face id or a local snapshot directory.        | The seven base tunables in [the search-space format](search-space.md), plus the two speculative dimensions when a setup is configured. | vLLM dev-mode endpoints.      | Prometheus `/metrics`.         |
-| `llamacpp` | A local `.gguf` file or a Hub repository with `:QUANT`. | The five base tunables llama.cpp forwards, plus the two speculative dimensions when a setup is configured. | None; llama.cpp exposes none. | The `timings` response object. |
+| `vllm`     | A Hugging Face id or a local snapshot directory.        | The ten base tunables in [the search-space format](search-space.md), plus the two speculative dimensions when a setup is configured. | vLLM dev-mode endpoints.      | Prometheus `/metrics`.         |
+| `llamacpp` | A local `.gguf` file or a Hub repository with `:QUANT`. | The seven base tunables llama.cpp forwards, plus the two speculative dimensions when a setup is configured. | None; llama.cpp exposes none. | The `timings` response object. |
 
 The **default images**, used when `--image` is omitted, are:
 

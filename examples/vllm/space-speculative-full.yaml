@@ -16,21 +16,29 @@
 # support it.
 space:
   dtype:
-    categorical: [auto, float16, bfloat16, float32]
+    categorical: [auto, float16, bfloat16]
   kv_cache_dtype:
-    categorical: [auto, float16, bfloat16, fp8_e4m3, fp8_e5m2]
+    categorical: [auto, fp8_e4m3, fp8_e5m2]
   max_model_len:
     interval:
       min: 1024
       max: 32768
   max_num_seqs:
     interval:
-      min: 1
+      min: 16
       max: 256
   max_num_batched_tokens:
     interval:
-      min: 2048
+      min: 4096
       max: 8192
+  max_num_active_seqs:
+    interval:
+      min: 1
+      max: 16
+  max_num_scheduled_tokens:
+    interval:
+      min: 2048
+      max: 4096
   tensor_parallel_size:
     default: true
   attention_backend:
@@ -39,3 +47,5 @@ space:
     categorical: [enabled, disabled]
   num_speculative_tokens:
     categorical: [1, 2, 4, 8]
+  prefix_caching:
+    categorical: [true, false]

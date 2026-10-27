@@ -11,12 +11,12 @@
 # every trial but only applied when the mode is enabled, so disabled points can
 # repeat across depth values; this is expected and harmless to the optimizer.
 #
-# Only the five parameters llama-server forwards are declared; `dtype` and
+# Only the seven parameters llama-server forwards are declared; `dtype` and
 # `tensor_parallel_size` are not applicable to a GGUF checkpoint. The slot cap
 # and context-size notes from `space-full.yaml` apply unchanged.
 space:
   kv_cache_dtype:
-    categorical: [float16, bfloat16]
+    categorical: [float16, bfloat16, float32, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1]
   max_model_len:
     interval:
       min: 1024
@@ -30,8 +30,12 @@ space:
       min: 2048
       max: 8192
   attention_backend:
-    default: true
+    categorical: [auto, flash_attention]
   speculative_mode:
     categorical: [enabled, disabled]
   num_speculative_tokens:
     categorical: [1, 2, 4, 8]
+  prefix_caching:
+    categorical: [true, false]
+  n_gpu_layers:
+    default: true

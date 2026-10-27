@@ -67,6 +67,8 @@ llm:
   max_model_len: 2048
   max_num_seqs: null
   max_num_batched_tokens: null
+  max_num_active_seqs: null
+  max_num_scheduled_tokens: null
   gpu_memory_utilization: null
   tensor_parallel_size: null
   seed: null
@@ -75,6 +77,8 @@ llm:
   draft_model: null
   speculative_mode: null
   num_speculative_tokens: null
+  prefix_caching: null
+  n_gpu_layers: null
   resolved_draft_path: null
 """
 """The document consumers already know; the move must not change a byte of it."""

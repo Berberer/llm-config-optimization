@@ -17,23 +17,55 @@ that is not an ``LLMConfig`` field at all is an unknown parameter.
 The expected kind of a tunable is not stored here. It is read from the
 ``LLMConfig`` field's own type annotation by :func:`expected_kind`, so the
 registry cannot drift from the config: an enum field resolves to its
-engine-neutral enum class and an integer field to :class:`int`.
+engine-neutral enum class, an integer field to :class:`int`, a boolean field to
+:class:`bool`, and a field that admits more than one of those (an int-or-enum
+union such as a GPU-layer count with ``auto``/``all`` modes) to a
+:class:`UnionKind` carrying each branch.
 """
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType, NoneType
 from typing import get_args, get_type_hints
 
 from ..inference.types import LLMConfig
 
-type ParameterKind = type[StrEnum] | type[int]
+type AtomKind = type[StrEnum] | type[int] | type[bool]
+"""A single engine-neutral kind a tunable's ``LLMConfig`` field may expect.
+
+A categorical parameter resolves to its engine-neutral enum class, a numeric
+parameter to :class:`int`, and a boolean parameter to :class:`bool`.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class UnionKind:
+    """The two or more engine-neutral kinds a union-annotated field admits.
+
+    A field such as ``int | GpuLayersMode | None`` has no single kind: a value
+    may be an exact integer or one of the enum's mode names, and the loader
+    validates a declared value against either branch. The order is the order of
+    the annotation. An ``interval`` spec constrains the integer branch only, so
+    a mode name can never masquerade as a numeric bound.
+    """
+
+    kinds: tuple[AtomKind, ...]
+
+    def __post_init__(self) -> None:
+        """Store the branches as a tuple so the kind is immutable and hashable."""
+        object.__setattr__(self, "kinds", tuple(self.kinds))
+
+
+type ParameterKind = AtomKind | UnionKind
 """The engine-neutral kind a tunable's ``LLMConfig`` field expects.
 
-A categorical parameter resolves to its engine-neutral enum class and a numeric
-parameter to :class:`int`. The validator uses this to reject a spec that cannot
-describe the field, such as an :class:`~llm_config_optimization.search_space.types.Interval`
-declared for an enum field.
+A categorical parameter resolves to its engine-neutral enum class, a numeric
+parameter to :class:`int`, a boolean parameter to :class:`bool`, and a union
+field to a :class:`UnionKind`. The validator uses this to reject a spec that
+cannot describe the field, such as an
+:class:`~llm_config_optimization.search_space.types.Interval` declared for an
+enum, a boolean, or a union that carries no integer branch.
 """
 
 
@@ -44,10 +76,14 @@ TUNABLE_PARAMETERS: Mapping[str, str] = MappingProxyType(
         "max_model_len": "max_model_len",
         "max_num_seqs": "max_num_seqs",
         "max_num_batched_tokens": "max_num_batched_tokens",
+        "max_num_active_seqs": "max_num_active_seqs",
+        "max_num_scheduled_tokens": "max_num_scheduled_tokens",
         "tensor_parallel_size": "tensor_parallel_size",
         "attention_backend": "attention_backend",
         "speculative_mode": "speculative_mode",
         "num_speculative_tokens": "num_speculative_tokens",
+        "prefix_caching": "prefix_caching",
+        "n_gpu_layers": "n_gpu_layers",
     }
 )
 """Which serving parameters a sweep may vary, and the ``LLMConfig`` field each fills.
@@ -84,13 +120,17 @@ def expected_kind(field: str) -> ParameterKind:
     The kind is read from the field's type annotation rather than duplicated in
     :data:`TUNABLE_PARAMETERS`, so the registry cannot drift from the config.
     Optional annotations (``DType | None``) resolve to their single non-``None``
-    member, which is an engine-neutral enum class for categorical fields and
-    :class:`int` for numeric ones.
+    member, which is an engine-neutral enum class for categorical fields,
+    :class:`int` for numeric ones, and :class:`bool` for boolean ones. An
+    annotation with several non-``None`` members (``int | GpuLayersMode |
+    None``) resolves to a :class:`UnionKind` in annotation order.
 
     Raises :class:`KeyError` for a name that is not an ``LLMConfig`` field.
     """
     annotation = get_type_hints(LLMConfig)[field]
-    for argument in get_args(annotation):
-        if argument is not NoneType:
-            return argument
+    arguments = tuple(argument for argument in get_args(annotation) if argument is not NoneType)
+    if len(arguments) > 1:
+        return UnionKind(arguments)
+    if arguments:
+        return arguments[0]
     return annotation

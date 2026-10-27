@@ -100,6 +100,8 @@ SPACE = ExperimentSpace(
         Dimension("max_num_seqs", Categorical(_MAX_NUM_SEQS)),
         Dimension("max_num_batched_tokens", Fixed(_MAX_NUM_BATCHED_TOKENS)),
         Dimension("attention_backend", Default()),
+        Dimension("prefix_caching", Fixed(True)),
+        Dimension("n_gpu_layers", Fixed(0)),
     )
 )
 """A mostly-fixed CPU-safe space declaring exactly llama.cpp's applicable set."""
@@ -198,6 +200,7 @@ def test_two_trial_sweep_returns_a_usable_best_configuration(
     assert best.llm.tensor_parallel_size is None
     assert best.llm.gpu_memory_utilization is None
     assert best.llm.attention_backend is None
+    assert best.llm.n_gpu_layers == 0
     assert best.llm.seed == _SEED
 
     recorded = result.study.best_trial.user_attrs["result"]

@@ -8,24 +8,40 @@
 # both depend on the host: a tensor-parallel size larger than the detected
 # device count is rejected, and the attention backends this backend models are
 # CUDA-only. Pin either one only when the target is known to support it.
+#
+# `dtype` omits `float32`: some model kernels reject it, such as Qwen3.5's
+# linear-attention layers, so the broad example stays portable. Add it only for
+# a checkpoint known to support it. `kv_cache_dtype` keeps `auto` (the resolved
+# model dtype) and the FP8 formats; an explicit float16/bfloat16 cache must
+# match the resolved model dtype, so pin one only for a known checkpoint.
 space:
   dtype:
-    categorical: [auto, float16, bfloat16, float32]
+    categorical: [auto, float16, bfloat16]
   kv_cache_dtype:
-    categorical: [auto, float16, bfloat16, fp8_e4m3, fp8_e5m2]
+    categorical: [auto, fp8_e4m3, fp8_e5m2]
   max_model_len:
     interval:
       min: 1024
       max: 32768
   max_num_seqs:
     interval:
-      min: 1
+      min: 16
       max: 256
   max_num_batched_tokens:
     interval:
-      min: 2048
+      min: 4096
       max: 8192
+  max_num_active_seqs:
+    interval:
+      min: 1
+      max: 16
+  max_num_scheduled_tokens:
+    interval:
+      min: 2048
+      max: 4096
   tensor_parallel_size:
     default: true
   attention_backend:
     default: true
+  prefix_caching:
+    categorical: [true, false]

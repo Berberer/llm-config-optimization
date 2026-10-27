@@ -20,6 +20,32 @@ from .types import ExperimentError
 
 
 @dataclass(frozen=True, slots=True)
+class Toggle:
+    """A boolean tunable forwarded as one of two opposite flags.
+
+    The engine is told both sides of the switch explicitly, so ``False`` is a
+    real configuration rather than an omitted default. ``enabled`` is emitted
+    for ``True`` and ``disabled`` for ``False``; an unset value emits neither.
+    The flag spellings stay in the backend that owns the engine.
+    """
+
+    enabled: str
+    disabled: str
+
+
+def toggle_arguments(value: object, target: Toggle) -> list[str]:
+    """Return the flag that expresses ``value`` for a :class:`Toggle`.
+
+    Argument assembly calls this for a declared boolean value, so the choice
+    between the two flag spellings is made in one place for every backend.
+    ``value`` is typed as ``object`` because it arrives from an untyped
+    parameter mapping; the toggle is only used for a boolean field, and
+    ``True`` is matched by identity so no other value can masquerade as on.
+    """
+    return [target.enabled] if value is True else [target.disabled]
+
+
+@dataclass(frozen=True, slots=True)
 class Gate:
     """A tunable that is not forwarded but switches related fields on or off.
 

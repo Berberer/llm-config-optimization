@@ -100,6 +100,55 @@ def test_a_checkpoint_without_a_file_type_declares_no_quantization(tmp_path: Pat
     assert read_gguf_metadata(model) == GgufMetadata(quantization=None)
 
 
+def test_the_architecture_block_count_is_reported(tmp_path: Path) -> None:
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {"general.architecture": "llama", "llama.block_count": 16},
+    )
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, block_count=16)
+
+
+def test_a_block_count_is_reported_without_a_declared_architecture(tmp_path: Path) -> None:
+    model = _write_gguf(tmp_path / "model.gguf", {"qwen2.block_count": 28})
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, block_count=28)
+
+
+def test_only_the_declared_architecture_block_count_is_reported(tmp_path: Path) -> None:
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {
+            "general.architecture": "llama",
+            "llama.block_count": 16,
+            "qwen2.block_count": 28,
+        },
+    )
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, block_count=16)
+
+
+def test_an_ambiguous_block_count_is_not_reported(tmp_path: Path) -> None:
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {"llama.block_count": 16, "qwen2.block_count": 28},
+    )
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None)
+
+
+def test_a_boolean_block_count_is_not_reported(tmp_path: Path) -> None:
+    model = _write_gguf(tmp_path / "model.gguf", {"llama.block_count": True})
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None)
+
+
+def test_a_checkpoint_without_a_block_count_reports_none(tmp_path: Path) -> None:
+    model = _write_gguf(tmp_path / "model.gguf", {"general.architecture": "llama"})
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, block_count=None)
+
+
 def test_an_unmodeled_file_type_declares_no_quantization(tmp_path: Path) -> None:
     model = _write_gguf(tmp_path / "model.gguf", {"general.file_type": 250})
 

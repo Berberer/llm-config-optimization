@@ -28,6 +28,7 @@ from llm_config_optimization.inference import (
     ContainerRuntimeConfig,
     DType,
     ExperimentConfig,
+    GpuLayersMode,
     HardwareTarget,
     KVCacheDType,
     LLMConfig,
@@ -54,11 +55,15 @@ FULL_SPACE = ExperimentSpace(
         Dimension("max_model_len", Interval(1024, 8192)),
         Dimension("max_num_seqs", Fixed(256)),
         Dimension("max_num_batched_tokens", Interval(2048, 8192)),
+        Dimension("max_num_active_seqs", Fixed(16)),
+        Dimension("max_num_scheduled_tokens", Interval(2048, 4096)),
         Dimension("tensor_parallel_size", Categorical((1, 2, 4))),
         Dimension(
             "attention_backend",
             Categorical((AttentionBackend.XFORMERS, AttentionBackend.FLASH_ATTENTION)),
         ),
+        Dimension("prefix_caching", Categorical((True, False))),
+        Dimension("n_gpu_layers", Categorical((GpuLayersMode.AUTO, 0, GpuLayersMode.ALL, 8))),
     )
 )
 """A complete space over every tunable, with all four spec kinds represented."""
@@ -69,8 +74,12 @@ PARAMETERS: dict[str, object] = {
     "max_model_len": 4096,
     "max_num_seqs": 256,
     "max_num_batched_tokens": 4096,
+    "max_num_active_seqs": 16,
+    "max_num_scheduled_tokens": 2048,
     "tensor_parallel_size": 2,
     "attention_backend": "flash_attention",
+    "prefix_caching": True,
+    "n_gpu_layers": "all",
 }
 """A parameter mapping as a persisted study would return it: plain JSON values."""
 
@@ -205,6 +214,79 @@ def test_sampled_strings_round_trip_to_enum_members(
     assert getattr(result, field) is expected
 
 
+@pytest.mark.parametrize(
+    ("sampled", "expected"),
+    [
+        ("auto", GpuLayersMode.AUTO),
+        ("all", GpuLayersMode.ALL),
+        (0, 0),
+        (8, 8),
+    ],
+    ids=["auto-mode", "all-mode", "zero-count", "exact-count"],
+)
+def test_a_sampled_union_value_resolves_to_its_own_branch(
+    sampled: str | int, expected: GpuLayersMode | int
+) -> None:
+    """The int-or-enum field keeps a mode a mode and a count a count.
+
+    The branches appear in annotation order (integer first), so a mode string
+    must reach the enum branch rather than being forced through :func:`int`.
+    """
+    space = ExperimentSpace(dimensions=(Dimension("n_gpu_layers", Fixed(expected)),))
+
+    result = reconstruct_llm(space, LLMConfig(), {"n_gpu_layers": sampled})
+
+    assert result.n_gpu_layers is expected
+
+
+@pytest.mark.parametrize(
+    "sampled",
+    ["bogus", True],
+    ids=["unknown-mode", "boolean"],
+)
+def test_a_union_value_outside_both_branches_is_rejected(sampled: object) -> None:
+    space = ExperimentSpace(dimensions=(Dimension("n_gpu_layers", Fixed(0)),))
+
+    with pytest.raises(ValueError, match="n_gpu_layers"):
+        reconstruct_llm(space, LLMConfig(), {"n_gpu_layers": sampled})
+
+
+def test_a_mixed_categorical_union_samples_and_reconstructs_each_branch() -> None:
+    """A sweep over modes and exact counts survives sampling and reconstruction."""
+    space = ExperimentSpace(
+        dimensions=(
+            Dimension("n_gpu_layers", Categorical((GpuLayersMode.AUTO, 0, GpuLayersMode.ALL, 8))),
+        )
+    )
+
+    trials = _sample(space, 40, seed=4)
+    sampled = {trial.params["n_gpu_layers"] for trial in trials}
+    reconstructed = {
+        reconstruct_llm(space, LLMConfig(), trial.params).n_gpu_layers for trial in trials
+    }
+
+    assert sampled <= {"auto", 0, "all", 8}
+    assert reconstructed <= {GpuLayersMode.AUTO, 0, GpuLayersMode.ALL, 8}
+    assert any(isinstance(value, GpuLayersMode) for value in reconstructed)
+    assert any(isinstance(value, int) and not isinstance(value, bool) for value in reconstructed)
+
+
+def test_a_sampled_boolean_stays_a_boolean() -> None:
+    space = ExperimentSpace(dimensions=(Dimension("prefix_caching", Fixed(False)),))
+
+    result = reconstruct_llm(space, LLMConfig(), {"prefix_caching": False})
+
+    assert result.prefix_caching is False
+
+
+def test_a_boolean_field_rejects_a_non_boolean_value() -> None:
+    """A reloaded study cannot smuggle ``0``/``1`` in as a boolean."""
+    space = ExperimentSpace(dimensions=(Dimension("prefix_caching", Fixed(True)),))
+
+    with pytest.raises(ValueError, match="prefix_caching"):
+        reconstruct_llm(space, LLMConfig(), {"prefix_caching": 1})
+
+
 def test_reconstruct_llm_takes_tunables_from_the_mapping_and_inherits_the_rest() -> None:
     result = reconstruct_llm(FULL_SPACE, BASE_LLM, PARAMETERS)
 
@@ -215,10 +297,14 @@ def test_reconstruct_llm_takes_tunables_from_the_mapping_and_inherits_the_rest()
         max_model_len=4096,
         max_num_seqs=256,
         max_num_batched_tokens=4096,
+        max_num_active_seqs=16,
+        max_num_scheduled_tokens=2048,
         gpu_memory_utilization=0.85,
         tensor_parallel_size=2,
         seed=7,
         attention_backend=AttentionBackend.FLASH_ATTENTION,
+        prefix_caching=True,
+        n_gpu_layers=GpuLayersMode.ALL,
     )
 
 

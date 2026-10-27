@@ -35,11 +35,12 @@ from llm_config_optimization.inference._vllm import (
     serve_arguments,
 )
 
-_INAPPLICABLE_FIELDS = frozenset({"resolved_draft_path"})
+_INAPPLICABLE_FIELDS = frozenset({"resolved_draft_path", "n_gpu_layers"})
 """The :class:`LLMConfig` fields vLLM has no target for.
 
 ``resolved_draft_path`` is a host-side resolution artifact that an engine never
 receives; the speculative settings reach the engine through their group.
+``n_gpu_layers`` is llama.cpp's GPU-offload knob and has no vLLM equivalent.
 """
 
 
@@ -54,6 +55,8 @@ def test_flat_flags_are_emitted_as_kebab_case_value_pairs() -> None:
         max_model_len=4096,
         max_num_seqs=256,
         max_num_batched_tokens=8192,
+        max_num_active_seqs=32,
+        max_num_scheduled_tokens=2048,
         gpu_memory_utilization=0.9,
         tensor_parallel_size=2,
         seed=1234,
@@ -66,12 +69,28 @@ def test_flat_flags_are_emitted_as_kebab_case_value_pairs() -> None:
         "256",
         "--max-num-batched-tokens",
         "8192",
+        "--max-num-active-seqs",
+        "32",
+        "--max-num-scheduled-tokens",
+        "2048",
         "--gpu-memory-utilization",
         "0.9",
         "--tensor-parallel-size",
         "2",
         "--seed",
         "1234",
+    ]
+
+
+def test_scheduling_caps_are_forwarded_as_flat_flags() -> None:
+    """The optional caps are named after their fields, like the existing limits."""
+    config = LLMConfig(max_num_active_seqs=8, max_num_scheduled_tokens=2048)
+
+    assert serve_arguments(config) == [
+        "--max-num-active-seqs",
+        "8",
+        "--max-num-scheduled-tokens",
+        "2048",
     ]
 
 
@@ -90,6 +109,16 @@ def test_categorical_fields_are_translated_to_vllm_spellings() -> None:
         "--kv-cache-dtype",
         "fp8_e4m3",
     ]
+
+
+def test_prefix_caching_emits_the_enabling_or_disabling_flag() -> None:
+    """Both sides of the switch are explicit, so ``False`` is a real setting."""
+    assert serve_arguments(LLMConfig(prefix_caching=True)) == ["--enable-prefix-caching"]
+    assert serve_arguments(LLMConfig(prefix_caching=False)) == ["--no-enable-prefix-caching"]
+
+
+def test_an_unset_prefix_caching_emits_neither_flag() -> None:
+    assert serve_arguments(LLMConfig(prefix_caching=None)) == []
 
 
 def test_attention_backend_is_forwarded_through_its_json_group() -> None:
@@ -209,6 +238,8 @@ def test_all_fields_assemble_in_the_declared_order() -> None:
         max_model_len=2048,
         max_num_seqs=64,
         max_num_batched_tokens=4096,
+        max_num_active_seqs=16,
+        max_num_scheduled_tokens=2048,
         gpu_memory_utilization=0.85,
         tensor_parallel_size=1,
         seed=7,
@@ -228,6 +259,10 @@ def test_all_fields_assemble_in_the_declared_order() -> None:
         "64",
         "--max-num-batched-tokens",
         "4096",
+        "--max-num-active-seqs",
+        "16",
+        "--max-num-scheduled-tokens",
+        "2048",
         "--gpu-memory-utilization",
         "0.85",
         "--tensor-parallel-size",
@@ -330,9 +365,33 @@ def test_unsupported_enum_member_is_rejected_rather_than_dropped() -> None:
         serve_arguments(config)
 
 
-def test_an_attention_backend_vllm_no_longer_ships_is_rejected() -> None:
-    """XFORMERS has no vLLM spelling in current releases, so it is refused."""
-    config = LLMConfig(attention_backend=AttentionBackend.XFORMERS)
+@pytest.mark.parametrize(
+    "value",
+    [
+        KVCacheDType.FLOAT32,
+        KVCacheDType.Q8_0,
+        KVCacheDType.Q4_0,
+        KVCacheDType.Q4_1,
+        KVCacheDType.IQ4_NL,
+        KVCacheDType.Q5_0,
+        KVCacheDType.Q5_1,
+    ],
+)
+def test_a_llama_cpp_only_kv_cache_format_is_rejected(value: KVCacheDType) -> None:
+    """The quantized cache formats are llama.cpp's; vLLM must refuse them."""
+    config = LLMConfig(kv_cache_dtype=value)
+
+    with pytest.raises(ExperimentError, match="kv_cache_dtype"):
+        serve_arguments(config)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [AttentionBackend.AUTO, AttentionBackend.OFF, AttentionBackend.XFORMERS],
+)
+def test_an_attention_backend_vllm_does_not_serve_is_rejected(value: AttentionBackend) -> None:
+    """``auto``/``off`` are llama.cpp settings and XFORMERS is no longer shipped."""
+    config = LLMConfig(attention_backend=value)
 
     with pytest.raises(ExperimentError, match="attention_backend"):
         serve_arguments(config)

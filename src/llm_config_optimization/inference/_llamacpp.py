@@ -42,9 +42,16 @@ from ..search_space.registry import (
     TUNABLE_PARAMETERS,
     speculative_configured,
 )
-from ..search_space.types import Default, ExperimentSpace
+from ..search_space.types import Default, Dimension, ExperimentSpace, Interval
 from ._benchmark import _RESPONSES_KEY
-from ._tunables import Gate, translate_value, unsupported_values
+from ._tunables import (
+    Gate,
+    Toggle,
+    declared_values,
+    toggle_arguments,
+    translate_value,
+    unsupported_values,
+)
 from .types import (
     AttentionBackend,
     BenchmarkConfig,
@@ -53,6 +60,7 @@ from .types import (
     ExperimentConfig,
     ExperimentError,
     ExperimentResult,
+    GpuLayersMode,
     HardwareTarget,
     HubCheckpoint,
     KVCacheDType,
@@ -66,7 +74,7 @@ from .types import (
     SpeculativeMode,
 )
 
-PARAMETER_TARGETS: Mapping[str, tuple[str, ...] | Gate] = MappingProxyType(
+PARAMETER_TARGETS: Mapping[str, tuple[str, ...] | Gate | Toggle] = MappingProxyType(
     {
         "kv_cache_dtype": ("--cache-type-k", "--cache-type-v"),
         "max_model_len": ("--ctx-size",),
@@ -77,6 +85,8 @@ PARAMETER_TARGETS: Mapping[str, tuple[str, ...] | Gate] = MappingProxyType(
         "draft_model": ("--spec-draft-model",),
         "speculative_mode": Gate(),
         "num_speculative_tokens": ("--spec-draft-n-max",),
+        "prefix_caching": Toggle(enabled="--cache-prompt", disabled="--no-cache-prompt"),
+        "n_gpu_layers": ("--n-gpu-layers",),
     }
 )
 """Where each applicable :class:`LLMConfig` field is sent on ``llama-server``.
@@ -111,9 +121,18 @@ VALUE_MAPS: Mapping[str, Mapping[object, str]] = MappingProxyType(
         "kv_cache_dtype": {
             KVCacheDType.FLOAT16: "f16",
             KVCacheDType.BFLOAT16: "bf16",
+            KVCacheDType.FLOAT32: "f32",
+            KVCacheDType.Q8_0: "q8_0",
+            KVCacheDType.Q4_0: "q4_0",
+            KVCacheDType.Q4_1: "q4_1",
+            KVCacheDType.IQ4_NL: "iq4_nl",
+            KVCacheDType.Q5_0: "q5_0",
+            KVCacheDType.Q5_1: "q5_1",
         },
         "attention_backend": {
+            AttentionBackend.AUTO: "auto",
             AttentionBackend.FLASH_ATTENTION: "on",
+            AttentionBackend.OFF: "off",
         },
         "speculative_method": {
             SpeculativeMethod.DRAFT_MODEL: "draft-simple",
@@ -127,6 +146,10 @@ VALUE_MAPS: Mapping[str, Mapping[object, str]] = MappingProxyType(
             SpeculativeMode.ENABLED: "enabled",
             SpeculativeMode.DISABLED: "disabled",
         },
+        "n_gpu_layers": {
+            GpuLayersMode.AUTO: "auto",
+            GpuLayersMode.ALL: "all",
+        },
     }
 )
 """How llama.cpp spells each engine-neutral categorical value it can serve.
@@ -137,12 +160,34 @@ member missing from its field's map is unsupported and is rejected rather than
 forwarded, while the engine's own default is reached by declaring the parameter
 as ``default: true`` instead of naming a value.
 
-``kv_cache_dtype`` is curated to the portable element formats llama.cpp accepts:
-``auto`` and the FP8 members have no equivalent here. For ``attention_backend``
-only the flash-attention implementation is modelled, mapped to the engine's
-``on`` setting; ``flash_infer`` and ``xformers`` are vLLM-only backends. The six
+``kv_cache_dtype`` covers the cache formats llama.cpp serves: the three float
+formats and the quantized ``q*``/``iq4_nl`` formats. ``auto`` and the FP8
+members have no equivalent here. For ``attention_backend`` all three
+flash-attention settings are modelled: ``auto`` lets the engine choose,
+``flash_attention`` maps to the engine's ``on`` setting, and ``off`` disables
+it; ``flash_infer`` and ``xformers`` are vLLM-only backends. The six
 speculative methods map onto llama.cpp's ``--spec-type`` spellings; the
 engine-only n-gram cache, map, and mod variants stay behind ``extra_args``.
+``n_gpu_layers`` translates its two modes and passes an exact integer count
+through unchanged, so a union dimension samples both branches.
+"""
+
+_QUANTIZED_CACHE_DTYPES: frozenset[KVCacheDType] = frozenset(
+    {
+        KVCacheDType.Q8_0,
+        KVCacheDType.Q4_0,
+        KVCacheDType.Q4_1,
+        KVCacheDType.IQ4_NL,
+        KVCacheDType.Q5_0,
+        KVCacheDType.Q5_1,
+    }
+)
+"""KV-cache formats llama.cpp can only build with flash attention enabled.
+
+llama.cpp rejects a quantized V cache when ``--flash-attn off`` is passed,
+because the quantized cache kernels require flash attention. The field's
+engine-neutral names are used here; this set is llama.cpp's subset that carries
+the constraint.
 """
 
 
@@ -191,6 +236,9 @@ def serve_arguments(
             continue
         value = getattr(config, field)
         if value is None:
+            continue
+        if isinstance(target, Toggle):
+            arguments.extend(toggle_arguments(value, target))
             continue
         translated = translate_value(field, value, VALUE_MAPS, engine="llama.cpp")
         for flag in target:
@@ -337,6 +385,17 @@ guessing at a layout it does not know.
 _GGUF_FILE_TYPE_KEY = "general.file_type"
 """The metadata key that carries the checkpoint's quantization."""
 
+_GGUF_ARCHITECTURE_KEY = "general.architecture"
+"""The metadata key that names the checkpoint's architecture.
+
+The block count is architecture-prefixed (``llama.block_count``,
+``qwen2.block_count``, and so on), so the reader learns the architecture from
+this key rather than hard-coding one model family.
+"""
+
+_GGUF_BLOCK_COUNT_SUFFIX = ".block_count"
+"""The architecture-independent suffix of the checkpoint's block count."""
+
 _GGUF_BOOL_TYPE = 7
 """The value type id of a boolean metadata value."""
 
@@ -424,16 +483,23 @@ class _UnreadableGguf(Exception):
 
 @dataclass(frozen=True, slots=True)
 class GgufMetadata:
-    """The quantization a GGUF checkpoint declares in its metadata.
+    """The model facts a GGUF checkpoint declares in its metadata.
 
     ``quantization`` is the canonical short tag for the checkpoint's
     ``general.file_type`` (``"Q4_K_M"``, ``"BF16"``, and so on), or ``None``
     when the checkpoint declares no file type or one this library does not
     name. ``general.file_type`` is the value llama.cpp itself reports as the
     model's quantization, so validation speaks the engine's own vocabulary.
+
+    ``block_count`` is the number of transformer blocks the checkpoint's
+    architecture declares through its ``<arch>.block_count`` key, or ``None``
+    when that key is absent or the header cannot be read. It bounds an exact
+    GPU-layer count: offloading more layers than the checkpoint has is a
+    typo, and ``--n-gpu-layers all`` is the unambiguous full-offload choice.
     """
 
     quantization: str | None
+    block_count: int | None = None
 
 
 def _read_exact(handle: BinaryIO, size: int) -> bytes:
@@ -492,7 +558,7 @@ def _skip_metadata_value(handle: BinaryIO, value_type: int) -> None:
 
 
 def read_gguf_metadata(path: Path) -> GgufMetadata | None:
-    """Read the quantization a GGUF checkpoint declares, if it can be read.
+    """Read the facts a GGUF checkpoint declares, if they can be read.
 
     A path that is not a regular file, or a file that does not start with the
     GGUF magic, is rejected with :class:`ExperimentError`: llama.cpp cannot
@@ -502,6 +568,13 @@ def read_gguf_metadata(path: Path) -> GgufMetadata | None:
     metadata this library could not see. An unknown container version or
     ``general.file_type`` value is likewise reported as no quantization, never
     as a guess.
+
+    The block count is looked up under the architecture named by
+    ``general.architecture`` (``llama.block_count``, ``qwen2.block_count``, and
+    so on). A file that declares no architecture still reports a block count
+    when exactly one architecture-prefixed block-count key is present, and
+    reports none when the key is absent or several architectures would make
+    the choice ambiguous.
     """
     if not path.is_file():
         raise ExperimentError(f"{path} is not a GGUF file; llama.cpp serves GGUF checkpoints")
@@ -516,14 +589,22 @@ def read_gguf_metadata(path: Path) -> GgufMetadata | None:
             _read_uint64(handle)
             metadata_count = _read_uint64(handle)
             file_type: int | None = None
+            architecture: str | None = None
+            block_counts: dict[str, int] = {}
             for _ in range(metadata_count):
                 key = _read_metadata_string(handle)
                 value_type = _read_uint32(handle)
                 scalar_format = _GGUF_SCALAR_FORMATS.get(value_type)
-                if key == _GGUF_FILE_TYPE_KEY and value_type != _GGUF_BOOL_TYPE and scalar_format:
+                if key == _GGUF_ARCHITECTURE_KEY and value_type == _GGUF_STRING_TYPE:
+                    architecture = _read_metadata_string(handle)
+                elif key == _GGUF_FILE_TYPE_KEY and value_type != _GGUF_BOOL_TYPE and scalar_format:
                     value = _read_scalar(handle, scalar_format)
-                    if isinstance(value, int):
+                    if isinstance(value, int) and not isinstance(value, bool):
                         file_type = value
+                elif key.endswith(_GGUF_BLOCK_COUNT_SUFFIX) and scalar_format:
+                    value = _read_scalar(handle, scalar_format)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        block_counts[key] = value
                 else:
                     _skip_metadata_value(handle, value_type)
     except ExperimentError:
@@ -531,7 +612,19 @@ def read_gguf_metadata(path: Path) -> GgufMetadata | None:
     except OSError, _UnreadableGguf, UnicodeDecodeError:
         return None
     quantization = _GGUF_FILE_TYPE_LABELS.get(file_type) if file_type is not None else None
-    return GgufMetadata(quantization=quantization)
+    block_count = _resolve_block_count(architecture, block_counts)
+    return GgufMetadata(quantization=quantization, block_count=block_count)
+
+
+def _resolve_block_count(architecture: str | None, block_counts: Mapping[str, int]) -> int | None:
+    """Pick the block count the checkpoint's architecture names, if any."""
+    if architecture is not None:
+        declared = block_counts.get(f"{architecture}{_GGUF_BLOCK_COUNT_SUFFIX}")
+        if declared is not None:
+            return declared
+    if len(block_counts) == 1:
+        return next(iter(block_counts.values()))
+    return None
 
 
 _MODEL_MOUNT_PATH = "/models/model.gguf"
@@ -822,6 +915,94 @@ def _quantization_problems(
     ]
 
 
+def _validate_gpu_layers_target(
+    dimension: Dimension, field: str, target: HardwareTarget
+) -> list[str]:
+    """Report every GPU-layer value that needs GPU hardware on a CPU target.
+
+    ``all`` and a positive exact count both ask llama.cpp to offload work to a
+    GPU, so a CPU target can never serve them. ``auto`` may still resolve to no
+    offload and ``0`` explicitly disables it, so both stay valid for a
+    host-agnostic space. An ``Interval`` is rejected when any value it can draw
+    is positive, because the optimizer may sample one; a range pinned to zero
+    remains acceptable.
+    """
+    if field != "n_gpu_layers" or target is not HardwareTarget.CPU:
+        return []
+    problems: list[str] = []
+    for path, value in declared_values(dimension):
+        if value is GpuLayersMode.ALL or (
+            isinstance(value, int) and not isinstance(value, bool) and value > 0
+        ):
+            problems.append(
+                f"{path}: llama.cpp cannot offload GPU layers on the CPU target; "
+                f"use {field}=auto or 0"
+            )
+    if isinstance(dimension.spec, Interval) and dimension.spec.maximum > 0:
+        problems.append(
+            f"space.{dimension.name}.interval: llama.cpp cannot offload GPU layers "
+            f"up to {dimension.spec.maximum} on the CPU target; use {field}=auto or 0"
+        )
+    return problems
+
+
+def _validate_quantized_cache_attention(space: ExperimentSpace) -> list[str]:
+    """Report a space that can pair a quantized KV cache with flash attention off.
+
+    llama.cpp refuses to create a quantized V cache unless flash attention is
+    enabled (``quantized V cache requires flash_attn to be enabled``), so a
+    space that can sample both would fail at server startup instead of producing
+    a measurement. Only declared values create the conflict: a ``Default``
+    dimension defers to the engine, whose own defaults are the float cache and
+    ``auto`` attention, and a space missing either dimension is left to the
+    per-dimension checks.
+    """
+    dimensions = {dimension.name: dimension for dimension in space.dimensions}
+    cache = dimensions.get("kv_cache_dtype")
+    attention = dimensions.get("attention_backend")
+    if cache is None or attention is None:
+        return []
+    quantized = [
+        path
+        for path, value in declared_values(cache)
+        if isinstance(value, KVCacheDType) and value in _QUANTIZED_CACHE_DTYPES
+    ]
+    if not quantized:
+        return []
+    disabled = [path for path, value in declared_values(attention) if value is AttentionBackend.OFF]
+    if not disabled:
+        return []
+    return [
+        f"{disabled[0]}: llama.cpp requires flash attention for a quantized KV cache, "
+        f"but this space can sample {', '.join(quantized)}; remove "
+        f"attention_backend=off or restrict kv_cache_dtype to float16, bfloat16, "
+        f"or float32"
+    ]
+
+
+def _gpu_layers_block_count_problems(
+    n_gpu_layers: int | GpuLayersMode | None, model: Path, metadata: GgufMetadata | None
+) -> list[str]:
+    """Report an exact GPU-layer count larger than the checkpoint has blocks.
+
+    ``all`` offloads every layer unambiguously and ``auto`` defers the choice
+    to llama.cpp, so neither is bounded here. An exact integer above the
+    architecture's block count is almost always a typo that would silently
+    duplicate full offload; the problem points at ``all`` instead. Unreadable
+    metadata or a checkpoint that declares no block count fails open, leaving
+    the engine as the final authority.
+    """
+    if n_gpu_layers is None or isinstance(n_gpu_layers, GpuLayersMode):
+        return []
+    block_count = metadata.block_count if metadata is not None else None
+    if block_count is None or n_gpu_layers <= block_count:
+        return []
+    return [
+        f"n_gpu_layers={n_gpu_layers} exceeds the {block_count} layers in {model}; "
+        "use n_gpu_layers=all to offload every layer"
+    ]
+
+
 @dataclass(frozen=True, slots=True)
 class LlamaCppBackend:
     """The llama.cpp implementation of the inference backend seam.
@@ -846,13 +1027,14 @@ class LlamaCppBackend:
     def applicable_parameters(self, llm: LLMConfig) -> frozenset[str]:
         """Exactly the tunables this backend forwards for ``llm``.
 
-        llama.cpp can vary ``max_model_len``, ``max_num_seqs``,
-        ``max_num_batched_tokens``, ``kv_cache_dtype``, and
-        ``attention_backend``; ``dtype`` and ``tensor_parallel_size`` have no
-        engine flag, so a definition may omit them and the loader does not
-        require them. The two speculative dimensions are added exactly when
-        ``llm`` configures a speculative method or draft model, so a
-        non-speculative space stays unchanged.
+        A tunable is applicable when its field has a ``llama-server`` target in
+        :data:`PARAMETER_TARGETS`: that covers the context, slot, batch, cache,
+        attention, prefix-caching, and GPU-layer dimensions. ``dtype``, the
+        vLLM scheduling caps, and ``tensor_parallel_size`` have no engine flag,
+        so a definition may omit them and the loader does not require them. The
+        two speculative dimensions are added exactly when ``llm`` configures a
+        speculative method or draft model, so a non-speculative space stays
+        unchanged.
         """
         applicable = frozenset(
             name
@@ -879,10 +1061,15 @@ class LlamaCppBackend:
         strings so the caller can aggregate them; an empty sequence means
         llama.cpp supports every dimension.
 
-        ``hardware`` is accepted for the backend seam but adds no checks today:
-        the modelled values are not accelerator-specific, and the numeric
+        ``hardware`` is accepted for the backend seam; when given, it also
+        rejects a GPU-layer value the resolved accelerator class cannot serve,
+        because offloading ``all`` or a positive exact count needs a GPU while
+        ``auto`` and ``0`` do not. It also rejects a space that can sample a
+        quantized KV cache together with flash attention off, because llama.cpp
+        refuses to create a quantized V cache without flash attention. The
+        other modelled values are not accelerator-specific, and the numeric
         values the engine bounds are clamped by llama.cpp at load time rather
-        than rejected, so there is nothing to narrow before a sweep starts.
+        than rejected, so nothing else is narrowed before a sweep starts.
         """
         problems: list[str] = []
         applicable = self.applicable_parameters(llm)
@@ -894,6 +1081,9 @@ class LlamaCppBackend:
             if isinstance(dimension.spec, Default):
                 continue
             problems.extend(unsupported_values(dimension, field, VALUE_MAPS, engine="llama.cpp"))
+            if hardware is not None:
+                problems.extend(_validate_gpu_layers_target(dimension, field, hardware.target))
+        problems.extend(_validate_quantized_cache_attention(space))
         return problems
 
     def validate_model(self, experiment: ExperimentConfig, model: Path) -> Sequence[str]:
@@ -903,11 +1093,12 @@ class LlamaCppBackend:
         serve GGUF. A configured ``quantization`` is rejected too: llama.cpp
         reads the quantization from the file's metadata rather than from a
         flag, and the problem names the quantization the checkpoint actually
-        declares. A resolved draft checkpoint is held to the same file-format
-        rule, since llama.cpp loads it through the same GGUF reader. A GGUF
-        whose header cannot be parsed is accepted (fail-open), leaving the
-        engine as the final authority rather than rejecting on metadata this
-        library could not see.
+        declares. An exact ``n_gpu_layers`` count above the checkpoint's block
+        count is rejected and pointed at ``all``. A resolved draft checkpoint
+        is held to the same file-format rule, since llama.cpp loads it through
+        the same GGUF reader. A GGUF whose header cannot be parsed is accepted
+        (fail-open), leaving the engine as the final authority rather than
+        rejecting on metadata this library could not see.
         """
         quantization = experiment.llm.quantization
         problems: list[str] = []
@@ -920,6 +1111,9 @@ class LlamaCppBackend:
         else:
             if quantization is not None:
                 problems.extend(_quantization_problems(quantization, model, metadata))
+            problems.extend(
+                _gpu_layers_block_count_problems(experiment.llm.n_gpu_layers, model, metadata)
+            )
         draft = experiment.llm.resolved_draft_path
         if draft is not None:
             try:
@@ -950,7 +1144,7 @@ class LlamaCppBackend:
         mapping. The checkpoint is mounted read-only at a fixed container path
         (or left for the server to fetch itself when no path was resolved), the
         server binds on every interface on the published port, the served name
-        is pinned to the configured model string, and the five mapped tunables
+        is pinned to the configured model string, and the seven mapped tunables
         and ``extra_args`` follow. A configured draft is mounted beside it at its
         own fixed path and pointed at through the speculative arguments, or left
         for the server to fetch through its draft-repository flag. The slot count

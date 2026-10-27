@@ -17,7 +17,7 @@ before any experiment runs.
 """
 
 from .loader import load_experiment_space, parse_experiment_space
-from .registry import TUNABLE_PARAMETERS, ParameterKind, expected_kind
+from .registry import TUNABLE_PARAMETERS, ParameterKind, UnionKind, expected_kind
 from .types import (
     Categorical,
     Default,
@@ -43,6 +43,7 @@ __all__ = [
     "ParameterKind",
     "ParameterValue",
     "Spec",
+    "UnionKind",
     "expected_kind",
     "load_experiment_space",
     "parse_experiment_space",

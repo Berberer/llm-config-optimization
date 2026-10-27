@@ -2,12 +2,15 @@
 # with nothing for the optimizer to search. A sweep over this space runs exactly
 # one configuration, which is useful as a reference point before widening it.
 #
-# Only the five parameters llama-server forwards are declared. `dtype` and
+# Only the seven parameters llama-server forwards are declared. `dtype` and
 # `tensor_parallel_size` are absent by design: a GGUF file carries its own
 # numerical format and llama.cpp has no tensor parallelism.
 #
 # Quantization is not part of the space either: the GGUF file's metadata is the
 # checkpoint's quantization, so there is no `--quantization` flag to set.
+#
+# This baseline is GPU-only: `n_gpu_layers` offloads every layer, which a
+# CPU-only host cannot serve. Use `fixed: auto` there instead.
 space:
   kv_cache_dtype:
     fixed: float16
@@ -21,3 +24,7 @@ space:
   # a host whose build has no flash-attention support.
   attention_backend:
     fixed: flash_attention
+  prefix_caching:
+    fixed: true
+  n_gpu_layers:
+    fixed: all

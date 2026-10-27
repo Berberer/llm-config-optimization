@@ -13,7 +13,9 @@ import pytest
 
 from llm_config_optimization.inference import DType, ExperimentError, KVCacheDType
 from llm_config_optimization.inference._tunables import (
+    Toggle,
     declared_values,
+    toggle_arguments,
     translate_value,
     unsupported_values,
 )
@@ -30,6 +32,19 @@ _DTYPE_MAP = MappingProxyType({"dtype": MappingProxyType({DType.FLOAT16: "float1
 
 def test_a_mapped_enum_member_is_translated() -> None:
     assert translate_value("dtype", DType.FLOAT16, _DTYPE_MAP, engine="engine") == "float16"
+
+
+def test_a_toggle_emits_the_enabling_flag_for_true() -> None:
+    target = Toggle(enabled="--enable", disabled="--disable")
+
+    assert toggle_arguments(True, target) == ["--enable"]
+
+
+def test_a_toggle_emits_the_disabling_flag_for_false() -> None:
+    """``False`` is a real configuration, not an omitted default."""
+    target = Toggle(enabled="--enable", disabled="--disable")
+
+    assert toggle_arguments(False, target) == ["--disable"]
 
 
 def test_a_field_without_a_map_passes_its_value_through() -> None:

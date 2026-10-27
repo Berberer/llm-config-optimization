@@ -1,0 +1,32 @@
+# A llama.cpp sweep over GPU offload: every other tunable is pinned so the
+# comparison isolates `n_gpu_layers`. `auto` lets llama.cpp choose how many
+# layers to offload, `0` keeps the model entirely on the CPU, and `all` offloads
+# every layer. The three points span the offload spectrum on any GPU host.
+#
+# This space is GPU-only in the sense that `all` needs an accelerator; on a
+# CPU-only host it is rejected before the sweep. Drop `all` from the list (or
+# use `space-full.yaml`) to keep a CPU host runnable.
+#
+# Exact layer counts are checkpoint-specific: llama.cpp accepts any count up to
+# the model's block count, and the loader cannot know that number from the
+# space alone. After reading the checkpoint's `<arch>.block_count` metadata, add
+# the counts you want to compare, for example `categorical: [auto, 0, 8, 16, all]`;
+# a count above the block count is rejected by the model-aware validation.
+#
+# Only the seven parameters llama-server forwards are declared. `dtype` and
+# `tensor_parallel_size` are not applicable to a GGUF checkpoint.
+space:
+  kv_cache_dtype:
+    fixed: float16
+  max_model_len:
+    fixed: 4096
+  max_num_seqs:
+    fixed: 64
+  max_num_batched_tokens:
+    fixed: 4096
+  attention_backend:
+    default: true
+  prefix_caching:
+    fixed: true
+  n_gpu_layers:
+    categorical: [auto, 0, all]

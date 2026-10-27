@@ -75,6 +75,17 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
   tokenizer decides the cap. A dataset whose preflight could not run falls back
   to one slot. The cap lives in the backend's plan; the engine-neutral surfaces
   carry none of it.
+- vLLM's `validate` rejects an explicit `float16` or `bfloat16`
+  `kv_cache_dtype` unless the `dtype` dimension is pinned to the matching model
+  dtype, because vLLM stores a non-quantized KV cache in the model dtype; the
+  FP8 cache formats are exempt. The match table is `_FLOAT_CACHE_DTYPES` in
+  `inference/_vllm.py`, and the shipped vLLM examples use `auto`/FP8 caches so
+  they stay portable across checkpoints.
+- llama.cpp's `validate` rejects a space that can sample a quantized
+  `kv_cache_dtype` together with `attention_backend: off`: llama.cpp refuses
+  to create a quantized V cache unless flash attention is enabled, so keeping
+  those points out of the sweep avoids server-startup failures. The quantized
+  set is `_QUANTIZED_CACHE_DTYPES` in `inference/_llamacpp.py`.
 - A backend owns its model-argument rules through `model_request`: vLLM
   resolves a Hub snapshot directory or a local directory, while llama.cpp
   accepts a local `.gguf` file or a Hub repository with an optional `:QUANT`
@@ -100,6 +111,24 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
   speculative tunables `speculative_mode` and `num_speculative_tokens` are in
   the set exactly when `speculative_method` or `draft_model` is configured, and
   a definition declaring them without that setup is rejected as unsupported.
+- The registry derives each tunable's kind from its `LLMConfig` field
+  annotation (`expected_kind`), so kinds are never duplicated: an optional
+  enum, integer, or boolean resolves to that one kind, while an int-or-enum
+  union such as `n_gpu_layers` (`int | GpuLayersMode | None`) resolves to a
+  `UnionKind` whose branches are validated independently. An `interval` spec
+  constrains only an integer branch, so a mode name can never masquerade as a
+  numeric bound; booleans are strict and are never coerced from integers or
+  strings; and numeric floors come from the loader (`_POSITIVE_PARAMETERS`,
+  plus `_NON_NEGATIVE_PARAMETERS` for `n_gpu_layers`, whose `0` disables
+  offload).
+- `n_gpu_layers` is llama.cpp-only: `GpuLayersMode` (`auto`, `all`) and exact
+  integer counts are engine-neutral in `inference/types.py`, and
+  `inference/_llamacpp.py` maps the modes and passes integers through as
+  `--n-gpu-layers`. vLLM omits the field from its applicable set. A CPU target
+  rejects `all` and positive exact counts while accepting `auto` and `0`; after
+  the checkpoint resolves, an exact count above the GGUF architecture's block
+  count is rejected with a pointer to `all`, and unreadable metadata fails
+  open. The engine-neutral surfaces carry none of this vocabulary.
 - A trial is host-driven: the backend plans an engine-neutral `ServerSpec` and
   the orchestrator starts the server container, drives it with the host
   benchmark client, stops it, and hands the measured outcome to
@@ -181,7 +210,9 @@ Code:
 
 - [ ] `inference/types.py` — add a typed, optional (`| None`) field to
   `LLMConfig`. For a categorical parameter, also add an engine-neutral
-  `StrEnum` in the same module; never use an engine's own spelling here.
+  `StrEnum` in the same module; never use an engine's own spelling here. A
+  field that accepts both a mode and an exact count (like `n_gpu_layers`) is a
+  union of the enum and `int`.
 - [ ] `search_space/registry.py` — add an entry to `TUNABLE_PARAMETERS` mapping
   the YAML name to the field name. The loader reads the expected kind from the
   field annotation, so there is no second kind to keep in sync. Insertion order
@@ -205,8 +236,9 @@ Code:
   `VALUE_MAPS`. A parameter llama.cpp lacks (like `dtype` or
   `tensor_parallel_size`) stays out of `PARAMETER_TARGETS`, which is what keeps
   it out of the backend's applicable set.
-- [ ] `search_space/loader.py` — if the parameter is an integer with a `>= 1`
-  floor, add it to `_POSITIVE_PARAMETERS`.
+- [ ] `search_space/loader.py` — if the parameter is an integer bounded below,
+  add it to `_POSITIVE_PARAMETERS` for a `>= 1` floor or
+  `_NON_NEGATIVE_PARAMETERS` for a `>= 0` floor such as an offload count.
 - [ ] `inference/_vllm.py`/`inference/_llamacpp.py` — if the engine imposes a
   cross-parameter rule, add it to `_ENGINE_BOUNDS` (or the equivalent
   engine-specific validation).

@@ -64,9 +64,12 @@ class QuantizationMethod(StrEnum):
 class KVCacheDType(StrEnum):
     """Precision of the KV cache, named engine-neutrally.
 
-    Only the portable core of an engine's cache precisions is modelled;
-    engine-specific formats (vLLM's ``turboquant_*`` and ``nvfp4*``, for
-    instance) are left to the backend's raw-argument escape hatch.
+    The float members are the portable element formats both engines serve; the
+    quantized members are llama.cpp's cache formats, which trade cache
+    precision for memory. No single engine serves the whole set, so a backend
+    maps only the members it can load and every other member is rejected as
+    unsupported. vLLM's engine-specific formats (``turboquant_*`` and
+    ``nvfp4*``, for instance) stay behind its raw-argument escape hatch.
     """
 
     AUTO = "auto"
@@ -74,6 +77,26 @@ class KVCacheDType(StrEnum):
     BFLOAT16 = "bfloat16"
     FP8_E4M3 = "fp8_e4m3"
     FP8_E5M2 = "fp8_e5m2"
+    FLOAT32 = "float32"
+    Q8_0 = "q8_0"
+    Q4_0 = "q4_0"
+    Q4_1 = "q4_1"
+    IQ4_NL = "iq4_nl"
+    Q5_0 = "q5_0"
+    Q5_1 = "q5_1"
+
+
+class GpuLayersMode(StrEnum):
+    """How many layers llama.cpp offloads to the GPU, named engine-neutrally.
+
+    The modes are the engine's two non-numeric choices: :attr:`AUTO` lets
+    llama.cpp pick a count, and :attr:`ALL` offloads every layer. An exact
+    count is a plain integer rather than a member, so a GPU-layer dimension is
+    an int-or-enum union. vLLM has no equivalent setting and rejects the field.
+    """
+
+    AUTO = "auto"
+    ALL = "all"
 
 
 class AttentionBackend(StrEnum):
@@ -82,11 +105,15 @@ class AttentionBackend(StrEnum):
     Attention backends are engine- and platform-specific and the set grows over
     time, so only widely available implementations are modelled. A backend maps
     these to its own names; vLLM spells :attr:`FLASH_ATTENTION` ``FLASH_ATTN``.
+    :attr:`AUTO` and :attr:`OFF` are llama.cpp's flash-attention settings and
+    have no vLLM equivalent, so vLLM rejects them.
     """
 
     FLASH_ATTENTION = "flash_attention"
     FLASH_INFER = "flash_infer"
     XFORMERS = "xformers"
+    AUTO = "auto"
+    OFF = "off"
 
 
 class SpeculativeMethod(StrEnum):
@@ -367,6 +394,11 @@ class LLMConfig:
     disabled mode starts the engine with no speculative flags at all, so the
     draft model's memory is genuinely freed.
 
+    :attr:`prefix_caching` is a boolean toggle, forwarded as the enabling flag
+    or its disabling counterpart so both sides of the switch are explicit.
+    :attr:`n_gpu_layers` is an int-or-enum union: an exact offloaded-layer count
+    or one of llama.cpp's :class:`GpuLayersMode` choices.
+
     :attr:`resolved_draft_path` is a resolution artifact like
     :class:`BenchmarkConfig`'s ``resolved_path``: it holds the local path the
     composition root fetched the draft to, and a backend never forwards it to
@@ -380,6 +412,8 @@ class LLMConfig:
     max_model_len: int | None = None
     max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
+    max_num_active_seqs: int | None = None
+    max_num_scheduled_tokens: int | None = None
     gpu_memory_utilization: float | None = None
     tensor_parallel_size: int | None = None
     seed: int | None = None
@@ -388,6 +422,8 @@ class LLMConfig:
     draft_model: str | None = None
     speculative_mode: SpeculativeMode | None = None
     num_speculative_tokens: int | None = None
+    prefix_caching: bool | None = None
+    n_gpu_layers: int | GpuLayersMode | None = None
     resolved_draft_path: Path | None = None
 
 

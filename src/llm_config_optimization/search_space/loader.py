@@ -34,7 +34,13 @@ from typing import cast
 import yaml
 
 from ..inference.types import LLMConfig
-from .registry import TUNABLE_PARAMETERS, ParameterKind, expected_kind
+from .registry import (
+    TUNABLE_PARAMETERS,
+    AtomKind,
+    ParameterKind,
+    UnionKind,
+    expected_kind,
+)
 from .types import (
     Categorical,
     Default,
@@ -57,10 +63,28 @@ _POSITIVE_PARAMETERS = frozenset(
         "max_model_len",
         "max_num_seqs",
         "max_num_batched_tokens",
+        "max_num_active_seqs",
+        "max_num_scheduled_tokens",
         "tensor_parallel_size",
         "num_speculative_tokens",
     }
 )
+_NON_NEGATIVE_PARAMETERS: frozenset[str] = frozenset({"n_gpu_layers"})
+"""Numerically tunable parameters whose floor is zero rather than one.
+
+The loader applies a per-parameter numeric floor so a count that legitimately
+includes zero (GPU layer offload, for instance) is not rejected by the
+positive-only rule that suits sizes and token budgets.
+"""
+
+
+def _minimum_value(name: str) -> int | None:
+    """Return the inclusive numeric floor of a tunable, if it has one."""
+    if name in _POSITIVE_PARAMETERS:
+        return 1
+    if name in _NON_NEGATIVE_PARAMETERS:
+        return 0
+    return None
 
 
 def load_experiment_space(path: Path, *, required: Iterable[str] | None = None) -> ExperimentSpace:
@@ -159,7 +183,7 @@ def _parse_dimension(name: object, raw_spec: object, problems: list[str]) -> Dim
         path,
         raw_spec,
         kind,
-        positive=name in _POSITIVE_PARAMETERS,
+        minimum=_minimum_value(name),
         problems=problems,
     )
     if spec is None:
@@ -172,7 +196,7 @@ def _parse_spec(
     raw_spec: object,
     kind: ParameterKind,
     *,
-    positive: bool,
+    minimum: int | None,
     problems: list[str],
 ) -> Spec | None:
     """Parse one dimension's tagged spec, reporting structural and value problems."""
@@ -197,11 +221,11 @@ def _parse_spec(
     tag = tags[0]
     value = raw_spec[tag]
     if tag == "fixed":
-        return _parse_fixed(path, value, kind, positive=positive, problems=problems)
+        return _parse_fixed(path, value, kind, minimum=minimum, problems=problems)
     if tag == "categorical":
-        return _parse_categorical(path, value, kind, positive=positive, problems=problems)
+        return _parse_categorical(path, value, kind, minimum=minimum, problems=problems)
     if tag == "interval":
-        return _parse_interval(path, value, kind, positive=positive, problems=problems)
+        return _parse_interval(path, value, kind, minimum=minimum, problems=problems)
     return _parse_default(path, value, problems=problems)
 
 
@@ -210,7 +234,7 @@ def _parse_fixed(
     value: object,
     kind: ParameterKind,
     *,
-    positive: bool,
+    minimum: int | None,
     problems: list[str],
 ) -> Fixed | None:
     """Parse a ``fixed`` spec, which pins the parameter to one value."""
@@ -218,8 +242,7 @@ def _parse_fixed(
     coerced = _coerce_value(value_path, value, kind, problems)
     if coerced is None:
         return None
-    if positive and isinstance(coerced, int) and coerced < 1:
-        problems.append(f"{value_path}: value must be at least 1, got {coerced}")
+    _check_minimum(value_path, coerced, minimum, problems)
     return Fixed(coerced)
 
 
@@ -228,13 +251,14 @@ def _parse_categorical(
     value: object,
     kind: ParameterKind,
     *,
-    positive: bool,
+    minimum: int | None,
     problems: list[str],
 ) -> Categorical | None:
     """Parse a ``categorical`` spec, preserving the declared order of values.
 
-    For a numeric parameter the values are integers, so the same kind,
-    uniqueness, and floor checks apply as for ``fixed`` and ``interval``.
+    A numeric parameter's values are integers, so the same kind, uniqueness, and
+    floor checks apply as for ``fixed`` and ``interval``. A union parameter may
+    mix its branches in one list, such as an enum mode and exact integer counts.
     """
     value_path = f"{path}.categorical"
     if not isinstance(value, list):
@@ -252,8 +276,7 @@ def _parse_categorical(
         result = _coerce_value(item_path, item, kind, problems)
         if result is None:
             continue
-        if positive and isinstance(result, int) and result < 1:
-            problems.append(f"{item_path}: value must be at least 1, got {result}")
+        _check_minimum(item_path, result, minimum, problems)
         coerced.append(result)
 
     if len(set(coerced)) != len(coerced):
@@ -268,12 +291,20 @@ def _parse_interval(
     value: object,
     kind: ParameterKind,
     *,
-    positive: bool,
+    minimum: int | None,
     problems: list[str],
 ) -> Interval | None:
-    """Parse an ``interval`` spec, valid only for an integer parameter."""
+    """Parse an ``interval`` spec, valid only when the parameter has an integer branch.
+
+    A union parameter's interval constrains the integer branch alone: the enum
+    modes are not numeric values, so they cannot appear in ``min`` or ``max``.
+    """
     value_path = f"{path}.interval"
-    if issubclass(kind, StrEnum):
+    atoms = _kind_atoms(kind)
+    if all(issubclass(atom, bool) for atom in atoms):
+        problems.append(f"{value_path}: not valid for a boolean parameter")
+        return None
+    if not any(atom is int for atom in atoms):
         problems.append(f"{value_path}: not valid for a categorical parameter")
         return None
     if not isinstance(value, Mapping):
@@ -291,18 +322,18 @@ def _parse_interval(
     if unknown or missing:
         return None
 
-    minimum = _coerce_int(f"{value_path}.min", value["min"], problems)
-    maximum = _coerce_int(f"{value_path}.max", value["max"], problems)
-    if minimum is None or maximum is None:
+    lower = _coerce_int(f"{value_path}.min", value["min"], problems)
+    upper = _coerce_int(f"{value_path}.max", value["max"], problems)
+    if lower is None or upper is None:
         return None
-    if minimum > maximum:
-        problems.append(f"{value_path}: 'min' ({minimum}) must not exceed 'max' ({maximum})")
-    if positive:
-        if minimum < 1:
-            problems.append(f"{value_path}.min: value must be at least 1, got {minimum}")
-        if maximum < 1:
-            problems.append(f"{value_path}.max: value must be at least 1, got {maximum}")
-    return Interval(minimum, maximum)
+    if lower > upper:
+        problems.append(f"{value_path}: 'min' ({lower}) must not exceed 'max' ({upper})")
+    if minimum is not None:
+        if lower < minimum:
+            problems.append(f"{value_path}.min: value must be at least {minimum}, got {lower}")
+        if upper < minimum:
+            problems.append(f"{value_path}.max: value must be at least {minimum}, got {upper}")
+    return Interval(lower, upper)
 
 
 def _parse_default(path: str, value: object, *, problems: list[str]) -> Default | None:
@@ -313,35 +344,117 @@ def _parse_default(path: str, value: object, *, problems: list[str]) -> Default 
     return Default()
 
 
+def _check_minimum(
+    path: str, value: ParameterValue, minimum: int | None, problems: list[str]
+) -> None:
+    """Report a numeric value below its parameter's inclusive floor.
+
+    Booleans are excluded even though :class:`bool` subclasses :class:`int`, so a
+    union that carried both branches keeps the two kinds distinct.
+    """
+    if minimum is None or isinstance(value, bool) or not isinstance(value, int):
+        return
+    if value < minimum:
+        problems.append(f"{path}: value must be at least {minimum}, got {value}")
+
+
+def _kind_atoms(kind: ParameterKind) -> tuple[AtomKind, ...]:
+    """Expand a kind into its branches, treating a plain kind as one branch."""
+    return kind.kinds if isinstance(kind, UnionKind) else (kind,)
+
+
 def _coerce_value(
     path: str, value: object, kind: ParameterKind, problems: list[str]
 ) -> ParameterValue | None:
-    """Coerce a declared value to its parameter's engine-neutral kind."""
-    if issubclass(kind, StrEnum):
-        if isinstance(value, kind):
-            return cast("ParameterValue", value)
+    """Coerce a declared value to one of its parameter's engine-neutral kinds."""
+    if isinstance(kind, UnionKind):
+        coerced = _coerce_union(value, kind)
+        if coerced is None:
+            problems.append(f"{path}: expected {_format_kind(kind)}, got {type(value).__name__}")
+        return coerced
+    return _coerce_atom(path, value, kind, problems)
+
+
+def _coerce_union(value: object, kind: UnionKind) -> ParameterValue | None:
+    """Coerce ``value`` against the first union branch that accepts it."""
+    for atom in kind.kinds:
+        coerced = _match_atom(value, atom)
+        if coerced is not None:
+            return coerced
+    return None
+
+
+def _coerce_atom(
+    path: str, value: object, kind: AtomKind, problems: list[str]
+) -> ParameterValue | None:
+    """Coerce ``value`` to one kind, reporting a kind-specific problem."""
+    coerced = _match_atom(value, kind)
+    if coerced is not None:
+        return coerced
+    if issubclass(kind, bool):
+        problems.append(f"{path}: expected a boolean, got {type(value).__name__}")
+    elif issubclass(kind, StrEnum):
         if not isinstance(value, str):
             problems.append(
                 f"{path}: expected one of {_format_values(kind)}, got {type(value).__name__}"
             )
-            return None
-        try:
-            return cast("ParameterValue", kind(value))
-        except ValueError:
+        else:
             problems.append(
                 f"{path}: {value!r} is not a valid {kind.__name__}; "
                 f"expected one of {_format_values(kind)}"
             )
+    else:
+        problems.append(f"{path}: expected an integer, got {type(value).__name__}")
+    return None
+
+
+def _match_atom(value: object, kind: AtomKind) -> ParameterValue | None:
+    """Return ``value`` as ``kind`` when it fits, otherwise ``None``."""
+    if issubclass(kind, bool):
+        return value if isinstance(value, bool) else None
+    if issubclass(kind, StrEnum):
+        if isinstance(value, kind):
+            return cast("ParameterValue", value)
+        if not isinstance(value, str):
             return None
-    return _coerce_int(path, value, problems)
+        try:
+            return cast("ParameterValue", kind(value))
+        except ValueError:
+            return None
+    return _coerce_int_if_possible(value)
+
+
+def _coerce_int_if_possible(value: object) -> int | None:
+    """Return ``value`` as an integer, rejecting booleans and non-numbers."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def _coerce_int(path: str, value: object, problems: list[str]) -> int | None:
-    """Coerce a declared value to an integer, rejecting booleans."""
+    """Coerce a declared value to an integer, rejecting booleans.
+
+    ``bool`` is a subclass of :class:`int`, so an explicit boolean check keeps
+    the two kinds separate in both directions and refuses YAML's ``true``/``false``
+    for a numeric dimension.
+    """
     if isinstance(value, bool) or not isinstance(value, int):
         problems.append(f"{path}: expected an integer, got {type(value).__name__}")
         return None
     return value
+
+
+def _format_kind(kind: ParameterKind) -> str:
+    """Render the accepted values of a possibly-union kind for an error message."""
+    descriptions: list[str] = []
+    for atom in _kind_atoms(kind):
+        if issubclass(atom, bool):
+            descriptions.append("a boolean")
+        elif issubclass(atom, StrEnum):
+            descriptions.append(f"one of {_format_values(atom)}")
+        else:
+            descriptions.append("an integer")
+    return " or ".join(descriptions)
 
 
 def _format_kinds() -> str:

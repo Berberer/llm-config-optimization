@@ -22,6 +22,7 @@ from llm_config_optimization.inference import (
     DetectedHardware,
     DType,
     HardwareTarget,
+    KVCacheDType,
     LLMConfig,
     SpeculativeMethod,
     SpeculativeMode,
@@ -46,8 +47,11 @@ SUPPORTED_SPACE = ExperimentSpace(
         Dimension("max_model_len", Interval(1024, 8192)),
         Dimension("max_num_seqs", Fixed(256)),
         Dimension("max_num_batched_tokens", Interval(2048, 8192)),
+        Dimension("max_num_active_seqs", Fixed(16)),
+        Dimension("max_num_scheduled_tokens", Fixed(2048)),
         Dimension("tensor_parallel_size", Categorical((1, 2, 4))),
         Dimension("attention_backend", Default()),
+        Dimension("prefix_caching", Fixed(True)),
     )
 )
 """A space whose every parameter and value vLLM supports."""
@@ -158,6 +162,14 @@ def test_a_parameter_the_backend_does_not_forward_is_reported(
     assert any("space.dtype" in problem and "does not forward" in problem for problem in problems)
 
 
+def test_llama_cpp_gpu_layers_are_reported_as_not_forwarded_by_vllm() -> None:
+    problems = validate(space(Dimension("n_gpu_layers", Fixed(0))))
+
+    assert any(
+        "space.n_gpu_layers" in problem and "does not forward" in problem for problem in problems
+    )
+
+
 def test_a_default_dimension_still_requires_a_forwarded_parameter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -213,6 +225,107 @@ def test_a_space_that_satisfies_the_engine_bound_has_no_problems() -> None:
     )
 
     assert list(validate(satisfying)) == []
+
+
+def test_a_matching_pinned_float_cache_dtype_is_accepted() -> None:
+    accepted = space(
+        Dimension("dtype", Fixed(DType.FLOAT16)),
+        Dimension("kv_cache_dtype", Categorical((KVCacheDType.AUTO, KVCacheDType.FLOAT16))),
+    )
+
+    assert list(validate(accepted)) == []
+
+
+@pytest.mark.parametrize(
+    ("dtype_spec", "cache_spec"),
+    [
+        (Fixed(DType.FLOAT16), Fixed(KVCacheDType.BFLOAT16)),
+        (Fixed(DType.BFLOAT16), Fixed(KVCacheDType.FLOAT16)),
+        (Categorical((DType.FLOAT16, DType.BFLOAT16)), Fixed(KVCacheDType.FLOAT16)),
+        (Fixed(DType.AUTO), Fixed(KVCacheDType.FLOAT16)),
+        (Default(), Fixed(KVCacheDType.BFLOAT16)),
+    ],
+    ids=["wrong-float", "wrong-bfloat", "mixed-dtype", "auto-dtype", "default-dtype"],
+)
+def test_an_explicit_float_cache_without_a_matching_pinned_dtype_is_reported(
+    dtype_spec: Fixed | Categorical | Default,
+    cache_spec: Fixed,
+) -> None:
+    problems = validate(
+        space(
+            Dimension("dtype", dtype_spec),
+            Dimension("kv_cache_dtype", cache_spec),
+        )
+    )
+
+    assert any(
+        problem.startswith("space.kv_cache_dtype") and "explicit float KV cache" in problem
+        for problem in problems
+    ), problems
+
+
+def test_an_fp8_cache_is_exempt_from_the_model_dtype_match() -> None:
+    accepted = space(
+        Dimension("dtype", Categorical((DType.AUTO, DType.BFLOAT16))),
+        Dimension("kv_cache_dtype", Categorical((KVCacheDType.AUTO, KVCacheDType.FP8_E4M3))),
+    )
+
+    assert list(validate(accepted)) == []
+
+
+def test_a_space_that_can_violate_the_active_sequence_cap_is_reported() -> None:
+    violating = space(
+        Dimension("max_num_seqs", Interval(1, 16)),
+        Dimension("max_num_active_seqs", Interval(1, 32)),
+    )
+
+    problems = validate(violating)
+
+    assert any(
+        "space.max_num_seqs" in problem and "max_num_active_seqs" in problem for problem in problems
+    )
+
+
+def test_a_space_that_can_violate_the_scheduled_token_cap_is_reported() -> None:
+    violating = space(
+        Dimension("max_num_batched_tokens", Fixed(4096)),
+        Dimension("max_num_scheduled_tokens", Interval(2048, 8192)),
+    )
+
+    problems = validate(violating)
+
+    assert any(
+        "space.max_num_batched_tokens" in problem and "max_num_scheduled_tokens" in problem
+        for problem in problems
+    )
+
+
+@pytest.mark.parametrize(
+    ("upper", "lower"),
+    [
+        ("max_num_seqs", "max_num_active_seqs"),
+        ("max_num_batched_tokens", "max_num_scheduled_tokens"),
+    ],
+)
+def test_a_deferred_scheduling_companion_skips_the_bound_check(upper: str, lower: str) -> None:
+    """An engine default is unknown, so the bound is left to the engine at run time."""
+    deferred = space(Dimension(upper, Fixed(8)), Dimension(lower, Default()))
+    absent = space(Dimension(upper, Fixed(8)))
+
+    assert not any("requires" in problem for problem in validate(deferred))
+    assert not any("requires" in problem for problem in validate(absent))
+
+
+def test_the_permissive_corners_of_the_scheduling_caps_are_accepted() -> None:
+    """The broad example ranges satisfy every companion bound at every corner."""
+    accepted = space(
+        Dimension("max_num_seqs", Interval(16, 256)),
+        Dimension("max_num_active_seqs", Interval(1, 16)),
+        Dimension("max_num_batched_tokens", Interval(4096, 8192)),
+        Dimension("max_num_scheduled_tokens", Interval(2048, 4096)),
+    )
+
+    assert list(validate(accepted)) == []
 
 
 def test_a_categorical_engine_bound_is_checked_by_its_extremes() -> None:

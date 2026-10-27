@@ -59,12 +59,16 @@ def test_tunable_serving_parameters_are_left_unset_for_the_space() -> None:
     assert config.llm.max_model_len is None
     assert config.llm.max_num_seqs is None
     assert config.llm.max_num_batched_tokens is None
+    assert config.llm.max_num_active_seqs is None
+    assert config.llm.max_num_scheduled_tokens is None
     assert config.llm.tensor_parallel_size is None
     assert config.llm.attention_backend is None
     assert config.llm.speculative_method is None
     assert config.llm.draft_model is None
     assert config.llm.speculative_mode is None
     assert config.llm.num_speculative_tokens is None
+    assert config.llm.prefix_caching is None
+    assert config.llm.n_gpu_layers is None
     assert config.llm.resolved_draft_path is None
 
 

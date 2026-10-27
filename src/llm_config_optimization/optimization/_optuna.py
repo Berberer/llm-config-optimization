@@ -61,7 +61,7 @@ from ..inference.types import (
     InferenceBackend,
     LLMConfig,
 )
-from ..search_space.registry import TUNABLE_PARAMETERS, expected_kind
+from ..search_space.registry import TUNABLE_PARAMETERS, UnionKind, expected_kind
 from ..search_space.types import (
     Categorical,
     Default,
@@ -596,15 +596,19 @@ def _coerce_value(field: str, value: object) -> object:
 
     A categorical field's sampled string is resolved to a member of the enum
     named by the ``LLMConfig`` field's own type annotation, so the backend's
-    value maps apply exactly as they would for a hand-written config. A numeric
-    field's value is coerced to an integer.
+    value maps apply exactly as they would for a hand-written config. A boolean
+    field keeps its sampled boolean unchanged, and a numeric field's value is
+    coerced to an integer. A union field (an exact count or an enum mode) is
+    resolved against the first branch that accepts the sampled value, so a raw
+    choice that arrived as a string becomes the enum member and one that
+    arrived as a number stays an integer.
 
-    The numeric branch is intentionally narrow: this function knows only enums
-    and integers, so any other kind falls through to :func:`int` and is silently
-    truncated rather than rejected — ``issubclass(float, Enum)`` is ``False``.
-    That is sound for the current tunable set, where every non-enum tunable is
-    an ``int`` field and the one float field, ``gpu_memory_utilization``, is a
-    non-tunable absent from
+    The numeric branch is intentionally narrow: this function knows only enums,
+    booleans, and integers, so any other kind falls through to :func:`int` and
+    is silently truncated rather than rejected — ``issubclass(float, Enum)`` is
+    ``False``. That is sound for the current tunable set, where every non-enum,
+    non-boolean tunable is an ``int`` field and the one float field,
+    ``gpu_memory_utilization``, is a non-tunable absent from
     :data:`~llm_config_optimization.search_space.registry.TUNABLE_PARAMETERS`; the YAML
     loader additionally rejects a float ``Interval``. Two paths bypass those
     guards and would need a float branch: a hand-built ``Interval`` with float
@@ -613,6 +617,35 @@ def _coerce_value(field: str, value: object) -> object:
     resolved kind here instead of assuming an integer.
     """
     kind = expected_kind(field)
+    if isinstance(kind, UnionKind):
+        return _coerce_union_value(field, value, kind)
+    if issubclass(kind, bool):
+        if not isinstance(value, bool):
+            raise ValueError(f"{field} expects a boolean, got {type(value).__name__}")
+        return value
     if issubclass(kind, Enum):
         return kind(value)
     return int(cast("str | int | float", value))
+
+
+def _coerce_union_value(field: str, value: object, kind: UnionKind) -> object:
+    """Resolve a sampled value against a union field's branches.
+
+    An enum branch accepts its own string spelling, a boolean branch only a real
+    boolean, and an integer branch only an integer that is not a boolean. A
+    value no branch accepts is rejected rather than coerced to the wrong
+    domain, so a mode name is never handed to :func:`int` and an integer is
+    never reinterpreted as an enum value.
+    """
+    for atom in kind.kinds:
+        if issubclass(atom, bool):
+            if isinstance(value, bool):
+                return value
+        elif issubclass(atom, Enum):
+            try:
+                return atom(value)
+            except TypeError, ValueError:
+                continue
+        elif isinstance(value, int) and not isinstance(value, bool):
+            return value
+    raise ValueError(f"{field} expects {kind}, got {type(value).__name__}")

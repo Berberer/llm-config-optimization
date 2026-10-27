@@ -18,6 +18,7 @@ import yaml
 from llm_config_optimization.inference import (
     AttentionBackend,
     DType,
+    GpuLayersMode,
     SpeculativeMode,
 )
 from llm_config_optimization.search_space import (
@@ -28,6 +29,7 @@ from llm_config_optimization.search_space import (
     ExperimentDefinitionError,
     Fixed,
     Interval,
+    UnionKind,
     load_experiment_space,
     parse_experiment_space,
 )
@@ -38,10 +40,14 @@ VALID_SPACE: dict[str, object] = {
     "max_model_len": {"interval": {"min": 1024, "max": 8192}},
     "max_num_seqs": {"fixed": 256},
     "max_num_batched_tokens": {"interval": {"min": 2048, "max": 8192}},
+    "max_num_active_seqs": {"fixed": 16},
+    "max_num_scheduled_tokens": {"fixed": 4096},
     "tensor_parallel_size": {"categorical": [1, 2, 4]},
     "attention_backend": {"default": True},
     "speculative_mode": {"fixed": "enabled"},
     "num_speculative_tokens": {"interval": {"min": 1, "max": 5}},
+    "prefix_caching": {"fixed": True},
+    "n_gpu_layers": {"default": True},
 }
 """A complete, valid definition covering every tunable and every spec kind."""
 
@@ -65,6 +71,19 @@ def spec_of(space: object, name: str) -> object:
     return matches[0]
 
 
+BOOLEAN_PARAMETER = "prefix_caching"
+"""The registry's boolean tunable, whose strict parsing the tests below pin."""
+
+
+UNION_PARAMETER = "n_gpu_layers"
+"""The registry's int-or-enum tunable, whose two branches the tests below pin."""
+
+
+def parse_only(parameter: str, spec: object) -> object:
+    """Parse a document declaring only one tunable, with it required."""
+    return parse_experiment_space({"space": {parameter: spec}}, required={parameter})
+
+
 def test_a_complete_definition_parses_into_the_expected_dimensions() -> None:
     space = parse_experiment_space(definition())
 
@@ -74,10 +93,14 @@ def test_a_complete_definition_parses_into_the_expected_dimensions() -> None:
         Dimension("max_model_len", Interval(1024, 8192)),
         Dimension("max_num_seqs", Fixed(256)),
         Dimension("max_num_batched_tokens", Interval(2048, 8192)),
+        Dimension("max_num_active_seqs", Fixed(16)),
+        Dimension("max_num_scheduled_tokens", Fixed(4096)),
         Dimension("tensor_parallel_size", Categorical((1, 2, 4))),
         Dimension("attention_backend", Default()),
         Dimension("speculative_mode", Fixed(SpeculativeMode.ENABLED)),
         Dimension("num_speculative_tokens", Interval(1, 5)),
+        Dimension("prefix_caching", Fixed(True)),
+        Dimension("n_gpu_layers", Default()),
     )
 
 
@@ -123,6 +146,177 @@ def test_every_missing_tunable_is_named_with_its_accepted_spec_kinds() -> None:
         expected = f"space.{parameter}: missing required tunable parameter"
         assert any(problem.startswith(expected) for problem in problems), problems
     assert all("fixed, categorical, interval, default" in problem for problem in problems)
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ({"fixed": True}, Fixed(True)),
+        ({"fixed": False}, Fixed(False)),
+        ({"categorical": [True, False]}, Categorical((True, False))),
+        ({"default": True}, Default()),
+    ],
+    ids=["fixed-true", "fixed-false", "categorical", "default"],
+)
+def test_a_boolean_dimension_parses_to_its_engine_neutral_type(
+    spec: dict[str, object], expected: object
+) -> None:
+    space = parse_only(BOOLEAN_PARAMETER, spec)
+
+    assert spec_of(space, BOOLEAN_PARAMETER) == expected
+
+
+def test_a_boolean_value_is_kept_distinct_from_an_integer() -> None:
+    """``True == 1``, so assert on identity rather than equality alone."""
+    fixed = spec_of(parse_only(BOOLEAN_PARAMETER, {"fixed": True}), BOOLEAN_PARAMETER)
+
+    assert isinstance(fixed, Fixed)
+    assert fixed.value is True
+
+
+@pytest.mark.parametrize(
+    ("spec", "problem"),
+    [
+        ({"fixed": 1}, "space.prefix_caching.fixed: expected a boolean"),
+        ({"fixed": 0}, "space.prefix_caching.fixed: expected a boolean"),
+        ({"fixed": "true"}, "space.prefix_caching.fixed: expected a boolean"),
+        (
+            {"categorical": [True, 1]},
+            "space.prefix_caching.categorical[1]: expected a boolean",
+        ),
+        (
+            {"interval": {"min": 0, "max": 1}},
+            "space.prefix_caching.interval: not valid for a boolean parameter",
+        ),
+    ],
+    ids=["integer-one", "integer-zero", "quoted-string", "categorical-integer", "interval"],
+)
+def test_boolean_values_are_validated_strictly(spec: dict[str, object], problem: str) -> None:
+    with pytest.raises(ExperimentDefinitionError) as excinfo:
+        parse_only(BOOLEAN_PARAMETER, spec)
+
+    assert any(problem in found for found in excinfo.value.problems), excinfo.value.problems
+
+
+def test_a_boolean_dimension_still_rejects_duplicate_categorical_values() -> None:
+    with pytest.raises(ExperimentDefinitionError) as excinfo:
+        parse_only(BOOLEAN_PARAMETER, {"categorical": [True, True]})
+
+    assert any("values must be unique" in found for found in excinfo.value.problems)
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ({"fixed": "auto"}, Fixed(GpuLayersMode.AUTO)),
+        ({"fixed": 8}, Fixed(8)),
+        (
+            {"categorical": ["auto", 0, "all", 16]},
+            Categorical((GpuLayersMode.AUTO, 0, GpuLayersMode.ALL, 16)),
+        ),
+        ({"interval": {"min": 0, "max": 40}}, Interval(0, 40)),
+        ({"default": True}, Default()),
+    ],
+    ids=["fixed-enum", "fixed-integer", "mixed-categorical", "interval", "default"],
+)
+def test_an_int_or_enum_dimension_accepts_either_branch(
+    spec: dict[str, object], expected: object
+) -> None:
+    space = parse_only(UNION_PARAMETER, spec)
+
+    assert spec_of(space, UNION_PARAMETER) == expected
+
+
+def test_a_union_integer_is_kept_distinct_from_the_enum_branch() -> None:
+    """``0`` is an exact count, not an enum member; assert on its exact type."""
+    fixed = spec_of(parse_only(UNION_PARAMETER, {"fixed": 0}), UNION_PARAMETER)
+
+    assert isinstance(fixed, Fixed)
+    assert fixed.value == 0
+    assert type(fixed.value) is int
+
+
+@pytest.mark.parametrize(
+    ("spec", "problem"),
+    [
+        ({"fixed": True}, "space.n_gpu_layers.fixed: expected an integer or one of"),
+        ({"fixed": "bogus"}, "space.n_gpu_layers.fixed: expected an integer or one of"),
+        (
+            {"categorical": ["auto", "bogus"]},
+            "space.n_gpu_layers.categorical[1]: expected an integer or one of",
+        ),
+        (
+            {"interval": {"min": "auto", "max": 4}},
+            "space.n_gpu_layers.interval.min: expected an integer",
+        ),
+    ],
+    ids=["boolean", "unknown-enum", "categorical-unknown-enum", "interval-enum-bound"],
+)
+def test_a_union_dimension_rejects_values_outside_both_branches(
+    spec: dict[str, object], problem: str
+) -> None:
+    with pytest.raises(ExperimentDefinitionError) as excinfo:
+        parse_only(UNION_PARAMETER, spec)
+
+    assert any(problem in found for found in excinfo.value.problems), excinfo.value.problems
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"fixed": 0},
+        {"categorical": ["auto", 0, "all"]},
+        {"interval": {"min": 0, "max": 40}},
+    ],
+    ids=["fixed-zero", "categorical-zero", "interval-zero"],
+)
+def test_a_non_negative_dimension_accepts_zero(
+    spec: dict[str, object],
+) -> None:
+    space = parse_only(UNION_PARAMETER, spec)
+
+    assert spec_of(space, UNION_PARAMETER) is not None
+
+
+@pytest.mark.parametrize(
+    ("spec", "problem"),
+    [
+        ({"fixed": -1}, "space.n_gpu_layers.fixed: value must be at least 0, got -1"),
+        (
+            {"categorical": ["auto", -1]},
+            "space.n_gpu_layers.categorical[1]: value must be at least 0, got -1",
+        ),
+        (
+            {"interval": {"min": -1, "max": 40}},
+            "space.n_gpu_layers.interval.min: value must be at least 0, got -1",
+        ),
+    ],
+    ids=["fixed-negative", "categorical-negative", "interval-negative"],
+)
+def test_a_non_negative_dimension_rejects_a_negative_count(
+    spec: dict[str, object], problem: str
+) -> None:
+    with pytest.raises(ExperimentDefinitionError) as excinfo:
+        parse_only(UNION_PARAMETER, spec)
+
+    assert any(problem in found for found in excinfo.value.problems), excinfo.value.problems
+
+
+def test_a_union_without_an_integer_branch_rejects_an_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "llm_config_optimization.search_space.loader.expected_kind",
+        lambda _: UnionKind((AttentionBackend,)),
+    )
+
+    with pytest.raises(ExperimentDefinitionError) as excinfo:
+        parse_only(UNION_PARAMETER, {"interval": {"min": 0, "max": 4}})
+
+    assert any(
+        "space.n_gpu_layers.interval: not valid for a categorical parameter" in found
+        for found in excinfo.value.problems
+    )
 
 
 def test_a_reduced_required_set_makes_a_declared_space_total_over_it() -> None:
@@ -285,6 +479,14 @@ def test_top_level_shape_problems_are_reported(document: object, problem: str) -
             "space.max_model_len.interval.min: expected an integer",
         ),
         ({"max_num_seqs": {"fixed": 0}}, "space.max_num_seqs.fixed: value must be at least 1"),
+        (
+            {"max_num_active_seqs": {"fixed": 0}},
+            "space.max_num_active_seqs.fixed: value must be at least 1",
+        ),
+        (
+            {"max_num_scheduled_tokens": {"interval": {"min": 0, "max": 10}}},
+            "space.max_num_scheduled_tokens.interval.min: value must be at least 1",
+        ),
         (
             {"num_speculative_tokens": {"fixed": 0}},
             "space.num_speculative_tokens.fixed: value must be at least 1",

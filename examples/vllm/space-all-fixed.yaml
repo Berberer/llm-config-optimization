@@ -15,8 +15,14 @@ space:
     fixed: 64
   max_num_batched_tokens:
     fixed: 4096
+  max_num_active_seqs:
+    fixed: 64
+  max_num_scheduled_tokens:
+    fixed: 4096
   tensor_parallel_size:
     fixed: 1
   # flash_attention is CUDA-only; on ROCm or CPU use `default: true` instead.
   attention_backend:
     fixed: flash_attention
+  prefix_caching:
+    fixed: true

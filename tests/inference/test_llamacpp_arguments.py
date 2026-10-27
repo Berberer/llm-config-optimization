@@ -16,6 +16,7 @@ from llm_config_optimization.inference import (
     AttentionBackend,
     DType,
     ExperimentError,
+    GpuLayersMode,
     KVCacheDType,
     LLMConfig,
     QuantizationMethod,
@@ -29,7 +30,9 @@ from llm_config_optimization.inference._llamacpp import (
 )
 from llm_config_optimization.search_space.registry import TUNABLE_PARAMETERS
 
-_INAPPLICABLE_TUNABLES = frozenset({"dtype", "tensor_parallel_size"})
+_INAPPLICABLE_TUNABLES = frozenset(
+    {"dtype", "tensor_parallel_size", "max_num_active_seqs", "max_num_scheduled_tokens"}
+)
 """The registry's tunables llama.cpp has no ``llama-server`` flag for."""
 
 _INAPPLICABLE_FIELDS = frozenset(
@@ -38,6 +41,8 @@ _INAPPLICABLE_FIELDS = frozenset(
         "quantization",
         "gpu_memory_utilization",
         "tensor_parallel_size",
+        "max_num_active_seqs",
+        "max_num_scheduled_tokens",
         "seed",
         "resolved_draft_path",
     }
@@ -45,11 +50,11 @@ _INAPPLICABLE_FIELDS = frozenset(
 """The :class:`LLMConfig` fields this backend has no ``llama-server`` target for.
 
 ``dtype`` is carried by the GGUF weights and ``quantization`` by the file's
-metadata, tensor parallelism and the VRAM fraction are vLLM-only knobs, and the
-sampling seed is not forwarded because the host client measures with greedy
-decoding. ``resolved_draft_path`` is a host-side resolution artifact that an
-engine never receives; the speculative settings reach the engine through their
-``--spec-*`` flags.
+metadata, tensor parallelism, the VRAM fraction, and the scheduling caps are
+vLLM-only knobs, and the sampling seed is not forwarded because the host client
+measures with greedy decoding. ``resolved_draft_path`` is a host-side resolution
+artifact that an engine never receives; the speculative settings reach the
+engine through their ``--spec-*`` flags.
 """
 
 
@@ -85,6 +90,12 @@ def test_every_llm_config_field_is_classified_as_mapped_or_inapplicable() -> Non
             ["--cache-type-k", "f16", "--cache-type-v", "f16"],
         ),
         (LLMConfig(attention_backend=AttentionBackend.FLASH_ATTENTION), ["--flash-attn", "on"]),
+        (LLMConfig(attention_backend=AttentionBackend.AUTO), ["--flash-attn", "auto"]),
+        (LLMConfig(attention_backend=AttentionBackend.OFF), ["--flash-attn", "off"]),
+        (LLMConfig(n_gpu_layers=GpuLayersMode.AUTO), ["--n-gpu-layers", "auto"]),
+        (LLMConfig(n_gpu_layers=GpuLayersMode.ALL), ["--n-gpu-layers", "all"]),
+        (LLMConfig(n_gpu_layers=0), ["--n-gpu-layers", "0"]),
+        (LLMConfig(n_gpu_layers=40), ["--n-gpu-layers", "40"]),
     ],
 )
 def test_each_tunable_maps_to_its_server_flags(config: LLMConfig, expected: list[str]) -> None:
@@ -96,6 +107,13 @@ def test_each_tunable_maps_to_its_server_flags(config: LLMConfig, expected: list
     [
         (KVCacheDType.FLOAT16, "f16"),
         (KVCacheDType.BFLOAT16, "bf16"),
+        (KVCacheDType.FLOAT32, "f32"),
+        (KVCacheDType.Q8_0, "q8_0"),
+        (KVCacheDType.Q4_0, "q4_0"),
+        (KVCacheDType.Q4_1, "q4_1"),
+        (KVCacheDType.IQ4_NL, "iq4_nl"),
+        (KVCacheDType.Q5_0, "q5_0"),
+        (KVCacheDType.Q5_1, "q5_1"),
     ],
 )
 def test_every_supported_kv_cache_dtype_translates(value: KVCacheDType, spelling: str) -> None:
@@ -107,11 +125,33 @@ def test_every_supported_kv_cache_dtype_translates(value: KVCacheDType, spelling
     ]
 
 
-def test_the_supported_attention_backend_translates() -> None:
-    assert serve_arguments(LLMConfig(attention_backend=AttentionBackend.FLASH_ATTENTION)) == [
-        "--flash-attn",
-        "on",
-    ]
+@pytest.mark.parametrize(
+    ("value", "spelling"),
+    [
+        (AttentionBackend.AUTO, "auto"),
+        (AttentionBackend.FLASH_ATTENTION, "on"),
+        (AttentionBackend.OFF, "off"),
+    ],
+)
+def test_every_supported_attention_backend_translates(
+    value: AttentionBackend, spelling: str
+) -> None:
+    assert serve_arguments(LLMConfig(attention_backend=value)) == ["--flash-attn", spelling]
+
+
+@pytest.mark.parametrize(
+    ("value", "spelling"),
+    [
+        (GpuLayersMode.AUTO, "auto"),
+        (GpuLayersMode.ALL, "all"),
+    ],
+)
+def test_every_supported_gpu_layers_mode_translates(value: GpuLayersMode, spelling: str) -> None:
+    assert serve_arguments(LLMConfig(n_gpu_layers=value)) == ["--n-gpu-layers", spelling]
+
+
+def test_an_unset_n_gpu_layers_emits_no_flag() -> None:
+    assert serve_arguments(LLMConfig(n_gpu_layers=None)) == []
 
 
 @pytest.mark.parametrize(
@@ -136,8 +176,19 @@ def test_every_supported_value_has_a_map_entry_and_no_unsupported_one_does() -> 
     assert VALUE_MAPS["kv_cache_dtype"] == {
         KVCacheDType.FLOAT16: "f16",
         KVCacheDType.BFLOAT16: "bf16",
+        KVCacheDType.FLOAT32: "f32",
+        KVCacheDType.Q8_0: "q8_0",
+        KVCacheDType.Q4_0: "q4_0",
+        KVCacheDType.Q4_1: "q4_1",
+        KVCacheDType.IQ4_NL: "iq4_nl",
+        KVCacheDType.Q5_0: "q5_0",
+        KVCacheDType.Q5_1: "q5_1",
     }
-    assert VALUE_MAPS["attention_backend"] == {AttentionBackend.FLASH_ATTENTION: "on"}
+    assert VALUE_MAPS["attention_backend"] == {
+        AttentionBackend.AUTO: "auto",
+        AttentionBackend.FLASH_ATTENTION: "on",
+        AttentionBackend.OFF: "off",
+    }
     assert VALUE_MAPS["speculative_method"] == {
         SpeculativeMethod.DRAFT_MODEL: "draft-simple",
         SpeculativeMethod.EAGLE3: "draft-eagle3",
@@ -165,6 +216,16 @@ def test_every_supported_value_has_a_map_entry_and_no_unsupported_one_does() -> 
 )
 def test_every_speculative_method_translates(value: SpeculativeMethod, spelling: str) -> None:
     assert serve_arguments(LLMConfig(speculative_method=value)) == ["--spec-type", spelling]
+
+
+def test_prefix_caching_emits_the_enabling_or_disabling_flag() -> None:
+    """Both sides of the switch are explicit, so ``False`` is a real setting."""
+    assert serve_arguments(LLMConfig(prefix_caching=True)) == ["--cache-prompt"]
+    assert serve_arguments(LLMConfig(prefix_caching=False)) == ["--no-cache-prompt"]
+
+
+def test_an_unset_prefix_caching_emits_neither_flag() -> None:
+    assert serve_arguments(LLMConfig(prefix_caching=None)) == []
 
 
 def test_speculative_settings_reach_their_own_flags() -> None:

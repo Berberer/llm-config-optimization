@@ -85,6 +85,7 @@ _CPU_SEED = 0
 _MAX_MODEL_LEN = 2048
 _MAX_NUM_BATCHED_TOKENS = 2048
 _MAX_NUM_SEQS = (2, 4)
+_MAX_NUM_ACTIVE_SEQS = 2
 
 BASE = ExperimentConfig(
     container=ContainerRuntimeConfig(target=HardwareTarget.CPU, image=VLLM_CPU_IMAGE),
@@ -113,8 +114,11 @@ SPACE = ExperimentSpace(
         Dimension("max_model_len", Fixed(_MAX_MODEL_LEN)),
         Dimension("max_num_seqs", Categorical(_MAX_NUM_SEQS)),
         Dimension("max_num_batched_tokens", Fixed(_MAX_NUM_BATCHED_TOKENS)),
+        Dimension("max_num_active_seqs", Fixed(_MAX_NUM_ACTIVE_SEQS)),
+        Dimension("max_num_scheduled_tokens", Fixed(_MAX_NUM_BATCHED_TOKENS)),
         Dimension("tensor_parallel_size", Fixed(1)),
         Dimension("attention_backend", Default()),
+        Dimension("prefix_caching", Fixed(True)),
     )
 )
 """A mostly-fixed CPU-safe space with one dimension the sweep varies."""
@@ -257,6 +261,8 @@ def test_two_trial_sweep_returns_a_usable_best_configuration(
     assert best.llm.max_model_len == _MAX_MODEL_LEN
     assert best.llm.max_num_seqs == result.study.best_trial.params["max_num_seqs"]
     assert best.llm.max_num_batched_tokens == _MAX_NUM_BATCHED_TOKENS
+    assert best.llm.max_num_active_seqs == _MAX_NUM_ACTIVE_SEQS
+    assert best.llm.max_num_scheduled_tokens == _MAX_NUM_BATCHED_TOKENS
     assert best.llm.tensor_parallel_size == 1
     assert best.llm.quantization is None
     assert best.llm.attention_backend is None
