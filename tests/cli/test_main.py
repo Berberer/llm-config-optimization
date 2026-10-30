@@ -23,13 +23,15 @@ import struct
 from collections.abc import Iterable
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import optuna
 import pytest
 import yaml
 
 from fakes import FakeBackend, FakeBenchmarkClient, FakePodmanClient
-from llm_config_optimization.cli import main
+from llm_config_optimization.cli import _sweep_budget, main
+from llm_config_optimization.cli._budget import Budget
 from llm_config_optimization.inference import (
     BenchmarkOutcome,
     DetectedHardware,
@@ -1004,6 +1006,29 @@ def test_the_budget_reports_the_sweep_timeout(tmp_path: Path, model: str) -> Non
     assert "budget: 2 trials, 30s" in out
 
 
+def test_an_unbounded_serial_sweep_has_an_empty_budget() -> None:
+    """Neither budget flag and one job leave the sweep with nothing to project."""
+    args = SimpleNamespace(n_trials=None, sweep_timeout=None, n_jobs=1)
+
+    assert _sweep_budget(args, empty_space=False) == Budget()
+
+
+def test_the_sweep_budget_carries_the_trials_timeout_and_parallelism() -> None:
+    """The reporter's budget is built from the requested trial count and flags."""
+    args = SimpleNamespace(n_trials=5, sweep_timeout=600.0, n_jobs=4)
+
+    assert _sweep_budget(args, empty_space=False) == Budget(
+        n_trials=5, timeout=600.0, parallel=True
+    )
+
+
+def test_an_empty_effective_space_budgets_a_single_trial() -> None:
+    """A space the assessment emptied runs one trial, and the budget says so."""
+    args = SimpleNamespace(n_trials=None, sweep_timeout=None, n_jobs=1)
+
+    assert _sweep_budget(args, empty_space=True) == Budget(n_trials=1)
+
+
 def test_the_header_names_the_configured_speculative_setup(tmp_path: Path, model: str) -> None:
     """A configured setup is named with its method and draft source."""
     draft = tmp_path / "draft"
@@ -1806,3 +1831,47 @@ def test_a_usage_error_is_reported_on_the_injected_stderr() -> None:
 
     assert code == 2
     assert "unrecognized arguments" in err.getvalue()
+
+
+def test_both_output_modes_wire_the_trial_start_hook(
+    tmp_path: Path, model: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log and TUI reporters both measure a trial from its start."""
+    import llm_config_optimization.cli as cli
+
+    space = _write_space(tmp_path / "space.yaml")
+    hooks: list[object] = []
+    real_optimize = cli.optimize
+
+    def recording_optimize(*args: object, **kwargs: object) -> object:
+        hooks.append(kwargs.get("on_trial_start"))
+        return real_optimize(*args, **kwargs)
+
+    monkeypatch.setattr("llm_config_optimization.cli.optimize", recording_optimize)
+
+    log_out, log_err = StringIO(), StringIO()
+    assert (
+        main(
+            [model, str(space), "vllm", "--target", "cpu", "--n-trials", "1", "--output", "log"],
+            backend=_backend(),
+            client=FakePodmanClient(),
+            stdout=log_out,
+            stderr=log_err,
+        )
+        == 0
+    )
+
+    tui_out, tui_err = TtyStringIO(), StringIO()
+    assert (
+        main(
+            [model, str(space), "vllm", "--target", "cpu", "--n-trials", "1", "--output", "tui"],
+            backend=_backend(),
+            client=FakePodmanClient(),
+            stdout=tui_out,
+            stderr=tui_err,
+        )
+        == 0
+    )
+
+    assert len(hooks) == 2
+    assert all(callable(hook) for hook in hooks)

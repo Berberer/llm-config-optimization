@@ -357,16 +357,21 @@ trial and again when it finishes. In the default multi mode it is a
 prefill-versus-decode scatter of this run's trials with the study's Pareto
 front highlighted, and the status line reports the best rate reached in each
 phase. The scalar weighted and combined modes keep the historical best-so-far
-line with the raw per-trial points. The running frame's status line marks the
-trial as in flight, so a long trial is visibly running rather than frozen:
+line with the raw per-trial points. The status line ends with one time group —
+`avg trial`, `elapsed`, and the budget's `eta` — after the mode-specific
+fields. The running frame's status line marks the trial as in flight, so a long
+trial is visibly running rather than frozen:
 
 ```
-trials 3/10 | failed 0% | running trial 3 | best prefill 1234.56 tps  decode 45.67 tps | avg trial 12.3s | (36.9s)
+trials 3/10 | failed 0% | running trial 4 | best prefill 1234.56 tps  decode 45.67 tps | avg trial 12s | elapsed 37s | eta 1m 24s
 ```
 
 `running trial` appears only while a trial is in flight, and `avg trial` — the
-mean seconds per successful trial, with failed trials excluded — only after the
-first success, so the remaining budget can be estimated. The graph's axes are
+mean wall-clock seconds per successful trial, with failed trials excluded — only
+after the first success, so the remaining budget can be estimated. Durations
+are humanized: `avg trial`, `elapsed`, and `eta` share one at-most-two-unit
+format rounded to the nearest second (`0s`, `42s`, `2m 10s`, `1h 5m`), so the
+columns read as one group instead of three styles. The graph's axes are
 labelled with thousands-separated plain numbers (never scientific notation) and
 its x-axis with integer trial numbers, thinned to an even step once a sweep
 grows past ten trials.
@@ -376,7 +381,7 @@ a redirected log stays easy to parse. A multi-mode line names the trial's two
 rates, and its best column reports the highest rate reached in each phase:
 
 ```
-trial 3/10 | COMPLETE | prefill 1234.56 tps  decode 45.67 tps | failed 0% | best prefill 1234.56 tps  decode 45.67 tps | (36.9s)
+trial 3/10 | COMPLETE | prefill 1234.56 tps  decode 45.67 tps | failed 0% | best prefill 1234.56 tps  decode 45.67 tps | elapsed 37s | eta 1m 24s
 ```
 
 A scalar line keeps the historical objective value and appends the measured
@@ -384,7 +389,7 @@ phase pair when the engine reported both, so the phase split is visible without
 changing the familiar shape:
 
 ```
-trial 3/10 | COMPLETE | 42.00 tps  prefill 1234.56 tps  decode 45.67 tps | failed 0% | best 42.00 | (36.9s)
+trial 3/10 | COMPLETE | 42.00 tps  prefill 1234.56 tps  decode 45.67 tps | failed 0% | best 42.00 | elapsed 37s | eta 1m 24s
 ```
 
 A failed trial replaces the value and phase columns with the error message the
@@ -392,8 +397,12 @@ optimizer recorded, collapsed to one line, so one bad configuration is visible
 without ending the sweep:
 
 ```
-trial 3/10 | FAIL | container exited with code 1 | failed 33% | best 42.00 | (36.9s)
+trial 3/10 | FAIL | container exited with code 1 | failed 33% | best 42.00 | elapsed 37s | eta 1m 24s
 ```
+
+Every finished-trial line — including a failed one — ends with the same
+`elapsed` and `eta` segments, so a redirected log records the projection trial
+by trial; `eta` is simply absent from any line whose budget cannot project one.
 
 Both live modes join their top-level fields with ` | ` so the fields stay
 distinct; inner pairs such as the `prefill …  decode …` rates keep their
@@ -406,6 +415,33 @@ counts only `FAIL` trials; pruned trials and individual failed benchmark runs
 are different signals and are not counted. Percentages are whole numbers, and a
 nonzero rate that would round to zero is shown as `<1%` rather than `0%`, so a
 small but real failure rate is never hidden.
+
+The `avg trial`, `elapsed`, and `eta` segments are the live sweep's time group,
+and `elapsed` then `eta` are always the last two segments, so past and remaining
+time can be compared directly. `eta` is the budget's projection of how much
+longer the sweep will run:
+
+- With only `--sweep-timeout`, it is the time left until the deadline and is
+  shown from the first frame, because the deadline is already known.
+- With only `--n-trials`, it extrapolates the remaining trials from the observed
+  mean duration of successful trials: `(n_trials - finished) × mean`. It is
+  absent until the first success gives it a basis, because there is nothing to
+  extrapolate from yet.
+- With both, the sweep stops at whichever binds first, so the estimate is the
+  smaller of the deadline remainder and the trial extrapolation; until the
+  first success gives the trial term a basis there is no estimate at all, even
+  though the deadline is already known.
+- With neither, no estimate is shown.
+
+The mean is exactly the one the `avg trial` column shows, counts only
+successful trials, and covers only the trials finished in this invocation, so a
+resumed study builds a fresh mean from its own successes rather than counting an
+earlier run. Trials running in parallel overlap, so `--n-jobs` greater than one
+suppresses the trial-based term — every remaining trial would otherwise be
+counted as if it ran alone — and only a deadline can produce an estimate there.
+The estimate is clamped at `0s`: Optuna checks the deadline between trials, so
+the last trial may run past it, and the TUI's `running trial` marker shows why
+the sweep is still alive.
 
 The sweep's final summary always prints the recommended configuration as the
 three-domain YAML document, whichever `--output-format` was chosen, so an
@@ -420,8 +456,10 @@ trial's recorded combined throughput, and the recommended row marked — so the
 whole trade-off can be compared at a glance.
 
 With `--n-jobs` greater than one the reporters are driven from several worker
-threads; they are not thread-safe, so frames and lines can interleave. Use log
-mode with a single job when a clean record matters.
+threads; they are not thread-safe, so frames and lines can interleave. The
+trial-based estimate is suppressed in that mode because overlapping trials make
+the mean duration useless for extrapolation, so only a `--sweep-timeout` still
+produces an `eta`. Use log mode with a single job when a clean record matters.
 
 ## Exit codes
 

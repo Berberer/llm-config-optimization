@@ -79,6 +79,7 @@ from ..search_space import (
     load_experiment_space,
     validate_space,
 )
+from ._budget import Budget
 from .arguments import parse_args
 from .config import build_base_config, resolve_objective
 from .download import download_model
@@ -390,15 +391,15 @@ def _sweep(
             benchmark_client=benchmark_client,
             err=err,
         )
-        n_trials = 1 if empty_space else args.n_trials
-        reporter = _make_reporter(mode, n_trials, out, objective_mode=objective_mode)
+        budget = _sweep_budget(args, empty_space)
+        reporter = _make_reporter(mode, budget, out, objective_mode=objective_mode)
         print("preparing study", file=out)
         reporter.start()
         result = optimize(
             space,
             base,
-            n_trials=n_trials,
-            timeout=args.sweep_timeout,
+            n_trials=budget.n_trials,
+            timeout=budget.timeout,
             seed=args.sampler_seed,
             mode=objective_mode,
             weights=objective_weights,
@@ -409,7 +410,7 @@ def _sweep(
             benchmark_client=benchmark_client,
             n_jobs=args.n_jobs,
             callback=reporter,
-            on_trial_start=reporter.trial_started if isinstance(reporter, TuiReporter) else None,
+            on_trial_start=reporter.trial_started,
         )
     except _CliFailure as failure:
         print(failure, file=err)
@@ -742,9 +743,26 @@ def _pull_image(
     return image
 
 
+def _sweep_budget(args: argparse.Namespace, empty_space: bool) -> Budget:
+    """Build the sweep's budget from the arguments and the effective space.
+
+    The trial count is the requested one, except that an effective space with
+    no dimensions runs a single trial at engine defaults. The timeout is the
+    wall-clock limit, and a job count above one marks the sweep parallel so the
+    trial-based estimate is suppressed. The budget is the single source for
+    both the reporter and the optimizer, so they cannot disagree about the
+    effective trial count.
+    """
+    return Budget(
+        n_trials=1 if empty_space else args.n_trials,
+        timeout=args.sweep_timeout,
+        parallel=args.n_jobs > 1,
+    )
+
+
 def _make_reporter(
     mode: str,
-    n_trials: int | None,
+    budget: Budget,
     out: TextIO,
     *,
     objective_mode: ObjectiveMode,
@@ -755,13 +773,14 @@ def _make_reporter(
     prefill-versus-decode scatter or the historical best-so-far line — before
     the first frame, when its argument-less trial-start hook has no study to
     read. The log reporter infers the mode from the study on every line.
-    ``n_trials`` is the sweep's effective budget — the requested count, or one
-    trial when the assessment left no dimensions — so the progress column
-    matches the trials that actually run.
+    ``budget`` is the sweep's effective budget — the requested trial count or
+    one trial when the assessment left no dimensions, the sweep timeout, and
+    whether trials overlap — so the progress column matches the trials that
+    actually run.
     """
     if mode == "tui":
-        return TuiReporter(n_trials=n_trials, mode=objective_mode, stream=out)
-    return LogReporter(n_trials=n_trials, stream=out)
+        return TuiReporter(budget=budget, mode=objective_mode, stream=out)
+    return LogReporter(budget=budget, stream=out)
 
 
 def _default_study_name(model: str, mode: ObjectiveMode) -> str:

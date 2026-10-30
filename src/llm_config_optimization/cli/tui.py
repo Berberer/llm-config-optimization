@@ -22,14 +22,28 @@ A failed trial contributes no raw point in either view but still counts toward
 the trial budget, so the scalar best-so-far line spans the gap and the scatter
 simply has one fewer point. A status line under the graph repeats the headline
 numbers — trial count against the budget, the share of finished trials that
-failed, the best value or the two best phase rates, mean seconds per successful
-trial, and elapsed time — so they can be read without parsing the plot. The
-failure share counts only the trials finished in this invocation, so a resumed
-study's earlier failures do not distort the current run's health; it is omitted
-entirely while no trial has finished. Its top-level segments are separated by
-the shared live separator ``" | "``, while the phase-rate pair inside the best
-segment keeps its internal double-space separation. The average is omitted
-until a trial succeeds, and failed trials do not contribute to it.
+failed, the best value or the two best phase rates, mean duration of a successful
+trial, the sweep's elapsed time, and the budget's estimate of the remaining time
+— so they can be read without parsing the plot. All duration columns use the
+shared duration format (``0s``, ``42s``, ``2m 10s``, ``1h 5m``), so the time
+information reads as one group, with ``elapsed`` and ``eta`` as its last two
+segments so past and remaining time are compared directly. The failure share
+counts only the trials finished in this invocation, so a resumed study's
+earlier failures do not distort the current run's health; it is omitted entirely
+while no trial has finished. Its top-level segments are separated by the shared
+live separator ``" | "``, while the phase-rate pair inside the best segment
+keeps its internal double-space separation. The average is omitted until a
+trial succeeds, and failed trials do not contribute to it.
+
+The ``eta`` segment is absent when the budget cannot project one: an unbounded
+sweep, a trial-count budget with no successful trial of this invocation to
+average, or a parallel sweep without a timeout. A timeout-only budget shows it
+from the first frame — including the running frame drawn before any trial has
+finished — because the deadline is already known. The projection uses the mean
+duration of this invocation's successful trials, the same basis ``avg trial``
+shows, so the two time columns cannot disagree. A deadline that has passed while
+the last trial is still running reads ``0s``, and the running-trial marker
+explains why the sweep is still alive.
 
 A frame is drawn at the start of each trial as well as when it finishes: the
 optimizer's trial-start hook calls :meth:`TuiReporter.trial_started`, which
@@ -61,7 +75,8 @@ from typing import TYPE_CHECKING, TextIO
 import plotext
 
 from ..optimization import ObjectiveMode
-from ._formatting import LIVE_SEPARATOR, failure_text
+from ._budget import Budget, TrialTimings
+from ._formatting import LIVE_SEPARATOR, duration_text, failure_text
 
 if TYPE_CHECKING:
     import optuna
@@ -108,10 +123,12 @@ class TuiReporter:
     study because the trial-start frame is drawn from the reporter's own state,
     before any study is seen, so the view must be known from the first frame.
 
-    ``n_trials`` is the sweep's trial budget and only shapes the status line's
-    progress column; ``None`` means an unbounded sweep and prints the count
-    alone. ``stream`` defaults to stdout, and ``clock`` to :func:`time.monotonic`
-    for a wall-clock duration that is immune to system clock changes.
+    ``budget`` carries the sweep's stop budgets; its trial count shapes the
+    status line's progress column and its projection supplies ``eta`` when one
+    is possible, while ``None`` means an unbounded sweep, which prints the count
+    alone and shows no estimate. ``stream`` defaults to stdout, and ``clock`` to
+    :func:`time.monotonic` for a wall-clock duration that is immune to system
+    clock changes.
 
     The graph is drawn with plotext's process-wide figure, which is cleared
     before every frame, so a second concurrent writer would race with it. With
@@ -123,22 +140,21 @@ class TuiReporter:
     def __init__(
         self,
         *,
-        n_trials: int | None = None,
+        budget: Budget | None = None,
         mode: ObjectiveMode = ObjectiveMode.COMBINED,
         stream: TextIO | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._budget = n_trials
+        self._budget = Budget() if budget is None else budget
         self._multi = mode is ObjectiveMode.MULTI
         self._stream = sys.stdout if stream is None else stream
         self._clock = clock
         self._started_at = clock()
-        self._trial_started_at: float | None = None
+        self._timings = TrialTimings(clock)
         self._values: list[float | None] = []
         self._best: list[float | None] = []
         self._pairs: list[tuple[float, float] | None] = []
         self._front: list[tuple[float, float]] = []
-        self._durations: list[float] = []
 
     def start(self) -> None:
         """Reset the series and clock and announce that preparation is underway.
@@ -154,11 +170,11 @@ class TuiReporter:
         the first completed trial draws the graph.
         """
         self._started_at = self._clock()
+        self._timings.start()
         self._values.clear()
         self._best.clear()
         self._pairs.clear()
         self._front.clear()
-        self._durations.clear()
         print(_PREPARING_MESSAGE, file=self._stream)
 
     def trial_started(self) -> None:
@@ -174,14 +190,14 @@ class TuiReporter:
         and best rates cached by the last completed trial are redrawn, since
         this hook receives no study to read them from.
         """
-        self._trial_started_at = self._clock()
+        self._timings.trial_started()
         if self._multi:
             print(
                 self._frame(
                     pairs=self._pairs,
                     front=self._front,
                     rates=_front_rates(self._front),
-                    durations=self._durations,
+                    average=self._timings.mean(successful=False),
                     running=len(self._pairs) + 1,
                 ),
                 file=self._stream,
@@ -191,7 +207,7 @@ class TuiReporter:
             self._frame(
                 self._values,
                 self._best,
-                durations=self._durations,
+                average=self._timings.mean(successful=False),
                 running=len(self._values) + 1,
             ),
             file=self._stream,
@@ -208,18 +224,18 @@ class TuiReporter:
         the best rates are read from the study, so a resumed sweep shows the
         front it already had. The reporter's own series are untouched.
         """
-        durations = self._durations_for(trial)
+        average = self._timings.mean(successful=trial.values is not None)
         if self._multi:
             front = _front_points(study)
             return self._frame(
                 pairs=[*self._pairs, _trial_pair(trial)],
                 front=front,
                 rates=_front_rates(front),
-                durations=durations,
+                average=average,
             )
         values = [*self._values, trial.value]
         best = [*self._best, _best_value(study)]
-        return self._frame(values, best, durations=durations)
+        return self._frame(values, best, average=average)
 
     def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
         """Print the trial's frame and record it as the next point."""
@@ -230,29 +246,7 @@ class TuiReporter:
         else:
             self._values.append(trial.value)
             self._best.append(_best_value(study))
-        if trial.values is not None:
-            self._durations.append(self._trial_duration())
-
-    def _durations_for(self, trial: optuna.trial.FrozenTrial) -> list[float]:
-        """Return the successful durations as they stand once ``trial`` completes.
-
-        A successful trial's own duration is measured from its start, so the
-        frame that reports it already includes it; a failed trial contributes
-        nothing and the average stays over the earlier successes only.
-        """
-        if trial.values is None:
-            return list(self._durations)
-        return [*self._durations, self._trial_duration()]
-
-    def _trial_duration(self) -> float:
-        """Return the in-flight trial's seconds so far.
-
-        The start is the one recorded by :meth:`trial_started`; when the
-        reporter is driven without it (as the string-producer tests do), the
-        reporter's own start time stands in so the average stays defined.
-        """
-        started_at = self._started_at if self._trial_started_at is None else self._trial_started_at
-        return self._clock() - started_at
+        self._timings.record(successful=trial.values is not None)
 
     def _frame(
         self,
@@ -262,7 +256,7 @@ class TuiReporter:
         pairs: Sequence[tuple[float, float] | None] = (),
         front: Sequence[tuple[float, float]] = (),
         rates: tuple[float, float] | None = None,
-        durations: Sequence[float] = (),
+        average: float | None = None,
         running: int | None = None,
     ) -> str:
         """Build the graph for the mode's series, followed by the status line.
@@ -275,11 +269,11 @@ class TuiReporter:
         prefill-versus-decode series and ``front`` the study's Pareto front,
         connected as the trade-off line and drawn against the two rate axes.
         An all-failed (or empty) sweep has nothing to plot, so only the axes
-        are drawn. ``durations`` are the successful trials' seconds, averaged
-        into the status line, and ``running`` is the trial in flight for a
-        running frame, or ``None`` once it has finished. The failure share is
-        derived from the ``None`` entries in the mode's own series, so it counts
-        the trials finished in this invocation, including the one being
+        are drawn. ``average`` is the mean seconds of the successful trials, or
+        ``None`` until one has completed, and ``running`` is the trial in flight
+        for a running frame, or ``None`` once it has finished. The failure share
+        is derived from the ``None`` entries in the mode's own series, so it
+        counts the trials finished in this invocation, including the one being
         rendered.
         """
         figure = plotext.figure
@@ -332,7 +326,6 @@ class TuiReporter:
             positions, labels = _axis_ticks(x_values) if self._multi else _x_ticks(len(values))
             figure.ruler(0, 0).ticks(positions, labels)
         graph = figure.build().string(colorless=True)
-        average = sum(durations) / len(durations) if durations else None
         return (
             f"{graph}\n"
             f"{self._status(completed, failed=failed, best_text=best_text, running=running, average=average)}"
@@ -347,21 +340,28 @@ class TuiReporter:
         running: int | None = None,
         average: float | None = None,
     ) -> str:
-        """Render the line under the graph: count, failure share, best, average, and elapsed.
+        """Render the line under the graph: count, failure share, best, and the time group.
 
         ``best_text`` is already formatted for the mode — one value in the
         scalar view, both phase rates in the multi view — and ``running`` is the
         trial currently in flight, or ``None`` once it has finished;
         ``average`` is the mean seconds per successful trial, or ``None`` until
-        one has completed. ``failed`` is the number of failed trials among the
-        ``completed`` finished in this invocation, and is omitted along with the
-        failure segment while nothing has finished. Top-level segments are
-        joined by the shared live separator, and the running and average
-        segments are omitted when their field has no value. The running frame
-        and the completion frame share this format and differ only by those
-        fields.
+        one has completed. Both ``average`` and the elapsed time are rendered
+        through the shared duration format, so the time columns share one
+        rounding rule. The budget projects the ``completed`` count and that
+        average into an ``eta`` segment appended after ``elapsed``, omitted when
+        the projection is unknown; a trial-count budget with no successful trial
+        yet therefore has no estimate at all, while a parallel sweep shows only
+        a deadline estimate. ``failed`` is
+        the number of failed trials among the ``completed`` finished in this
+        invocation, and is omitted along with the failure segment while nothing
+        has finished. Top-level segments are joined by the shared live
+        separator, and the running and average segments are omitted when their
+        field has no value. The running frame and the completion frame share
+        this format and differ only by those fields.
         """
-        progress = f"{completed}/{self._budget}" if self._budget is not None else str(completed)
+        n_trials = self._budget.n_trials
+        progress = f"{completed}/{n_trials}" if n_trials is not None else str(completed)
         segments = [f"trials {progress}"]
         failure = failure_text(failed, completed)
         if failure is not None:
@@ -370,8 +370,12 @@ class TuiReporter:
             segments.append(f"running trial {running}")
         segments.append(f"best {best_text}")
         if average is not None:
-            segments.append(f"avg trial {average:.1f}s")
-        segments.append(f"({self._elapsed():.1f}s)")
+            segments.append(f"avg trial {duration_text(average)}")
+        elapsed = self._elapsed()
+        segments.append(f"elapsed {duration_text(elapsed)}")
+        remaining = self._budget.remaining_seconds(completed, mean=average, elapsed=elapsed)
+        if remaining is not None:
+            segments.append(f"eta {duration_text(remaining)}")
         return LIVE_SEPARATOR.join(segments)
 
     def _elapsed(self) -> float:

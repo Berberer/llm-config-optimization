@@ -10,7 +10,10 @@ tests in `tests/`.
 
 The code is layered so engine and runtime details stay at the edges. Packages
 live under `src/llm_config_optimization/`; each exposes its public surface through its
-`__init__.py`, so import from the package, not from a private `_module`.
+`__init__.py`, so import from the package, not from a private `_module`. That rule
+governs imports between packages and layers; a test may import the module it
+exercises directly (`cli._budget`, `cli._formatting`), and takes names defined in
+the package's own `__init__.py` — such as `_sweep_budget` — from the package.
 
 | Package         | Owns                                                                                                 | Key files |
 | --------------- | ---------------------------------------------------------------------------------------------------- | --------- |
@@ -19,7 +22,7 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
 | `runtime/`      | Backend-agnostic container types, the detached start/stop lifecycle, the Podman client, and the SELinux probe | `types.py`, `_podman.py`, `_selinux.py` |
 | `optimization/` | The engine-neutral objective model plus the Optuna adapter: maps spec kinds to suggestions, scores trials, drives a study, and guards study provenance | `types.py`, `_optuna.py` |
 | `output/`       | Engine-neutral winning-configuration writers: the historical YAML experiment document, the Podman quadlet, and the Docker/Podman Compose file, plus the pure-renderer contract and the format registry | `types.py`, `_yaml.py`, `_quadlet.py`, `_compose.py`, `_registry.py` |
-| `cli/`          | Composition root: argument parsing, the engine registry, base-config construction, model download progress, log/TUI reporters, summary and output-writer selection, exit codes | `arguments.py`, `config.py`, `download.py`, `_formatting.py`, `log.py`, `tui.py`, `summary.py`, `__init__.py` |
+| `cli/`          | Composition root: argument parsing, the engine registry, base-config construction, model download progress, the sweep budget and its remaining-time estimate, log/TUI reporters, summary and output-writer selection, exit codes | `arguments.py`, `config.py`, `download.py`, `_formatting.py`, `_budget.py`, `log.py`, `tui.py`, `summary.py`, `__init__.py` |
 
 ### Invariants
 

@@ -9,19 +9,28 @@ line per finished trial, so a redirected log stays easy to parse.
 
 A scalar trial's line is::
 
-    trial <i>/<N> | <STATE> | <tps> tps  [prefill <p> tps  decode <d> tps ] | failed <pct>% | best <best> | (<elapsed>)
+    trial <i>/<N> | <STATE> | <tps> tps  [prefill <p> tps  decode <d> tps ] | failed <pct>% | best <best> | elapsed <elapsed> | eta <eta>
 
 where ``<i>`` counts the trials finished in this invocation, ``<N>`` is the
 trial budget and is omitted when the sweep is unbounded, ``<STATE>`` is the
 trial's terminal state, ``<tps>`` is the objective value the trial submitted,
 ``<pct>`` is the share of this invocation's finished trials that failed,
 ``<best>`` is the best objective value the study holds so far (``n/a`` until a
-trial completes), and ``<elapsed>`` is the wall-clock time since the reporter
-started. Top-level segments are separated by the shared live separator
-``" | "``; the phase rates are the engine-reported prefill and decode
+trial completes), ``<elapsed>`` is the wall-clock time since the reporter
+started, rendered by the shared duration format (``0s``, ``42s``, ``2m 10s``,
+``1h 5m``), and ``<eta>`` is the budget's projection of the sweep's remaining
+time in the same format. Top-level segments are separated by the shared live
+separator ``" | "``; the phase rates are the engine-reported prefill and decode
 tokens-per-second the optimizer recorded on the trial and form one segment when
 the engine reported both, keeping their internal double-space separation. They
 are omitted — keeping the historical outcome — when only one was reported.
+
+The ``eta`` segment is absent when the budget cannot project one: an unbounded
+sweep, a trial-count budget with no successful trial of this invocation to
+average, or a parallel sweep without a timeout. A timeout-only budget shows it
+from the first line, because the deadline is already known. The projection uses
+the mean duration of this invocation's successful trials — the same basis the
+TUI reports as ``avg trial`` — so the two modes cannot disagree.
 
 The failure rate counts the trials whose terminal state is ``FAIL`` and only
 those finished in this invocation, so a resumed study does not report an
@@ -34,17 +43,19 @@ A multi-objective study has no single objective value, so the line names the
 trial's two rates instead and its best column reports the highest rate reached
 in each phase::
 
-    trial <i>/<N> | <STATE> | prefill <p> tps  decode <d> tps | failed <pct>% | best prefill <bp> tps  decode <bd> tps | (<elapsed>)
+    trial <i>/<N> | <STATE> | prefill <p> tps  decode <d> tps | failed <pct>% | best prefill <bp> tps  decode <bd> tps | elapsed <elapsed> | eta <eta>
 
 A failed trial prints the message the optimizer recorded under the trial's
 ``error`` user attribute in place of the value and phase columns, so one bad
-configuration is visible without ending the sweep.
+configuration is visible without ending the sweep. Its time segments remain, so
+the sweep's progress information survives an error line.
 
 The elapsed time is read from an injectable clock and the line is written to an
 injectable stream, so the reporter is exercised in tests as a string producer
 without a terminal or real time. :meth:`LogReporter.render` returns the line
 without printing it, and calling the reporter is what writes it and advances the
-trial index.
+trial index. The estimate is computed in the render path from the trial's start
+instant and the budget's projection, so rendering stays side-effect free.
 """
 
 import sys
@@ -54,7 +65,8 @@ from typing import TextIO
 
 import optuna
 
-from llm_config_optimization.cli._formatting import LIVE_SEPARATOR, failure_text
+from llm_config_optimization.cli._budget import Budget, TrialTimings
+from llm_config_optimization.cli._formatting import LIVE_SEPARATOR, duration_text, failure_text
 
 __all__ = ["LogReporter"]
 
@@ -78,29 +90,35 @@ class LogReporter:
     it is passed straight through as ``callback``. It tracks three things across
     calls: the number of trials finished in this invocation, which numbers the
     lines, how many of those failed, which feeds the ``failed <pct>%`` segment,
-    and the start time used for the elapsed column. The best-so-far value is
-    read from the study on every line rather than remembered here — the best
-    objective in a scalar study, the highest rate of each phase in a
-    multi-objective one — so a resumed study reflects the best an earlier run
-    found.
+    and the successful trials' durations, which feed the budget's ``eta``
+    projection. The start time used for the ``elapsed`` segment comes from its
+    clock, and the durations are measured by a :class:`TrialTimings` over the
+    same clock so the TUI's ``avg trial`` column uses the same basis. The
+    best-so-far value is read from the study on every line rather than
+    remembered here — the best objective in a scalar study, the highest rate of
+    each phase in a multi-objective one — so a resumed study reflects the best
+    an earlier run found.
 
-    ``n_trials`` is the sweep's trial budget and only shapes the ``<i>/<N>``
-    progress column; ``None`` means an unbounded sweep and prints the index
-    alone. ``stream`` defaults to stdout, and ``clock`` to :func:`time.monotonic`
-    for a wall-clock duration that is immune to system clock changes.
+    ``budget`` carries the sweep's stop budgets; its trial count shapes the
+    ``<i>/<N>`` progress column and ``None`` means an unbounded sweep, which
+    prints the index alone, and its projection supplies ``eta`` when one is
+    possible. ``stream`` defaults to stdout, and ``clock`` to
+    :func:`time.monotonic` for a wall-clock duration that is immune to system
+    clock changes.
     """
 
     def __init__(
         self,
         *,
-        n_trials: int | None = None,
+        budget: Budget | None = None,
         stream: TextIO | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._budget = n_trials
+        self._budget = Budget() if budget is None else budget
         self._stream = sys.stdout if stream is None else stream
         self._clock = clock
         self._started_at = clock()
+        self._timings = TrialTimings(clock)
         self._completed = 0
         self._failed = 0
 
@@ -109,9 +127,21 @@ class LogReporter:
 
         The clock starts when the reporter is built; calling this after the
         preparation steps keeps the elapsed column measuring the sweep rather
-        than the setup that preceded it.
+        than the setup that preceded it. The trial timings restart too, so a
+        restart cannot replay an earlier sweep's mean or its in-flight start.
         """
         self._started_at = self._clock()
+        self._timings.start()
+
+    def trial_started(self) -> None:
+        """Record when the in-flight trial started, to time its completion.
+
+        The optimizer invokes this through its argument-less trial-start hook,
+        so the reporter measures the same start-to-finish duration the TUI does.
+        The hook adds no output and does not change the one-line-per-finished-
+        trial shape.
+        """
+        self._timings.trial_started()
 
     def render(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> str:
         """Return the line for ``trial`` without printing or advancing the index.
@@ -122,25 +152,33 @@ class LogReporter:
         """
         index = self._completed + 1
         failed = self._failed + (1 if _is_failed(trial) else 0)
-        progress = f"{index}/{self._budget}" if self._budget is not None else str(index)
+        n_trials = self._budget.n_trials
+        progress = f"{index}/{n_trials}" if n_trials is not None else str(index)
         rate = failure_text(failed, index) or "0%"
-        return LIVE_SEPARATOR.join(
-            (
-                f"trial {progress}",
-                trial.state.name,
-                _outcome(trial),
-                f"failed {rate}",
-                f"best {_best_text(study)}",
-                f"({self._elapsed():.1f}s)",
-            )
+        segments = [
+            f"trial {progress}",
+            trial.state.name,
+            _outcome(trial),
+            f"failed {rate}",
+            f"best {_best_text(study)}",
+            f"elapsed {duration_text(self._elapsed())}",
+        ]
+        remaining = self._budget.remaining_seconds(
+            index,
+            mean=self._timings.mean(successful=trial.values is not None),
+            elapsed=self._elapsed(),
         )
+        if remaining is not None:
+            segments.append(f"eta {duration_text(remaining)}")
+        return LIVE_SEPARATOR.join(segments)
 
     def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        """Print the trial's line and advance the index and failure count."""
+        """Print the trial's line and advance the index, failure, and duration counts."""
         print(self.render(study, trial), file=self._stream)
         self._completed += 1
         if _is_failed(trial):
             self._failed += 1
+        self._timings.record(successful=trial.values is not None)
 
     def _elapsed(self) -> float:
         """Return the seconds elapsed since the reporter's clock started."""
