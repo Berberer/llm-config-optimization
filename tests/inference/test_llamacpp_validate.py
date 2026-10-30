@@ -15,6 +15,7 @@ import pytest
 
 from llm_config_optimization.inference import (
     AttentionBackend,
+    CpuMoeMode,
     DetectedHardware,
     DType,
     GpuLayersMode,
@@ -31,6 +32,7 @@ from llm_config_optimization.search_space import (
     ExperimentSpace,
     Fixed,
     Interval,
+    Spec,
 )
 from llm_config_optimization.search_space.registry import SPECULATIVE_PARAMETERS
 
@@ -43,6 +45,7 @@ APPLICABLE = frozenset(
         "attention_backend",
         "prefix_caching",
         "n_gpu_layers",
+        "n_cpu_moe",
     }
 )
 """Exactly the tunables llama.cpp has a ``llama-server`` flag for."""
@@ -56,6 +59,7 @@ SUPPORTED_SPACE = ExperimentSpace(
         Dimension("attention_backend", Fixed(AttentionBackend.FLASH_ATTENTION)),
         Dimension("prefix_caching", Fixed(True)),
         Dimension("n_gpu_layers", Fixed(GpuLayersMode.AUTO)),
+        Dimension("n_cpu_moe", Categorical((0, 8, CpuMoeMode.ALL))),
     )
 )
 """A space whose every parameter and value llama.cpp supports."""
@@ -222,6 +226,23 @@ def test_supported_categorical_values_are_accepted() -> None:
     )
 
     assert list(validate(space(dimension))) == []
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        Fixed(0),
+        Fixed(8),
+        Fixed(CpuMoeMode.ALL),
+        Categorical((0, 8, CpuMoeMode.ALL)),
+        Interval(0, 8),
+        Default(),
+    ],
+    ids=["zero", "count", "all-mode", "mixed-categorical", "interval", "default"],
+)
+def test_every_cpu_expert_offload_spec_is_accepted(spec: Spec) -> None:
+    """Both union branches are forwardable, so every spec kind is supported."""
+    assert list(validate(space(Dimension("n_cpu_moe", spec)))) == []
 
 
 @pytest.mark.parametrize(

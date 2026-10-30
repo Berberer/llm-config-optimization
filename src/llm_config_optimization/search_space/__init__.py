@@ -27,6 +27,7 @@ from .types import (
     Fixed,
     Interval,
     ParameterValue,
+    SpaceAssessment,
     Spec,
 )
 from .validation import validate_space
@@ -42,6 +43,7 @@ __all__ = [
     "Interval",
     "ParameterKind",
     "ParameterValue",
+    "SpaceAssessment",
     "Spec",
     "UnionKind",
     "expected_kind",

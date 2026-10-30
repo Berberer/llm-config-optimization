@@ -84,6 +84,9 @@ TUNABLE_PARAMETERS: Mapping[str, str] = MappingProxyType(
         "num_speculative_tokens": "num_speculative_tokens",
         "prefix_caching": "prefix_caching",
         "n_gpu_layers": "n_gpu_layers",
+        "expert_parallel": "expert_parallel",
+        "all2all_backend": "all2all_backend",
+        "n_cpu_moe": "n_cpu_moe",
     }
 )
 """Which serving parameters a sweep may vary, and the ``LLMConfig`` field each fills.

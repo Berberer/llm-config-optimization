@@ -20,9 +20,10 @@ ignore.
 hardware target,
 validates the space against that target, builds the base configuration, resolves
 the model to a local directory, validates the model against that configuration,
-pulls the container image, and then calls the optimization adapter with the
-injected backend, client, and reporter. Nothing about the study itself is
-duplicated here.
+asks the backend to assess the space against the resolved model, pulls the
+container image, and then calls the optimization adapter with the injected
+backend, client, and reporter. Nothing about the study itself is duplicated
+here.
 
 Exit codes are distinct so scripts can react to each outcome: ``0`` success,
 ``2`` a usage error (including an explicit TUI request without a terminal),
@@ -356,9 +357,11 @@ def _sweep(
     The base configuration and the objective were already resolved and
     validated by :func:`_run`; the preparation steps run in order and announce
     themselves, and the sweep is driven through the optimizer with the chosen
-    reporter and objective. Every outcome the plan assigns an exit code to is
-    mapped here; anything else propagates to :func:`main` as an unexpected
-    error.
+    reporter and objective. The declared space is replaced by the backend's
+    model-aware assessment, and a space the assessment leaves empty runs a
+    single trial at engine defaults instead of repeating one configuration.
+    Every outcome the plan assigns an exit code to is mapped here; anything else
+    propagates to :func:`main` as an unexpected error.
     """
     try:
         space = _load_space(args.space, resolved_backend, base.llm, out)
@@ -370,6 +373,13 @@ def _sweep(
             draft = _prefetch_draft(base.llm.draft_model, resolved_backend, out)
             base = replace(base, llm=replace(base.llm, resolved_draft_path=draft))
         _check_model(base, model, resolved_backend, out)
+        space = _assess_space(space, base, resolved_backend, hardware, model, out)
+        empty_space = not space.dimensions
+        if empty_space:
+            print(
+                "effective search space is empty; running a single trial at engine defaults",
+                file=out,
+            )
         _warn_speculation_without_dataset(base, err)
         image = _pull_image(args, hardware.target, resolved_backend, client, out)
         base = _with_dataset_request_tokens(
@@ -380,13 +390,14 @@ def _sweep(
             benchmark_client=benchmark_client,
             err=err,
         )
-        reporter = _make_reporter(mode, args, out, objective_mode=objective_mode)
+        n_trials = 1 if empty_space else args.n_trials
+        reporter = _make_reporter(mode, n_trials, out, objective_mode=objective_mode)
         print("preparing study", file=out)
         reporter.start()
         result = optimize(
             space,
             base,
-            n_trials=args.n_trials,
+            n_trials=n_trials,
             timeout=args.sweep_timeout,
             seed=args.sampler_seed,
             mode=objective_mode,
@@ -558,6 +569,36 @@ def _check_model(
     raise _CliFailure(f"unsupported configuration:\n{detail}", _EXIT_UNSUPPORTED)
 
 
+def _assess_space(
+    space: ExperimentSpace,
+    experiment: ExperimentConfig,
+    backend: InferenceBackend,
+    hardware: DetectedHardware,
+    model: Path,
+    out: TextIO,
+) -> ExperimentSpace:
+    """Replace the declared space with the one the resolved model makes meaningful.
+
+    The backend owns the pruning rules, because each depends on its engine's
+    vocabulary and checkpoint format; this step only asks for the assessment,
+    prints every note so a dropped or narrowed dimension is never silent, and
+    returns the effective space the sweep runs. Problems pruning cannot fix are
+    aggregated under the same "unsupported configuration" headline as the other
+    validation steps, so a model-aware mismatch takes the unsupported exit code
+    before the image is pulled. The assessment runs after
+    :func:`_check_model`, so a checkpoint-format or base-configuration error
+    still fails for its own reason first.
+    """
+    print("assessing search space against the resolved model", file=out)
+    assessment = backend.assess_space(space, experiment, hardware, model)
+    for note in assessment.notes:
+        print(note, file=out)
+    if assessment.problems:
+        detail = "\n".join(f"  - {problem}" for problem in assessment.problems)
+        raise _CliFailure(f"unsupported configuration:\n{detail}", _EXIT_UNSUPPORTED)
+    return assessment.space
+
+
 def _detect_hardware(args: argparse.Namespace, out: TextIO) -> DetectedHardware:
     """Resolve the host's accelerator target and device count, honouring ``--target``."""
     print("detecting hardware target", file=out)
@@ -703,7 +744,7 @@ def _pull_image(
 
 def _make_reporter(
     mode: str,
-    args: argparse.Namespace,
+    n_trials: int | None,
     out: TextIO,
     *,
     objective_mode: ObjectiveMode,
@@ -714,10 +755,13 @@ def _make_reporter(
     prefill-versus-decode scatter or the historical best-so-far line — before
     the first frame, when its argument-less trial-start hook has no study to
     read. The log reporter infers the mode from the study on every line.
+    ``n_trials`` is the sweep's effective budget — the requested count, or one
+    trial when the assessment left no dimensions — so the progress column
+    matches the trials that actually run.
     """
     if mode == "tui":
-        return TuiReporter(n_trials=args.n_trials, mode=objective_mode, stream=out)
-    return LogReporter(n_trials=args.n_trials, stream=out)
+        return TuiReporter(n_trials=n_trials, mode=objective_mode, stream=out)
+    return LogReporter(n_trials=n_trials, stream=out)
 
 
 def _default_study_name(model: str, mode: ObjectiveMode) -> str:

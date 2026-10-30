@@ -79,6 +79,9 @@ llm:
   num_speculative_tokens: null
   prefix_caching: null
   n_gpu_layers: null
+  expert_parallel: null
+  all2all_backend: null
+  n_cpu_moe: null
   resolved_draft_path: null
 """
 """The document consumers already know; the move must not change a byte of it."""

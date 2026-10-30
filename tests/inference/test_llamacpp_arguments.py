@@ -14,6 +14,7 @@ import pytest
 
 from llm_config_optimization.inference import (
     AttentionBackend,
+    CpuMoeMode,
     DType,
     ExperimentError,
     GpuLayersMode,
@@ -31,7 +32,14 @@ from llm_config_optimization.inference._llamacpp import (
 from llm_config_optimization.search_space.registry import TUNABLE_PARAMETERS
 
 _INAPPLICABLE_TUNABLES = frozenset(
-    {"dtype", "tensor_parallel_size", "max_num_active_seqs", "max_num_scheduled_tokens"}
+    {
+        "dtype",
+        "tensor_parallel_size",
+        "max_num_active_seqs",
+        "max_num_scheduled_tokens",
+        "expert_parallel",
+        "all2all_backend",
+    }
 )
 """The registry's tunables llama.cpp has no ``llama-server`` flag for."""
 
@@ -45,16 +53,19 @@ _INAPPLICABLE_FIELDS = frozenset(
         "max_num_scheduled_tokens",
         "seed",
         "resolved_draft_path",
+        "expert_parallel",
+        "all2all_backend",
     }
 )
 """The :class:`LLMConfig` fields this backend has no ``llama-server`` target for.
 
 ``dtype`` is carried by the GGUF weights and ``quantization`` by the file's
 metadata, tensor parallelism, the VRAM fraction, and the scheduling caps are
-vLLM-only knobs, and the sampling seed is not forwarded because the host client
-measures with greedy decoding. ``resolved_draft_path`` is a host-side resolution
-artifact that an engine never receives; the speculative settings reach the
-engine through their ``--spec-*`` flags.
+vLLM-only knobs, the MoE expert-parallelism fields are vLLM's MoE counterpart,
+and the sampling seed is not forwarded because the host client measures with
+greedy decoding. ``resolved_draft_path`` is a host-side resolution artifact that
+an engine never receives; the speculative settings reach the engine through
+their ``--spec-*`` flags.
 """
 
 
@@ -96,6 +107,8 @@ def test_every_llm_config_field_is_classified_as_mapped_or_inapplicable() -> Non
         (LLMConfig(n_gpu_layers=GpuLayersMode.ALL), ["--n-gpu-layers", "all"]),
         (LLMConfig(n_gpu_layers=0), ["--n-gpu-layers", "0"]),
         (LLMConfig(n_gpu_layers=40), ["--n-gpu-layers", "40"]),
+        (LLMConfig(n_cpu_moe=0), ["--n-cpu-moe", "0"]),
+        (LLMConfig(n_cpu_moe=8), ["--n-cpu-moe", "8"]),
     ],
 )
 def test_each_tunable_maps_to_its_server_flags(config: LLMConfig, expected: list[str]) -> None:
@@ -154,6 +167,15 @@ def test_an_unset_n_gpu_layers_emits_no_flag() -> None:
     assert serve_arguments(LLMConfig(n_gpu_layers=None)) == []
 
 
+def test_the_all_cpu_moe_mode_emits_the_value_less_flag() -> None:
+    """``all`` is a flag of its own, never ``--n-cpu-moe all``."""
+    assert serve_arguments(LLMConfig(n_cpu_moe=CpuMoeMode.ALL)) == ["--cpu-moe"]
+
+
+def test_an_unset_n_cpu_moe_emits_no_flag() -> None:
+    assert serve_arguments(LLMConfig(n_cpu_moe=None)) == []
+
+
 @pytest.mark.parametrize(
     ("config", "field"),
     [
@@ -201,6 +223,7 @@ def test_every_supported_value_has_a_map_entry_and_no_unsupported_one_does() -> 
         SpeculativeMode.ENABLED: "enabled",
         SpeculativeMode.DISABLED: "disabled",
     }
+    assert VALUE_MAPS["n_cpu_moe"] == {CpuMoeMode.ALL: "all"}
 
 
 @pytest.mark.parametrize(
@@ -311,6 +334,7 @@ def test_all_tunables_assemble_in_the_declared_order() -> None:
         draft_model="org/draft.gguf",
         speculative_mode=SpeculativeMode.ENABLED,
         num_speculative_tokens=3,
+        n_cpu_moe=16,
     )
 
     assert serve_arguments(config) == [
@@ -334,6 +358,8 @@ def test_all_tunables_assemble_in_the_declared_order() -> None:
         "org/draft.gguf",
         "--spec-draft-n-max",
         "3",
+        "--n-cpu-moe",
+        "16",
     ]
 
 

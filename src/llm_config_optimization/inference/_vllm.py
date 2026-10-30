@@ -36,18 +36,24 @@ from ..search_space.types import (
     ExperimentSpace,
     Fixed,
     Interval,
+    ParameterValue,
+    SpaceAssessment,
     Spec,
 )
 from ._benchmark import _METRICS_AFTER_KEY, _METRICS_BEFORE_KEY, _METRICS_KEY
 from ._tunables import (
     Gate,
     Toggle,
+    ValueNarrowing,
     declared_values,
+    narrow_values,
+    prune_dimensions,
     toggle_arguments,
     translate_value,
     unsupported_values,
 )
 from .types import (
+    All2AllBackend,
     AttentionBackend,
     BenchmarkOutcome,
     DetectedHardware,
@@ -122,6 +128,10 @@ PARAMETER_TARGETS: Mapping[str, ParameterTarget] = MappingProxyType(
         "prefix_caching": Toggle(
             enabled="--enable-prefix-caching", disabled="--no-enable-prefix-caching"
         ),
+        "expert_parallel": Toggle(
+            enabled="--enable-expert-parallel", disabled="--no-enable-expert-parallel"
+        ),
+        "all2all_backend": FlatFlag(),
     }
 )
 """Where each :class:`LLMConfig` field is sent on the vLLM command line.
@@ -169,6 +179,10 @@ VALUE_MAPS: Mapping[str, Mapping[object, str]] = MappingProxyType(
         "speculative_mode": {
             SpeculativeMode.ENABLED: "enabled",
             SpeculativeMode.DISABLED: "disabled",
+        },
+        "all2all_backend": {
+            All2AllBackend.ALLGATHER_REDUCESCATTER: "allgather_reducescatter",
+            All2AllBackend.NAIVE: "naive",
         },
     }
 )
@@ -824,15 +838,18 @@ def _numeric_range(spec: Spec) -> tuple[int, int] | None:
 
 
 def _validate_float_cache_dtype(space: ExperimentSpace) -> list[str]:
-    """Report an explicit float KV cache that cannot be proved to match the model dtype.
+    """Report an explicit float KV cache that no checkpoint fact could reconcile.
 
     vLLM stores a non-quantized KV cache in the model's dtype, so an explicit
-    ``float16`` or ``bfloat16`` cache is only safe when the ``dtype`` dimension
-    is pinned to exactly that model dtype. A ``Default``, ``auto``, ``float32``,
-    or multi-value dtype dimension leaves at least one combination unverifiable
-    or mismatched, so it is rejected rather than failing at server startup. The
-    FP8 cache formats are exempt because they are stored differently. A space
-    missing either dimension is left to the per-dimension checks.
+    ``float16`` or ``bfloat16`` cache is only safe when the model dtype matches
+    it. Before the checkpoint is read, only one mismatch is provable: a ``dtype``
+    dimension that pins exactly one explicit precision other than the cache's
+    own. A deferred or ``auto`` dtype, or a dimension that keeps several
+    possibilities, depends on the checkpoint's declared dtype, so it is left to
+    the model-aware assessment, which removes the cache values the resolved
+    model dtype cannot pair with. The FP8 cache formats are exempt because they
+    are stored differently. A space missing either dimension is left to the
+    per-dimension checks.
     """
     dimensions = {dimension.name: dimension for dimension in space.dimensions}
     dtype = dimensions.get("dtype")
@@ -841,17 +858,24 @@ def _validate_float_cache_dtype(space: ExperimentSpace) -> list[str]:
         return []
     dtype_values = [value for _, value in declared_values(dtype)]
     pinned = dtype_values[0] if len(dtype_values) == 1 else None
+    if pinned is None or pinned is DType.AUTO:
+        return []
     problems: list[str] = []
     for path, value in declared_values(cache):
         expected = _FLOAT_CACHE_DTYPES.get(value) if isinstance(value, KVCacheDType) else None
         if expected is None or pinned is expected:
             continue
-        problems.append(
-            f"{path}: vLLM stores an explicit float KV cache in the model dtype, "
-            f"but the dtype dimension does not pin {expected.value!r}; pin "
-            f"dtype={expected.value!r} or use kv_cache_dtype=auto"
-        )
+        problems.append(_cache_dtype_problem(path, expected))
     return problems
+
+
+def _cache_dtype_problem(path: str, expected: DType) -> str:
+    """Report a float cache whose accompanying model dtype does not match it."""
+    return (
+        f"{path}: vLLM stores an explicit float KV cache in the model dtype, "
+        f"but the dtype dimension does not resolve to {expected.value!r}; pin "
+        f"dtype={expected.value!r} or use kv_cache_dtype=auto"
+    )
 
 
 def _validate_engine_bounds(space: ExperimentSpace) -> list[str]:
@@ -892,6 +916,20 @@ that declares no method accepts only a method the engine can apply online.
 """
 
 
+def _read_checkpoint_config(model: Path) -> Mapping[str, object] | None:
+    """Read ``config.json`` as a JSON object, or ``None`` when it cannot be read.
+
+    Every checkpoint fact goes through this reader, so the fail-open rule is
+    decided once: a missing file, unreadable bytes, malformed JSON, or a payload
+    that is not a JSON object is unknown metadata, never an empty object.
+    """
+    try:
+        payload = json.loads((model / "config.json").read_text(encoding="utf-8"))
+    except OSError, json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
 def _read_checkpoint_quantization(model: Path) -> str | _UnreadableCheckpoint | None:
     """Return the quantization method a checkpoint declares, lower-cased.
 
@@ -904,11 +942,8 @@ def _read_checkpoint_quantization(model: Path) -> str | _UnreadableCheckpoint | 
     lower-cased because checkpoint authors are inconsistent about case while
     the engine's spellings are lower-case.
     """
-    try:
-        payload = json.loads((model / "config.json").read_text(encoding="utf-8"))
-    except OSError, json.JSONDecodeError:
-        return _UNREADABLE_CHECKPOINT
-    if not isinstance(payload, Mapping):
+    payload = _read_checkpoint_config(model)
+    if payload is None:
         return _UNREADABLE_CHECKPOINT
     quantization_config = payload.get("quantization_config")
     if not isinstance(quantization_config, Mapping):
@@ -917,6 +952,359 @@ def _read_checkpoint_quantization(model: Path) -> str | _UnreadableCheckpoint | 
     if not isinstance(method, str):
         return None
     return method.lower()
+
+
+_CHECKPOINT_EXPERT_COUNT_KEYS = ("num_experts", "n_routed_experts", "num_local_experts")
+"""The ``config.json`` keys that declare how many experts a checkpoint routes to.
+
+Checkpoint authors disagree on the spelling — ``num_experts`` for most families,
+``n_routed_experts`` for DeepSeek-style configurations, ``num_local_experts``
+for expert-parallel ones — so every spelling is checked. A multimodal
+checkpoint may nest its language-model configuration under ``text_config``, so
+that object is checked too.
+"""
+
+_CHECKPOINT_DTYPE_KEYS = ("dtype", "torch_dtype")
+"""The ``config.json`` keys that declare a checkpoint's execution dtype.
+
+Transformers renamed the field from ``torch_dtype`` to ``dtype``, and either
+spelling appears in the wild, so both are read. A multimodal checkpoint nests
+its language-model configuration under ``text_config``, and that nested object
+is consulted first: the language model is the part that generates tokens, so
+its precision is the one an unset or ``auto`` ``--dtype`` adopts.
+"""
+
+_CHECKPOINT_MODEL_DTYPES: Mapping[str, DType] = MappingProxyType(
+    {
+        "float16": DType.FLOAT16,
+        "bfloat16": DType.BFLOAT16,
+        "float32": DType.FLOAT32,
+    }
+)
+"""The checkpoint dtype spellings this backend models, and their members.
+
+Only the dtypes the engine-neutral :class:`DType` models are mapped. A
+checkpoint that declares another spelling — a float8 format, or the string
+``auto``, which names no concrete precision — reports an unknown model dtype
+rather than a guessed one, so a rule that needs a resolved dtype stays inactive
+instead of acting on an inferred value.
+"""
+
+_LAYER_TYPES_KEY = "layer_types"
+"""The ``config.json`` key listing each layer's attention implementation."""
+
+_LINEAR_ATTENTION_LAYER = "linear_attention"
+"""The ``layer_types`` entry naming a linear-attention layer."""
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointFacts:
+    """The model structure a vLLM checkpoint declares in its ``config.json``.
+
+    ``moe`` is ``True`` when a readable configuration declares a positive expert
+    count under any of :data:`_CHECKPOINT_EXPERT_COUNT_KEYS`, at the top level
+    or in a nested ``text_config``, and ``False`` when it declares none.
+    ``model_dtype`` is the execution dtype the checkpoint declares — the one an
+    unset or ``auto`` ``--dtype`` adopts — or ``None`` when it declares no dtype
+    this backend models, so a missing or unmodelled spelling is unknown rather
+    than coerced. ``linear_attention`` is ``True`` when the configuration lists
+    a :data:`_LINEAR_ATTENTION_LAYER` entry in its per-layer types, at the top
+    level or in a nested ``text_config``, and ``False`` when it lists none. A
+    checkpoint whose configuration cannot be read is not evidence of any of
+    this, so :func:`read_checkpoint_facts` returns ``None`` for it rather than
+    guessing.
+    """
+
+    moe: bool
+    model_dtype: DType | None
+    linear_attention: bool
+
+
+def read_checkpoint_facts(model: Path) -> CheckpointFacts | None:
+    """Read the model structure a vLLM checkpoint declares, if it can be read.
+
+    A missing or unreadable ``config.json``, malformed JSON, or a payload that
+    is not a JSON object reports ``None`` (fail open), leaving the engine as the
+    final authority. A readable object that declares no positive expert count
+    reports a dense model, and one that declares no dtype this backend models
+    reports an unknown ``model_dtype``, so the assessment prunes only on the
+    facts it actually read.
+    """
+    payload = _read_checkpoint_config(model)
+    if payload is None:
+        return None
+    return CheckpointFacts(
+        moe=_declares_experts(payload),
+        model_dtype=_declared_model_dtype(payload),
+        linear_attention=_declares_linear_attention(payload),
+    )
+
+
+def _declares_experts(payload: Mapping[str, object]) -> bool:
+    """Whether ``payload`` or its nested ``text_config`` declares experts."""
+    for source in (payload, payload.get("text_config")):
+        if not isinstance(source, Mapping):
+            continue
+        for key in _CHECKPOINT_EXPERT_COUNT_KEYS:
+            count = source.get(key)
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                return True
+    return False
+
+
+def _declared_model_dtype(payload: Mapping[str, object]) -> DType | None:
+    """Return the execution dtype the configuration declares, when modelled.
+
+    The nested ``text_config`` is consulted before the top level, so a
+    multimodal checkpoint's language-model precision wins. Within a source the
+    first dtype spelling that holds a string decides; it is reported only when
+    this backend models it, so an unmodelled spelling reports unknown rather
+    than falling through to a different source and guessing a precision the
+    checkpoint did not declare for the language model.
+    """
+    for source in (payload.get("text_config"), payload):
+        if not isinstance(source, Mapping):
+            continue
+        for key in _CHECKPOINT_DTYPE_KEYS:
+            declared = source.get(key)
+            if isinstance(declared, str):
+                return _CHECKPOINT_MODEL_DTYPES.get(declared.lower())
+    return None
+
+
+def _declares_linear_attention(payload: Mapping[str, object]) -> bool:
+    """Whether the configuration's per-layer types include linear attention.
+
+    A hybrid checkpoint lists one entry per layer, so a single
+    :data:`_LINEAR_ATTENTION_LAYER` entry is enough. A configuration that
+    declares no usable per-layer list reports no linear-attention layers: an
+    architecture with such layers always declares them, because the layout is
+    what distinguishes it from a plain transformer.
+    """
+    for source in (payload, payload.get("text_config")):
+        if not isinstance(source, Mapping):
+            continue
+        layer_types = source.get(_LAYER_TYPES_KEY)
+        if not isinstance(layer_types, Sequence) or isinstance(layer_types, str):
+            continue
+        if any(layer == _LINEAR_ATTENTION_LAYER for layer in layer_types):
+            return True
+    return False
+
+
+_LINEAR_ATTENTION_UNSUPPORTED_DTYPES: frozenset[DType] = frozenset({DType.FLOAT32})
+"""Execution dtypes a checkpoint with linear-attention layers cannot run.
+
+Qwen3.5's linear-attention layers call ``ChunkGatedDeltaRuleFunction``, which
+requires a half-precision activation dtype and rejects ``float32``; ``float16``
+and ``bfloat16`` remain valid. Because a checkpoint's declared preferred dtype
+is not an allowlist of every precision the engine can run, this set is the only
+value the kernel rule removes. The kernel behaviour belongs to vLLM, so it stays
+beside the rest of this backend's vocabulary.
+"""
+
+_LINEAR_ATTENTION_DTYPE_REASON = (
+    "the checkpoint's linear-attention layers reject float32 "
+    "(ChunkGatedDeltaRuleFunction requires float16 or bfloat16)"
+)
+"""Why a linear-attention checkpoint cannot serve a ``float32`` dtype."""
+
+_EMPTIED_LINEAR_ATTENTION_DTYPE_PROBLEM = (
+    "space.dtype: the checkpoint's linear-attention kernels reject float32 and "
+    "no other declared value remains; declare dtype=float16 or bfloat16"
+)
+"""Reported when dtype narrowing would remove every declared dtype value."""
+
+_EMPTIED_FLOAT_CACHE_PROBLEM = (
+    "space.kv_cache_dtype: every declared float KV-cache value is incompatible "
+    "with the resolved model dtype; use kv_cache_dtype=auto or pin dtype to "
+    "the cache format"
+)
+"""Reported when cache reconciliation would remove every declared cache value."""
+
+
+_MOE_PARAMETERS: frozenset[str] = frozenset({"expert_parallel", "all2all_backend"})
+"""The tunables that only change how a Mixture-of-Experts checkpoint is served.
+
+Expert parallelism shards the experts across devices and the all-to-all
+backend is the transport that sharding communicates over, so a dense
+checkpoint has no experts for either to act on.
+"""
+
+_DENSE_CHECKPOINT_REASON = "the checkpoint declares no experts"
+"""Why the MoE tunables are dropped for a checkpoint that is confidently dense."""
+
+_NO_TENSOR_PARALLEL_REASON = "the space never selects a tensor-parallel size above one"
+"""Why both MoE tunables are dropped when the space can never split a model.
+
+vLLM derives its expert-parallel size from the tensor-parallel and
+Data-parallel sizes, so a space that can only select one rank makes expert
+parallelism and its transport unreachable no matter what they declare.
+"""
+
+_NO_EXPERT_PARALLEL_REASON = "the space never enables expert parallelism"
+"""Why only the all-to-all transport is dropped when expert parallelism is off.
+
+The transport only carries the communication expert parallelism introduces, so
+a space that cannot switch expert parallelism on leaves ``all2all_backend``
+without an effect while the toggle itself may still be worth sampling.
+"""
+
+
+def _tensor_parallel_ceiling(dimension: Dimension | None, device_count: int) -> int | None:
+    """Return the largest tensor-parallel size a space can select, when known.
+
+    A ``Default`` dimension resolves through the detected device count, because
+    that is the value :meth:`VLLMBackend.plan` substitutes for an unset one, so
+    a deferred dimension is decided like a declared value rather than treated
+    as unknown. ``None`` means the ceiling cannot be established — the space
+    does not declare the dimension, or declares no integer value for it — and a
+    rule that depends on it stays inactive rather than inferring a split that
+    may not hold.
+    """
+    if dimension is None:
+        return None
+    spec = dimension.spec
+    if isinstance(spec, Default):
+        return device_count
+    if isinstance(spec, Interval):
+        return int(spec.maximum)
+    numeric = [
+        value
+        for _, value in declared_values(dimension)
+        if isinstance(value, int) and not isinstance(value, bool)
+    ]
+    return max(numeric) if numeric else None
+
+
+def _expert_parallel_reachable(dimension: Dimension | None) -> bool:
+    """Whether a space can pass ``--enable-expert-parallel`` at all.
+
+    Expert parallelism reaches the engine only through that positive flag, so a
+    dimension has to declare ``True`` somewhere. ``False`` and a categorical
+    that omits ``True`` both leave vLLM's own default — off — in place, and so
+    does a ``Default`` dimension, because it forwards no flag either. A
+    dimension the space does not declare cannot be switched on.
+    """
+    if dimension is None or isinstance(dimension.spec, Default):
+        return False
+    return any(value is True for _, value in declared_values(dimension))
+
+
+def _prune_unreachable_moe_parallelism(
+    space: ExperimentSpace, hardware: DetectedHardware
+) -> tuple[ExperimentSpace, tuple[str, ...]]:
+    """Drop the MoE parallelism dimensions the space itself makes unreachable.
+
+    Expert parallelism can only change a run that splits the model, so a space
+    whose declared (or deferred) tensor-parallel sizes never exceed one loses
+    both MoE dimensions. A space that can split but never switches expert
+    parallelism on still leaves the all-to-all transport unused, so only that
+    dimension is dropped and the toggle remains samplable. An undeterminable
+    tensor-parallel ceiling leaves both rules inactive: a missing value is not
+    evidence of a single rank.
+    """
+    dimensions = {dimension.name: dimension for dimension in space.dimensions}
+    ceiling = _tensor_parallel_ceiling(
+        dimensions.get("tensor_parallel_size"), hardware.device_count
+    )
+    if ceiling is not None and ceiling <= 1:
+        return prune_dimensions(space, _MOE_PARAMETERS, reason=_NO_TENSOR_PARALLEL_REASON)
+    if not _expert_parallel_reachable(dimensions.get("expert_parallel")):
+        return prune_dimensions(space, {"all2all_backend"}, reason=_NO_EXPERT_PARALLEL_REASON)
+    return space, ()
+
+
+def _linear_attention_dtype_reason(value: ParameterValue) -> str | None:
+    """Why a linear-attention checkpoint cannot serve a declared dtype value."""
+    if value in _LINEAR_ATTENTION_UNSUPPORTED_DTYPES:
+        return _LINEAR_ATTENTION_DTYPE_REASON
+    return None
+
+
+def _dtype_possibilities(
+    dimension: Dimension | None, facts: CheckpointFacts | None
+) -> tuple[frozenset[DType], bool] | None:
+    """Every model dtype a space's ``dtype`` dimension can select, and whether it is known.
+
+    ``None`` means the space declares no ``dtype`` dimension, so reconciliation
+    is skipped exactly as the pre-model check skips it. Otherwise the result
+    carries the concrete model dtypes the dimension can select and whether at
+    least one choice is unknown. An explicit dtype resolves directly, while
+    ``auto`` — and a deferred dimension, which means the same thing — follows
+    the checkpoint's declared dtype, so it resolves through
+    ``facts.model_dtype`` and is unknown when the checkpoint declares none this
+    backend models. An empty or non-enumerable spec yields no resolved
+    possibility and is treated as unknown rather than as a matching set.
+    """
+    if dimension is None:
+        return None
+    spec = dimension.spec
+    if isinstance(spec, Default):
+        values: tuple[object, ...] = (DType.AUTO,)
+    elif isinstance(spec, (Fixed, Categorical)):
+        values = tuple(value for _, value in declared_values(dimension))
+    else:
+        return frozenset(), True
+    resolved: set[DType] = set()
+    unknown = not values
+    for value in values:
+        if value is DType.AUTO:
+            if facts is None or facts.model_dtype is None:
+                unknown = True
+            else:
+                resolved.add(facts.model_dtype)
+        elif isinstance(value, DType):
+            resolved.add(value)
+        else:
+            unknown = True
+    return frozenset(resolved), unknown
+
+
+def _float_cache_reason(expected: DType) -> str:
+    """Why an explicit float KV cache cannot pair with the remaining dtypes."""
+    return (
+        "vLLM stores an explicit float KV cache in the model dtype, but the "
+        f"dtype dimension does not resolve only to {expected.value!r}"
+    )
+
+
+def _reconcile_float_cache_dtype(
+    space: ExperimentSpace, facts: CheckpointFacts | None
+) -> ValueNarrowing:
+    """Narrow explicit float KV-cache values to the model dtype they can pair with.
+
+    vLLM stores a non-quantized KV cache in the model dtype, so a ``float16`` or
+    ``bfloat16`` cache is retained only when every model dtype the narrowed
+    ``dtype`` dimension can still select resolves to that same dtype. An
+    explicit dtype resolves directly, while ``auto`` — and a deferred dimension,
+    which means the same thing — resolves through the checkpoint's declared
+    dtype. The ``auto`` and FP8 cache formats are always retained because they
+    do not have to match the model dtype.
+
+    The rule fails open: when the checkpoint's dtype cannot be resolved — an
+    unreadable or incomplete configuration, or a declared dtype this backend
+    does not model — the declared float caches are kept, because unknown
+    metadata is not evidence that a value is wrong and the engine remains the
+    final authority. A space that declares no ``dtype`` dimension is left alone
+    for the same reason the pre-model check leaves it alone.
+    """
+    dimensions = {dimension.name: dimension for dimension in space.dimensions}
+    cache = dimensions.get("kv_cache_dtype")
+    possibilities = _dtype_possibilities(dimensions.get("dtype"), facts)
+    if cache is None or possibilities is None:
+        return ValueNarrowing(space=space)
+    model_dtypes, unknown = possibilities
+    if unknown:
+        return ValueNarrowing(space=space)
+
+    def reason_for(value: ParameterValue) -> str | None:
+        expected = _FLOAT_CACHE_DTYPES.get(value) if isinstance(value, KVCacheDType) else None
+        if expected is None or model_dtypes == frozenset({expected}):
+            return None
+        return _float_cache_reason(expected)
+
+    return narrow_values(space, "kv_cache_dtype", reason_for)
 
 
 @dataclass(frozen=True, slots=True)
@@ -979,11 +1367,13 @@ class VLLMBackend:
         every fixed or categorical enum value must have a vLLM spelling.
         ``Default`` dimensions carry no value to check and are accepted once
         their parameter is known to be applicable. The engine's own numeric
-        constraints between parameters are checked last. A space that can pair
-        an explicit float16 or bfloat16 KV cache with a model dtype that is not
-        pinned to the same value is rejected too, because vLLM stores the cache
-        in the model dtype. Problems are returned as strings so the caller can
-        aggregate them; an empty sequence means vLLM supports every dimension.
+        constraints between parameters are checked last. A space that pins an
+        explicit float16 or bfloat16 KV cache to a different explicit dtype is
+        rejected too, because vLLM stores the cache in the model dtype and no
+        checkpoint fact could fix the pair; a deferred, ``auto``, or multi-value
+        dtype is left to the model-aware assessment. Problems are returned as
+        strings so the caller can aggregate them; an empty sequence means vLLM
+        supports every dimension.
 
         ``hardware``, when given, additionally asks whether each declared value
         is supported on that accelerator class and fits its device count, so a
@@ -1044,6 +1434,63 @@ class VLLMBackend:
             f"incompatible with the requested quantization={quantization.value!r}; omit "
             f"quantization to let vLLM auto-detect"
         ]
+
+    def assess_space(
+        self,
+        space: ExperimentSpace,
+        experiment: ExperimentConfig,
+        hardware: DetectedHardware,
+        model: Path,
+    ) -> SpaceAssessment:
+        """Derive the effective vLLM space for the resolved checkpoint.
+
+        The whole-dimension rules come first. A checkpoint whose ``config.json``
+        confidently declares no experts loses both MoE dimensions, because
+        expert parallelism and its all-to-all transport only change how experts
+        are sharded; the space is left untouched when the configuration
+        declares experts or cannot be read at all, since unknown metadata is
+        not evidence of a dense model. The remaining space is then asked
+        whether its own tensor-parallel and expert-parallel choices can ever
+        reach the MoE dimensions at all.
+
+        Two value-level rules then narrow what the checkpoint's kernels reject.
+        A checkpoint with linear-attention layers loses ``float32`` from the
+        ``dtype`` dimension, because those layers' kernel requires a
+        half-precision activation and the preferred dtype the checkpoint
+        declares is not an allowlist of everything else. The declared float
+        KV-cache values are reconciled with the dtypes that remain, because the
+        engine stores a non-quantized cache in the model dtype.
+
+        Every rule fails open on unknown metadata, so the engine stays the final
+        authority for a checkpoint this backend cannot fully read. A dimension
+        a value-level rule would empty is reported as a problem rather than
+        silently dropped or replaced with an engine default, and every retained
+        dimension keeps its canonical order while a narrowed one keeps its
+        declared value order.
+        """
+        facts = read_checkpoint_facts(model)
+        effective = space
+        notes: list[str] = []
+        problems: list[str] = []
+        if facts is not None and not facts.moe:
+            effective, dropped = prune_dimensions(
+                effective, _MOE_PARAMETERS, reason=_DENSE_CHECKPOINT_REASON
+            )
+            notes.extend(dropped)
+        effective, dependency_notes = _prune_unreachable_moe_parallelism(effective, hardware)
+        notes.extend(dependency_notes)
+        if facts is not None and facts.linear_attention:
+            dtype = narrow_values(effective, "dtype", _linear_attention_dtype_reason)
+            effective = dtype.space
+            notes.extend(dtype.notes)
+            if dtype.emptied:
+                problems.append(_EMPTIED_LINEAR_ATTENTION_DTYPE_PROBLEM)
+        cache = _reconcile_float_cache_dtype(effective, facts)
+        effective = cache.space
+        notes.extend(cache.notes)
+        if cache.emptied:
+            problems.append(_EMPTIED_FLOAT_CACHE_PROBLEM)
+        return SpaceAssessment(space=effective, notes=tuple(notes), problems=tuple(problems))
 
     def model_request(self, model: str) -> ModelRequest:
         """Decide whether ``model`` is a local checkpoint or a Hub repository.

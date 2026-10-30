@@ -48,3 +48,7 @@ space:
     default: true
   prefix_caching:
     fixed: true
+  expert_parallel:
+    categorical: [true, false]
+  all2all_backend:
+    categorical: [allgather_reducescatter, naive]

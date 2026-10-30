@@ -23,9 +23,11 @@ import optuna
 import pytest
 
 from llm_config_optimization.inference import (
+    All2AllBackend,
     AttentionBackend,
     BenchmarkConfig,
     ContainerRuntimeConfig,
+    CpuMoeMode,
     DType,
     ExperimentConfig,
     GpuLayersMode,
@@ -64,6 +66,12 @@ FULL_SPACE = ExperimentSpace(
         ),
         Dimension("prefix_caching", Categorical((True, False))),
         Dimension("n_gpu_layers", Categorical((GpuLayersMode.AUTO, 0, GpuLayersMode.ALL, 8))),
+        Dimension("expert_parallel", Categorical((True, False))),
+        Dimension(
+            "all2all_backend",
+            Categorical((All2AllBackend.ALLGATHER_REDUCESCATTER, All2AllBackend.NAIVE)),
+        ),
+        Dimension("n_cpu_moe", Categorical((0, 8, CpuMoeMode.ALL))),
     )
 )
 """A complete space over every tunable, with all four spec kinds represented."""
@@ -80,6 +88,9 @@ PARAMETERS: dict[str, object] = {
     "attention_backend": "flash_attention",
     "prefix_caching": True,
     "n_gpu_layers": "all",
+    "expert_parallel": False,
+    "all2all_backend": "naive",
+    "n_cpu_moe": "all",
 }
 """A parameter mapping as a persisted study would return it: plain JSON values."""
 
@@ -305,6 +316,9 @@ def test_reconstruct_llm_takes_tunables_from_the_mapping_and_inherits_the_rest()
         attention_backend=AttentionBackend.FLASH_ATTENTION,
         prefix_caching=True,
         n_gpu_layers=GpuLayersMode.ALL,
+        expert_parallel=False,
+        all2all_backend=All2AllBackend.NAIVE,
+        n_cpu_moe=CpuMoeMode.ALL,
     )
 
 

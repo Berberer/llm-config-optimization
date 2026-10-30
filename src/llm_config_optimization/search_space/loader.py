@@ -69,12 +69,12 @@ _POSITIVE_PARAMETERS = frozenset(
         "num_speculative_tokens",
     }
 )
-_NON_NEGATIVE_PARAMETERS: frozenset[str] = frozenset({"n_gpu_layers"})
+_NON_NEGATIVE_PARAMETERS: frozenset[str] = frozenset({"n_gpu_layers", "n_cpu_moe"})
 """Numerically tunable parameters whose floor is zero rather than one.
 
 The loader applies a per-parameter numeric floor so a count that legitimately
-includes zero (GPU layer offload, for instance) is not rejected by the
-positive-only rule that suits sizes and token budgets.
+includes zero (GPU-layer offload and CPU-resident expert layers, for instance)
+is not rejected by the positive-only rule that suits sizes and token budgets.
 """
 
 

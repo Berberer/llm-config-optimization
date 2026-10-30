@@ -23,14 +23,34 @@ Every tunable parameter is present in a well-formed space, so there is no
 "absent means engine default" case; deferral is expressed only through
 :class:`Default`. The types are frozen and hashable, so a space can be logged,
 compared, and cached.
+
+A :class:`SpaceAssessment` is the effective space a backend derives from a
+declared one once the checkpoint has been resolved: it may drop dimensions
+that cannot affect the resolved model and narrow the values a dimension keeps.
 """
 
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from ..inference.types import AttentionBackend, DType, GpuLayersMode, KVCacheDType
+from ..inference.types import (
+    All2AllBackend,
+    AttentionBackend,
+    CpuMoeMode,
+    DType,
+    GpuLayersMode,
+    KVCacheDType,
+)
 
-type ParameterValue = DType | KVCacheDType | AttentionBackend | GpuLayersMode | int | bool
+type ParameterValue = (
+    DType
+    | KVCacheDType
+    | AttentionBackend
+    | GpuLayersMode
+    | CpuMoeMode
+    | All2AllBackend
+    | int
+    | bool
+)
 """A value a tunable parameter may take.
 
 Categorical parameters hold an engine-neutral enum member, numeric parameters
@@ -120,6 +140,40 @@ class ExperimentSpace:
     def __post_init__(self) -> None:
         """Store the dimensions as a tuple so the space is immutable and hashable."""
         object.__setattr__(self, "dimensions", tuple(self.dimensions))
+
+
+@dataclass(frozen=True, slots=True)
+class SpaceAssessment:
+    """The effective search space after a model-aware assessment.
+
+    A space is written before the checkpoint is resolved, so its author cannot
+    know which dimensions can still affect the run. A backend assesses the
+    parsed space against the checkpoint it will mount — together with the run's
+    fixed configuration and the resolved hardware — and returns this result.
+    ``space`` is the effective space: a dimension that cannot affect the run is
+    removed, and a dimension whose declared values the model narrows keeps only
+    the remaining values, in declared order.
+
+    ``notes`` records each change as one human-readable line, so a run can say
+    which part of the definition was intentionally skipped instead of silently
+    sampling something else. ``problems`` are model-aware mismatches that
+    pruning cannot fix, such as a declared value the checkpoint cannot run;
+    they are reported through the same unsupported-configuration path as every
+    other validation problem. Empty ``problems`` means the effective space can
+    run as it stands.
+
+    The result is frozen and hashable like the space it carries, so an
+    assessment can be logged, compared, and cached.
+    """
+
+    space: ExperimentSpace
+    notes: tuple[str, ...] = ()
+    problems: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Store the notes and problems as tuples so the result is hashable."""
+        object.__setattr__(self, "notes", tuple(self.notes))
+        object.__setattr__(self, "problems", tuple(self.problems))
 
 
 class ExperimentDefinitionError(Exception):

@@ -1,4 +1,4 @@
-"""Unit tests for reading a GGUF checkpoint's declared quantization.
+"""Unit tests for reading a GGUF checkpoint's declared quantization and structure.
 
 ``read_gguf_metadata``'s observable contract is the
 :class:`~llm_config_optimization.inference._llamacpp.GgufMetadata` it returns, the
@@ -147,6 +147,82 @@ def test_a_checkpoint_without_a_block_count_reports_none(tmp_path: Path) -> None
     model = _write_gguf(tmp_path / "model.gguf", {"general.architecture": "llama"})
 
     assert read_gguf_metadata(model) == GgufMetadata(quantization=None, block_count=None)
+
+
+@pytest.mark.parametrize("architecture", ["llama", "qwen3moe", "deepseek2"])
+def test_the_architecture_expert_count_is_reported(architecture: str, tmp_path: Path) -> None:
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {"general.architecture": architecture, f"{architecture}.expert_count": 128},
+    )
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, expert_count=128)
+
+
+def test_an_expert_count_is_reported_without_a_declared_architecture(tmp_path: Path) -> None:
+    model = _write_gguf(tmp_path / "model.gguf", {"qwen3moe.expert_count": 128})
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, expert_count=128)
+
+
+def test_only_the_declared_architecture_expert_count_is_reported(tmp_path: Path) -> None:
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {
+            "general.architecture": "llama",
+            "llama.expert_count": 8,
+            "qwen3moe.expert_count": 128,
+        },
+    )
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, expert_count=8)
+
+
+def test_an_ambiguous_expert_count_is_not_reported(tmp_path: Path) -> None:
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {"llama.expert_count": 8, "qwen3moe.expert_count": 128},
+    )
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None)
+
+
+def test_a_zero_expert_count_is_reported(tmp_path: Path) -> None:
+    """A readable checkpoint that declares no experts is confidently dense."""
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {"general.architecture": "llama", "llama.expert_count": 0},
+    )
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, expert_count=0)
+
+
+def test_a_boolean_expert_count_is_not_reported(tmp_path: Path) -> None:
+    """A boolean is an ``int`` subclass, so it must not count as an expert count."""
+    model = _write_gguf(tmp_path / "model.gguf", {"llama.expert_count": True})
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None)
+
+
+def test_a_checkpoint_without_an_expert_count_reports_none(tmp_path: Path) -> None:
+    model = _write_gguf(tmp_path / "model.gguf", {"general.architecture": "llama"})
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, expert_count=None)
+
+
+def test_block_and_expert_counts_are_reported_together(tmp_path: Path) -> None:
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {
+            "general.architecture": "qwen3moe",
+            "qwen3moe.block_count": 48,
+            "qwen3moe.expert_count": 128,
+        },
+    )
+
+    assert read_gguf_metadata(model) == GgufMetadata(
+        quantization=None, block_count=48, expert_count=128
+    )
 
 
 def test_an_unmodeled_file_type_declares_no_quantization(tmp_path: Path) -> None:

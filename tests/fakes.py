@@ -30,7 +30,11 @@ from llm_config_optimization.inference import (
     ServerSpec,
 )
 from llm_config_optimization.runtime import ContainerResult
-from llm_config_optimization.search_space import TUNABLE_PARAMETERS, ExperimentSpace
+from llm_config_optimization.search_space import (
+    TUNABLE_PARAMETERS,
+    ExperimentSpace,
+    SpaceAssessment,
+)
 
 
 def _frame(stream_type: int, payload: bytes) -> bytes:
@@ -206,8 +210,11 @@ class FakeBackend:
     can be driven end to end without an engine: :meth:`plan` records every
     experiment it is asked to plan and :meth:`parse_result` records the measured
     outcome and captured container outcome, while ``parse_error`` makes every
-    parse fail. The inference orchestration tests and the optimization lifecycle
-    tests share it so neither needs a daemon or a GPU.
+    parse fail. :meth:`assess_space` records the space it was asked about and
+    leaves it whole, so a test can pin that preparation consulted the
+    assessment without needing a rule of its own. The inference orchestration
+    tests and the optimization lifecycle tests share it so neither needs a
+    daemon or a GPU.
     """
 
     def __init__(
@@ -231,6 +238,9 @@ class FakeBackend:
         self.plan_calls: list[tuple[ExperimentConfig, DetectedHardware]] = []
         self.parse_calls: list[tuple[BenchmarkOutcome, ServerSpec, ContainerResult]] = []
         self.model_request_calls: list[str] = []
+        self.assess_space_calls: list[
+            tuple[ExperimentSpace, ExperimentConfig, DetectedHardware, Path]
+        ] = []
 
     def applicable_parameters(self, llm: LLMConfig) -> frozenset[str]:
         """The tunable names the fake declares, every registered one by default."""
@@ -248,6 +258,18 @@ class FakeBackend:
     def validate_model(self, experiment: ExperimentConfig, model: Path) -> Sequence[str]:
         self.events.append("validate_model")
         return ()
+
+    def assess_space(
+        self,
+        space: ExperimentSpace,
+        experiment: ExperimentConfig,
+        hardware: DetectedHardware,
+        model: Path,
+    ) -> SpaceAssessment:
+        """Record the assessment request and keep the declared space whole."""
+        self.events.append("assess_space")
+        self.assess_space_calls.append((space, experiment, hardware, model))
+        return SpaceAssessment(space=space)
 
     def model_request(self, model: str) -> ModelRequest:
         """Resolve an existing host path as local, anything else as a Hub id.

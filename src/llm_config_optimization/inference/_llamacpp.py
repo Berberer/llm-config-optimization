@@ -23,7 +23,8 @@ Model resolution decides whether ``--model`` names a local checkpoint or a
 Hugging Face repository with an optional ``:QUANT`` selector, and picks the
 single GGUF file the server mounts. GGUF metadata makes model-aware validation
 possible without the engine: a file that is not GGUF is rejected up front, and
-the quantization it declares is read straight from its header.
+the quantization, block count, and expert count it declares are read straight
+from its header.
 """
 
 import os
@@ -42,12 +43,13 @@ from ..search_space.registry import (
     TUNABLE_PARAMETERS,
     speculative_configured,
 )
-from ..search_space.types import Default, Dimension, ExperimentSpace, Interval
+from ..search_space.types import Default, Dimension, ExperimentSpace, Interval, SpaceAssessment
 from ._benchmark import _RESPONSES_KEY
 from ._tunables import (
     Gate,
     Toggle,
     declared_values,
+    prune_dimensions,
     toggle_arguments,
     translate_value,
     unsupported_values,
@@ -56,6 +58,7 @@ from .types import (
     AttentionBackend,
     BenchmarkConfig,
     BenchmarkOutcome,
+    CpuMoeMode,
     DetectedHardware,
     ExperimentConfig,
     ExperimentError,
@@ -87,6 +90,7 @@ PARAMETER_TARGETS: Mapping[str, tuple[str, ...] | Gate | Toggle] = MappingProxyT
         "num_speculative_tokens": ("--spec-draft-n-max",),
         "prefix_caching": Toggle(enabled="--cache-prompt", disabled="--no-cache-prompt"),
         "n_gpu_layers": ("--n-gpu-layers",),
+        "n_cpu_moe": ("--n-cpu-moe",),
     }
 )
 """Where each applicable :class:`LLMConfig` field is sent on ``llama-server``.
@@ -150,6 +154,9 @@ VALUE_MAPS: Mapping[str, Mapping[object, str]] = MappingProxyType(
             GpuLayersMode.AUTO: "auto",
             GpuLayersMode.ALL: "all",
         },
+        "n_cpu_moe": {
+            CpuMoeMode.ALL: "all",
+        },
     }
 )
 """How llama.cpp spells each engine-neutral categorical value it can serve.
@@ -169,7 +176,48 @@ it; ``flash_infer`` and ``xformers`` are vLLM-only backends. The six
 speculative methods map onto llama.cpp's ``--spec-type`` spellings; the
 engine-only n-gram cache, map, and mod variants stay behind ``extra_args``.
 ``n_gpu_layers`` translates its two modes and passes an exact integer count
-through unchanged, so a union dimension samples both branches.
+through unchanged, so a union dimension samples both branches. ``n_cpu_moe``
+does the same for an exact count, but its :attr:`CpuMoeMode.ALL` mode is a
+value-less flag of its own rather than a spelling of ``--n-cpu-moe``; that
+branch is assembled in :func:`serve_arguments`.
+"""
+
+_CPU_MOE_ALL_FLAG = "--cpu-moe"
+"""The value-less flag that keeps every expert layer in system RAM.
+
+llama.cpp models the two choices as different flags: ``--n-cpu-moe N`` takes an
+exact layer count and ``--cpu-moe`` takes no value at all. The ``all`` mode must
+therefore emit this flag rather than ``--n-cpu-moe all``, which the engine would
+reject while parsing the count.
+"""
+
+_CPU_MOE_PARAMETER = "n_cpu_moe"
+"""The tunable that keeps a number of MoE expert layers in system RAM.
+
+It only changes how a Mixture-of-Experts checkpoint's experts are placed, so a
+dense checkpoint cannot be affected by it.
+"""
+
+_DENSE_CHECKPOINT_REASON = "the checkpoint declares no experts"
+"""Why the CPU expert offload is dropped for a checkpoint that is confidently dense."""
+
+_CPU_TARGET_MOE_REASON = "the CPU target keeps every weight in system RAM already"
+"""Why the CPU expert offload is dropped for a CPU-only run.
+
+``--n-cpu-moe``/``--cpu-moe`` keep some expert layers out of the accelerator's
+memory. On a CPU target no weight ever leaves system RAM, so neither flag can
+change how much memory the run uses or where the experts are computed.
+"""
+
+_CPU_TARGET_GPU_LAYERS_REASON = (
+    "the CPU target can never offload GPU layers and every declared value already disables it"
+)
+"""Why a CPU-valid GPU-layer dimension is dropped for a CPU-only run.
+
+``auto`` may resolve to no offload and ``0`` disables it, so a dimension
+confined to those values cannot change anything on a CPU target. ``all`` and
+positive counts are rejected by the pre-model validation instead of being
+pruned, so a GPU-oriented space never silently changes meaning on a CPU host.
 """
 
 _QUANTIZED_CACHE_DTYPES: frozenset[KVCacheDType] = frozenset(
@@ -221,6 +269,11 @@ def serve_arguments(
     It is suppressed with the other speculative fields when the mode is
     disabled.
 
+    An exact ``n_cpu_moe`` count is forwarded as ``--n-cpu-moe N``, while its
+    ``all`` mode emits the value-less ``--cpu-moe`` flag. The two are different
+    flags rather than one flag with two spellings, so the mode is special-cased
+    instead of going through the value map.
+
     Raises :class:`ExperimentError` for an enum value the engine has no spelling
     for.
     """
@@ -236,6 +289,9 @@ def serve_arguments(
             continue
         value = getattr(config, field)
         if value is None:
+            continue
+        if field == "n_cpu_moe" and value is CpuMoeMode.ALL:
+            arguments.append(_CPU_MOE_ALL_FLAG)
             continue
         if isinstance(target, Toggle):
             arguments.extend(toggle_arguments(value, target))
@@ -396,6 +452,15 @@ this key rather than hard-coding one model family.
 _GGUF_BLOCK_COUNT_SUFFIX = ".block_count"
 """The architecture-independent suffix of the checkpoint's block count."""
 
+_GGUF_EXPERT_COUNT_SUFFIX = ".expert_count"
+"""The architecture-independent suffix of the checkpoint's expert count.
+
+A Mixture-of-Experts checkpoint declares how many experts each layer routes
+between (``qwen3moe.expert_count`` and so on); a dense checkpoint declares no
+such key. The count is architecture-prefixed for the same reason the block
+count is.
+"""
+
 _GGUF_BOOL_TYPE = 7
 """The value type id of a boolean metadata value."""
 
@@ -496,10 +561,17 @@ class GgufMetadata:
     when that key is absent or the header cannot be read. It bounds an exact
     GPU-layer count: offloading more layers than the checkpoint has is a
     typo, and ``--n-gpu-layers all`` is the unambiguous full-offload choice.
+
+    ``expert_count`` is the number of experts the architecture declares
+    through its ``<arch>.expert_count`` key, or ``None`` when the key is
+    absent or the header cannot be read. A declared zero is reported as zero:
+    a readable checkpoint that declares no experts is confidently dense, while
+    absent metadata leaves the structure unknown.
     """
 
     quantization: str | None
     block_count: int | None = None
+    expert_count: int | None = None
 
 
 def _read_exact(handle: BinaryIO, size: int) -> bytes:
@@ -533,7 +605,8 @@ def _read_metadata_string(handle: BinaryIO) -> str:
 def _skip_metadata_value(handle: BinaryIO, value_type: int) -> None:
     """Advance past one metadata value without materialising it.
 
-    Only ``general.file_type`` is ever read, so every other entry is skipped.
+    Only the file type and the architecture-prefixed counts are ever read, so
+    every other entry is skipped.
     A fixed-width array is skipped in one seek, which matters because tokenizer
     metadata can hold a hundred thousand elements; only string elements and
     nested arrays are walked one by one.
@@ -569,12 +642,12 @@ def read_gguf_metadata(path: Path) -> GgufMetadata | None:
     ``general.file_type`` value is likewise reported as no quantization, never
     as a guess.
 
-    The block count is looked up under the architecture named by
+    The block and expert counts are looked up under the architecture named by
     ``general.architecture`` (``llama.block_count``, ``qwen2.block_count``, and
-    so on). A file that declares no architecture still reports a block count
-    when exactly one architecture-prefixed block-count key is present, and
-    reports none when the key is absent or several architectures would make
-    the choice ambiguous.
+    so on). A file that declares no architecture still reports a count when
+    exactly one architecture-prefixed key for it is present, and reports none
+    when the key is absent or several architectures would make the choice
+    ambiguous.
     """
     if not path.is_file():
         raise ExperimentError(f"{path} is not a GGUF file; llama.cpp serves GGUF checkpoints")
@@ -591,6 +664,7 @@ def read_gguf_metadata(path: Path) -> GgufMetadata | None:
             file_type: int | None = None
             architecture: str | None = None
             block_counts: dict[str, int] = {}
+            expert_counts: dict[str, int] = {}
             for _ in range(metadata_count):
                 key = _read_metadata_string(handle)
                 value_type = _read_uint32(handle)
@@ -605,6 +679,10 @@ def read_gguf_metadata(path: Path) -> GgufMetadata | None:
                     value = _read_scalar(handle, scalar_format)
                     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                         block_counts[key] = value
+                elif key.endswith(_GGUF_EXPERT_COUNT_SUFFIX) and scalar_format:
+                    value = _read_scalar(handle, scalar_format)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        expert_counts[key] = value
                 else:
                     _skip_metadata_value(handle, value_type)
     except ExperimentError:
@@ -612,18 +690,27 @@ def read_gguf_metadata(path: Path) -> GgufMetadata | None:
     except OSError, _UnreadableGguf, UnicodeDecodeError:
         return None
     quantization = _GGUF_FILE_TYPE_LABELS.get(file_type) if file_type is not None else None
-    block_count = _resolve_block_count(architecture, block_counts)
-    return GgufMetadata(quantization=quantization, block_count=block_count)
+    return GgufMetadata(
+        quantization=quantization,
+        block_count=_resolve_architecture_count(
+            _GGUF_BLOCK_COUNT_SUFFIX, architecture, block_counts
+        ),
+        expert_count=_resolve_architecture_count(
+            _GGUF_EXPERT_COUNT_SUFFIX, architecture, expert_counts
+        ),
+    )
 
 
-def _resolve_block_count(architecture: str | None, block_counts: Mapping[str, int]) -> int | None:
-    """Pick the block count the checkpoint's architecture names, if any."""
+def _resolve_architecture_count(
+    suffix: str, architecture: str | None, counts: Mapping[str, int]
+) -> int | None:
+    """Pick the count the checkpoint's architecture names, if any."""
     if architecture is not None:
-        declared = block_counts.get(f"{architecture}{_GGUF_BLOCK_COUNT_SUFFIX}")
+        declared = counts.get(f"{architecture}{suffix}")
         if declared is not None:
             return declared
-    if len(block_counts) == 1:
-        return next(iter(block_counts.values()))
+    if len(counts) == 1:
+        return next(iter(counts.values()))
     return None
 
 
@@ -1003,6 +1090,117 @@ def _gpu_layers_block_count_problems(
     ]
 
 
+def _is_dense_checkpoint(metadata: GgufMetadata | None) -> bool:
+    """Whether the GGUF header confidently declares no experts.
+
+    A readable header with no expert count, or a count of zero, is confidently
+    dense. Unreadable metadata is unknown rather than dense, so a checkpoint
+    the reader could not see keeps the declared MoE dimensions.
+    """
+    return metadata is not None and metadata.expert_count in (None, 0)
+
+
+def _cpu_valid_gpu_layers(dimension: Dimension) -> bool:
+    """Whether every value ``dimension`` can select is valid on a CPU target.
+
+    ``auto`` may resolve to no offload and an exact ``0`` disables it, so both
+    are CPU-valid. A ``Default`` dimension declares no value and defers to the
+    engine, so it is not judged here, and an ``Interval`` is CPU-valid only when
+    its maximum is zero because the optimizer could draw any value in the range.
+    """
+    spec = dimension.spec
+    if isinstance(spec, Default):
+        return False
+    if isinstance(spec, Interval):
+        return spec.maximum <= 0
+    values = [value for _, value in declared_values(dimension)]
+    return bool(values) and all(
+        value is GpuLayersMode.AUTO
+        or (isinstance(value, int) and not isinstance(value, bool) and value == 0)
+        for value in values
+    )
+
+
+def _prune_cpu_target_dimensions(
+    space: ExperimentSpace, target: HardwareTarget
+) -> tuple[ExperimentSpace, tuple[str, ...]]:
+    """Drop the llama.cpp dimensions a CPU target makes meaningless.
+
+    A CPU run has no device to offload from, so ``n_cpu_moe`` cannot change
+    anything and is dropped unconditionally. ``n_gpu_layers`` is dropped only
+    when every value it can select is already CPU-valid, because ``all`` and
+    positive counts are rejected by the pre-model validation rather than
+    silently reinterpreted on a CPU host. A non-CPU target keeps both
+    dimensions, and the remaining dimensions keep their canonical order.
+    """
+    if target is not HardwareTarget.CPU:
+        return space, ()
+    effective, notes = prune_dimensions(space, {_CPU_MOE_PARAMETER}, reason=_CPU_TARGET_MOE_REASON)
+    layers = next(
+        (dimension for dimension in effective.dimensions if dimension.name == "n_gpu_layers"), None
+    )
+    if layers is not None and _cpu_valid_gpu_layers(layers):
+        effective, layer_notes = prune_dimensions(
+            effective, {"n_gpu_layers"}, reason=_CPU_TARGET_GPU_LAYERS_REASON
+        )
+        notes += layer_notes
+    return effective, notes
+
+
+def _layer_count_problems(
+    dimension: Dimension, block_count: int, model: Path, hint: str
+) -> list[str]:
+    """Report every layer count ``dimension`` declares above ``block_count``.
+
+    An exact integer above the checkpoint's block count is almost always a typo
+    that would silently duplicate full offload, so the problem points at the
+    mode that expresses full offload unambiguously. An ``Interval`` is checked
+    by its maximum because the optimizer may draw any value in the range. The
+    mode members (``auto``/``all``) declare no count to compare and are never
+    bounded here.
+    """
+    problems: list[str] = []
+    for path, value in declared_values(dimension):
+        if isinstance(value, int) and not isinstance(value, bool) and value > block_count:
+            problems.append(
+                f"{path}: {dimension.name}={value} exceeds the {block_count} layers in "
+                f"{model}; {hint}"
+            )
+    if isinstance(dimension.spec, Interval) and dimension.spec.maximum > block_count:
+        problems.append(
+            f"space.{dimension.name}.interval: {dimension.name} up to "
+            f"{dimension.spec.maximum} exceeds the {block_count} layers in {model}; {hint}"
+        )
+    return problems
+
+
+def _block_count_problems(
+    space: ExperimentSpace, model: Path, metadata: GgufMetadata | None
+) -> list[str]:
+    """Report declared layer counts the checkpoint has no blocks for.
+
+    Both GPU-layer offload and CPU expert offload count layers, so both are
+    bounded by the architecture's ``<arch>.block_count``. Unreadable metadata
+    or a checkpoint that declares no block count fails open, leaving the engine
+    as the final authority rather than rejecting on metadata this library could
+    not see. Dimensions the assessment dropped are not consulted, because the
+    run will not sample them.
+    """
+    block_count = metadata.block_count if metadata is not None else None
+    if block_count is None:
+        return []
+    hints = {
+        "n_gpu_layers": "use n_gpu_layers=all to offload every layer",
+        _CPU_MOE_PARAMETER: "use n_cpu_moe=all to keep every expert layer on the CPU",
+    }
+    problems: list[str] = []
+    for dimension in space.dimensions:
+        hint = hints.get(dimension.name)
+        if hint is not None:
+            problems.extend(_layer_count_problems(dimension, block_count, model, hint))
+    return problems
+
+
 @dataclass(frozen=True, slots=True)
 class LlamaCppBackend:
     """The llama.cpp implementation of the inference backend seam.
@@ -1029,12 +1227,12 @@ class LlamaCppBackend:
 
         A tunable is applicable when its field has a ``llama-server`` target in
         :data:`PARAMETER_TARGETS`: that covers the context, slot, batch, cache,
-        attention, prefix-caching, and GPU-layer dimensions. ``dtype``, the
-        vLLM scheduling caps, and ``tensor_parallel_size`` have no engine flag,
-        so a definition may omit them and the loader does not require them. The
-        two speculative dimensions are added exactly when ``llm`` configures a
-        speculative method or draft model, so a non-speculative space stays
-        unchanged.
+        attention, prefix-caching, GPU-layer, and CPU-resident expert-layer
+        dimensions. ``dtype``, the vLLM scheduling caps, and
+        ``tensor_parallel_size`` have no engine flag, so a definition may omit
+        them and the loader does not require them. The two speculative
+        dimensions are added exactly when ``llm`` configures a speculative
+        method or draft model, so a non-speculative space stays unchanged.
         """
         applicable = frozenset(
             name
@@ -1122,6 +1320,46 @@ class LlamaCppBackend:
                 problems.append(f"draft model: {exc}")
         return problems
 
+    def assess_space(
+        self,
+        space: ExperimentSpace,
+        experiment: ExperimentConfig,
+        hardware: DetectedHardware,
+        model: Path,
+    ) -> SpaceAssessment:
+        """Derive the effective llama.cpp space for the resolved checkpoint.
+
+        Three rules apply. A checkpoint whose GGUF header confidently declares
+        no experts loses ``n_cpu_moe``, because keeping expert layers in system
+        RAM cannot change a dense model; a header that cannot be parsed is
+        unknown rather than dense, so the dimension is kept and the engine stays
+        the final authority. A CPU target then loses ``n_cpu_moe`` — no weight
+        ever leaves system RAM there — and ``n_gpu_layers`` when every value it
+        can select already disables offload. Finally, the retained dimensions
+        are bounded by the checkpoint's block count, so an exact count above it
+        is reported with the ``all`` mode as the unambiguous alternative. A
+        non-GGUF path is already reported by :meth:`validate_model`, so the
+        assessment leaves the space untouched rather than raising a second time.
+        """
+        try:
+            metadata = read_gguf_metadata(model)
+        except ExperimentError:
+            metadata = None
+        effective = space
+        notes: list[str] = []
+        if _is_dense_checkpoint(metadata):
+            effective, dropped = prune_dimensions(
+                effective, {_CPU_MOE_PARAMETER}, reason=_DENSE_CHECKPOINT_REASON
+            )
+            notes.extend(dropped)
+        effective, cpu_notes = _prune_cpu_target_dimensions(effective, hardware.target)
+        notes.extend(cpu_notes)
+        return SpaceAssessment(
+            space=effective,
+            notes=tuple(notes),
+            problems=tuple(_block_count_problems(effective, model, metadata)),
+        )
+
     def model_request(self, model: str) -> ModelRequest:
         """Decide whether ``model`` is a local GGUF file or a Hub repository.
 
@@ -1144,8 +1382,8 @@ class LlamaCppBackend:
         mapping. The checkpoint is mounted read-only at a fixed container path
         (or left for the server to fetch itself when no path was resolved), the
         server binds on every interface on the published port, the served name
-        is pinned to the configured model string, and the seven mapped tunables
-        and ``extra_args`` follow. A configured draft is mounted beside it at its
+        is pinned to the configured model string, and the mapped tunables and
+        ``extra_args`` follow. A configured draft is mounted beside it at its
         own fixed path and pointed at through the speculative arguments, or left
         for the server to fetch through its draft-repository flag. The slot count
         is cut beforehand to what the context can serve, so the benchmark's

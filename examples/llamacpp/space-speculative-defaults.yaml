@@ -9,7 +9,7 @@
 # not llama.cpp's no-speculation default — and on `num_speculative_tokens` it
 # omits `--spec-draft-n-max` so llama.cpp uses its own built-in depth.
 #
-# Only the seven parameters llama-server forwards are declared; `dtype` and
+# Only the eight parameters llama-server forwards are declared; `dtype` and
 # `tensor_parallel_size` are not applicable to a GGUF checkpoint. The slot cap
 # and context-size notes from `space-full.yaml` apply unchanged.
 space:
@@ -36,4 +36,6 @@ space:
   prefix_caching:
     fixed: true
   n_gpu_layers:
+    default: true
+  n_cpu_moe:
     default: true

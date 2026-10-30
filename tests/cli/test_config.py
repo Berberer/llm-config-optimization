@@ -69,6 +69,9 @@ def test_tunable_serving_parameters_are_left_unset_for_the_space() -> None:
     assert config.llm.num_speculative_tokens is None
     assert config.llm.prefix_caching is None
     assert config.llm.n_gpu_layers is None
+    assert config.llm.expert_parallel is None
+    assert config.llm.all2all_backend is None
+    assert config.llm.n_cpu_moe is None
     assert config.llm.resolved_draft_path is None
 
 

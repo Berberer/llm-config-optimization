@@ -1,0 +1,40 @@
+# A llama.cpp sweep over Mixture-of-Experts CPU offload: `n_cpu_moe` compares
+# no expert offload (`0`), two partial counts, and `all`.
+#
+# `--n-cpu-moe N` keeps the expert weights of the first N layers in system RAM
+# while attention and the KV cache stay on the GPU, so a GPU host can trade
+# expert compute against VRAM. `--cpu-moe` (`all`) keeps every expert layer on
+# the CPU, and `0` is the offload-off baseline.
+#
+# Exact counts are checkpoint-specific: llama.cpp accepts a count up to the
+# model's block count, and the loader cannot know that number from the space
+# alone. The counts below fit many current MoE checkpoints, but adjust them to
+# the model you serve. A count above the checkpoint's block count is rejected
+# after the model resolves rather than silently clamped; `all` names the full
+# offload without knowing the layer count.
+#
+# Every other tunable is pinned so the comparison isolates the expert offload.
+# `n_gpu_layers: all` offloads every layer to the GPU, which is what makes the
+# CPU placement of the experts meaningful, so this space is GPU-only. On a
+# CPU-only host the assessment drops `n_cpu_moe`, because no weight ever leaves
+# system RAM there.
+#
+# Only the eight parameters llama-server forwards are declared; `dtype` and
+# `tensor_parallel_size` are not applicable to a GGUF checkpoint.
+space:
+  kv_cache_dtype:
+    fixed: float16
+  max_model_len:
+    fixed: 4096
+  max_num_seqs:
+    fixed: 64
+  max_num_batched_tokens:
+    fixed: 4096
+  attention_backend:
+    default: true
+  prefix_caching:
+    fixed: true
+  n_gpu_layers:
+    fixed: all
+  n_cpu_moe:
+    categorical: [0, 8, 16, all]

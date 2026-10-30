@@ -11,7 +11,7 @@
 # every trial but only applied when the mode is enabled, so disabled points can
 # repeat across depth values; this is expected and harmless to the optimizer.
 #
-# Only the seven parameters llama-server forwards are declared; `dtype` and
+# Only the eight parameters llama-server forwards are declared; `dtype` and
 # `tensor_parallel_size` are not applicable to a GGUF checkpoint. The slot cap
 # and context-size notes from `space-full.yaml` apply unchanged.
 space:
@@ -38,4 +38,6 @@ space:
   prefix_caching:
     categorical: [true, false]
   n_gpu_layers:
+    default: true
+  n_cpu_moe:
     default: true

@@ -241,14 +241,11 @@ def test_a_matching_pinned_float_cache_dtype_is_accepted() -> None:
     [
         (Fixed(DType.FLOAT16), Fixed(KVCacheDType.BFLOAT16)),
         (Fixed(DType.BFLOAT16), Fixed(KVCacheDType.FLOAT16)),
-        (Categorical((DType.FLOAT16, DType.BFLOAT16)), Fixed(KVCacheDType.FLOAT16)),
-        (Fixed(DType.AUTO), Fixed(KVCacheDType.FLOAT16)),
-        (Default(), Fixed(KVCacheDType.BFLOAT16)),
     ],
-    ids=["wrong-float", "wrong-bfloat", "mixed-dtype", "auto-dtype", "default-dtype"],
+    ids=["float-to-bfloat", "bfloat-to-float"],
 )
-def test_an_explicit_float_cache_without_a_matching_pinned_dtype_is_reported(
-    dtype_spec: Fixed | Categorical | Default,
+def test_an_explicit_float_cache_pinned_to_the_wrong_dtype_is_reported(
+    dtype_spec: Fixed,
     cache_spec: Fixed,
 ) -> None:
     problems = validate(
@@ -262,6 +259,28 @@ def test_an_explicit_float_cache_without_a_matching_pinned_dtype_is_reported(
         problem.startswith("space.kv_cache_dtype") and "explicit float KV cache" in problem
         for problem in problems
     ), problems
+
+
+@pytest.mark.parametrize(
+    ("dtype_spec", "cache_spec"),
+    [
+        (Categorical((DType.FLOAT16, DType.BFLOAT16)), Fixed(KVCacheDType.FLOAT16)),
+        (Fixed(DType.AUTO), Fixed(KVCacheDType.FLOAT16)),
+        (Default(), Fixed(KVCacheDType.BFLOAT16)),
+    ],
+    ids=["mixed-dtype", "auto-dtype", "default-dtype"],
+)
+def test_an_explicit_float_cache_left_to_the_model_aware_assessment_is_not_reported(
+    dtype_spec: Fixed | Categorical | Default,
+    cache_spec: Fixed,
+) -> None:
+    """These pairs depend on the resolved model dtype, so pruning decides them."""
+    accepted = space(
+        Dimension("dtype", dtype_spec),
+        Dimension("kv_cache_dtype", cache_spec),
+    )
+
+    assert list(validate(accepted)) == []
 
 
 def test_an_fp8_cache_is_exempt_from_the_model_dtype_match() -> None:

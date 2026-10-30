@@ -20,6 +20,7 @@ it is a usage error rather than a value the engine ignores.
 
 import json
 import struct
+from collections.abc import Iterable
 from io import StringIO
 from pathlib import Path
 
@@ -47,7 +48,11 @@ from llm_config_optimization.inference import (
 )
 from llm_config_optimization.optimization import ObjectiveMode
 from llm_config_optimization.runtime import ContainerConfig, ContainerResult
-from llm_config_optimization.search_space import TUNABLE_PARAMETERS
+from llm_config_optimization.search_space import (
+    TUNABLE_PARAMETERS,
+    ExperimentSpace,
+    SpaceAssessment,
+)
 
 PLAN = ServerSpec(
     container=ContainerConfig(image="fake/engine:latest", command=("serve",), ports={"8000": None}),
@@ -122,6 +127,46 @@ class ModelProblemBackend(FakeBackend):
     def validate_model(self, experiment: ExperimentConfig, model: Path) -> tuple[str, ...]:
         self.model_calls.append((experiment, model))
         return self.problems
+
+
+class AssessingBackend(FakeBackend):
+    """A backend whose model-aware assessment prunes the space on request.
+
+    The returned effective space keeps the declared dimensions except ``drop``,
+    and every dropped dimension produces the kind of note a real backend
+    emits. ``problems`` are returned verbatim, so a test can observe how the
+    CLI reports a model-aware mismatch without needing an assessment rule of
+    its own. The assessment request is recorded like the shared fake's.
+    """
+
+    def __init__(
+        self,
+        *,
+        drop: Iterable[str] = (),
+        problems: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(PLAN, RESULT, [])
+        self.drop = frozenset(drop)
+        self.problems = problems
+
+    def assess_space(
+        self,
+        space: ExperimentSpace,
+        experiment: ExperimentConfig,
+        hardware: DetectedHardware,
+        model: Path,
+    ) -> SpaceAssessment:
+        self.events.append("assess_space")
+        self.assess_space_calls.append((space, experiment, hardware, model))
+        kept = tuple(dimension for dimension in space.dimensions if dimension.name not in self.drop)
+        notes = tuple(
+            f"dropped space.{dimension.name}: the checkpoint declares no experts"
+            for dimension in space.dimensions
+            if dimension.name in self.drop
+        )
+        return SpaceAssessment(
+            space=ExperimentSpace(dimensions=kept), notes=notes, problems=self.problems
+        )
 
 
 class UnresolvableModelBackend(FakeBackend):
@@ -1413,6 +1458,66 @@ def test_every_model_compatibility_problem_is_reported_before_the_image_pull(
     experiment, resolved = backend.model_calls[0]
     assert experiment.llm.quantization is None
     assert resolved == Path(model).expanduser().resolve()
+
+
+def test_the_assessment_replaces_the_declared_space_and_prints_its_notes(
+    tmp_path: Path, model: str
+) -> None:
+    """A dimension the resolved checkpoint makes meaningless never reaches a trial."""
+    space = _write_space(tmp_path / "space.yaml", expert_parallel={"fixed": True})
+    backend = AssessingBackend(drop=("expert_parallel",))
+
+    code, out, err = _invoke(model, space, "--n-trials", "1", "--output", "log", backend=backend)
+
+    assert code == 0
+    assert err == ""
+    assert "assessing search space against the resolved model" in out
+    assert "dropped space.expert_parallel" in out
+    assert len(backend.assess_space_calls) == 1
+    declared, experiment, hardware, resolved = backend.assess_space_calls[0]
+    assert "expert_parallel" in {dimension.name for dimension in declared.dimensions}
+    assert experiment.llm.expert_parallel is None
+    assert hardware.target is HardwareTarget.CPU
+    assert resolved == Path(model).expanduser().resolve()
+    assert backend.events.index("validate_model") < backend.events.index("assess_space")
+    assert len(backend.plan_calls) == 1
+    assert backend.plan_calls[0][0].llm.expert_parallel is None
+
+
+def test_a_model_aware_space_problem_takes_the_unsupported_configuration_path(
+    tmp_path: Path, model: str
+) -> None:
+    """An assessment problem fails the run before the image is pulled, like validation."""
+    space = _write_space(tmp_path / "space.yaml")
+    backend = AssessingBackend(problems=("space.n_cpu_moe: 64 exceeds 32 blocks",))
+    client = FakePodmanClient()
+
+    code, out, err = _invoke(model, space, "--n-trials", "1", backend=backend, client=client)
+
+    assert code == 4
+    assert "unsupported configuration" in err
+    assert "  - space.n_cpu_moe: 64 exceeds 32 blocks" in err
+    assert "assessing search space against the resolved model" in out
+    assert "pulling container image" not in out
+    assert "preparing study" not in out
+    assert client.pull_calls == []
+    assert backend.plan_calls == []
+
+
+def test_an_empty_effective_space_runs_exactly_one_trial(tmp_path: Path, model: str) -> None:
+    """When every dimension is pruned, one trial at engine defaults stands in."""
+    space = _write_space(tmp_path / "space.yaml")
+    backend = AssessingBackend(drop=TUNABLE_PARAMETERS)
+
+    code, out, err = _invoke(model, space, "--n-trials", "5", "--output", "log", backend=backend)
+
+    assert code == 0
+    assert err == ""
+    assert "effective search space is empty" in out
+    assert "running a single trial at engine defaults" in out
+    assert "trial 1/1 | COMPLETE" in out
+    assert "trials run: 1" in out
+    assert len(backend.plan_calls) == 1
 
 
 def test_a_non_gguf_checkpoint_is_rejected_before_the_image_pull(

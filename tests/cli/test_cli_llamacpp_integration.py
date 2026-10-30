@@ -9,7 +9,7 @@ prints one log line per completed trial, and writes the winning configuration.
 It asserts the observable contract — the exit code, the log lines, and the
 written YAML — rather than the throughput, which is hardware-dependent.
 
-The search space declares only the seven tunables llama.cpp forwards, and no
+The search space declares only the eight tunables llama.cpp forwards, and no
 engine-scoped flag is passed, so the sweep exercises the engine-scoped CLI rules
 that reject ``--quantization`` and ``--gpu-memory-utilization`` for this engine
 from the accepting side.
@@ -67,9 +67,10 @@ SPACE = {
         "attention_backend": {"default": True},
         "prefix_caching": {"fixed": True},
         "n_gpu_layers": {"fixed": 0},
+        "n_cpu_moe": {"fixed": 0},
     }
 }
-"""A mostly-fixed CPU-safe space with only llama.cpp's seven tunables declared."""
+"""A mostly-fixed CPU-safe space with only llama.cpp's eight tunables declared."""
 
 _MODEL_CACHE = (
     Path.home() / ".cache" / "huggingface" / "hub" / "models--ggml-org--test-model-stories260K"
@@ -174,6 +175,11 @@ def test_two_trial_cpu_sweep_reports_progress_and_writes_the_winner(
     assert f"model: {model}" in stdout
     assert "engine: llamacpp" in stdout
     assert "resolved target: cpu" in stdout
+    assert "assessing search space against the resolved model" in stdout
+    # The assessment drops both offload dimensions: the checkpoint is dense and
+    # a CPU target can never offload GPU layers.
+    assert "dropped space.n_gpu_layers" in stdout
+    assert "dropped space.n_cpu_moe" in stdout
     assert f"pulling container image: {llamacpp_cpu_image}" in stdout
     assert f"trial 1/{_N_TRIALS} | COMPLETE" in stdout
     assert f"trial 2/{_N_TRIALS} | COMPLETE" in stdout
@@ -204,4 +210,5 @@ def test_two_trial_cpu_sweep_reports_progress_and_writes_the_winner(
     assert document["llm"]["gpu_memory_utilization"] is None
     assert document["llm"]["seed"] == 0
     assert document["llm"]["attention_backend"] is None
-    assert document["llm"]["n_gpu_layers"] == 0
+    assert document["llm"]["n_gpu_layers"] is None
+    assert document["llm"]["n_cpu_moe"] is None

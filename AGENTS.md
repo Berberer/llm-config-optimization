@@ -14,8 +14,8 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
 
 | Package         | Owns                                                                                                 | Key files |
 | --------------- | ---------------------------------------------------------------------------------------------------- | --------- |
-| `search_space/` | Engine-neutral definition types, the tunable registry, the YAML loader, engine-agnostic and backend-support validation | `types.py`, `registry.py`, `loader.py`, `validation.py` |
-| `inference/`    | Engine-neutral experiment surface (the `InferenceBackend` protocol, `ServerSpec`, and the optional phase-rate metrics) plus the vLLM and llama.cpp backends, the host benchmark client with its Prometheus snapshots, and hardware detection | `types.py`, `_orchestrate.py`, `_benchmark.py`, `_vllm.py`, `_llamacpp.py`, `hardware.py` |
+| `search_space/` | Engine-neutral definition types including the model-aware `SpaceAssessment` result, the tunable registry, the YAML loader, engine-agnostic and backend-support validation | `types.py`, `registry.py`, `loader.py`, `validation.py` |
+| `inference/`    | Engine-neutral experiment surface (the `InferenceBackend` protocol, `ServerSpec`, the optional phase-rate metrics, and the space assessment) plus the vLLM and llama.cpp backends, the host benchmark client with its Prometheus snapshots, and hardware detection | `types.py`, `_orchestrate.py`, `_benchmark.py`, `_tunables.py`, `_vllm.py`, `_llamacpp.py`, `hardware.py` |
 | `runtime/`      | Backend-agnostic container types, the detached start/stop lifecycle, the Podman client, and the SELinux probe | `types.py`, `_podman.py`, `_selinux.py` |
 | `optimization/` | The engine-neutral objective model plus the Optuna adapter: maps spec kinds to suggestions, scores trials, drives a study, and guards study provenance | `types.py`, `_optuna.py` |
 | `output/`       | Engine-neutral winning-configuration writers: the historical YAML experiment document, the Podman quadlet, and the Docker/Podman Compose file, plus the pure-renderer contract and the format registry | `types.py`, `_yaml.py`, `_quadlet.py`, `_compose.py`, `_registry.py` |
@@ -38,12 +38,14 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
   the missing source rather than silently falling back to another measurement.
 - Engine spellings live only in each engine's own backend module: vLLM's in
   `inference/_vllm.py` (`PARAMETER_TARGETS`, `VALUE_MAPS`,
-  `_CHECKPOINT_QUANTIZATION_METHODS`, `_DEFAULT_IMAGES`, `_METRICS_PATH`,
-  `_PREFILL_RATE_SERIES`, `_DECODE_RATE_SERIES`), and llama.cpp's in
-  `inference/_llamacpp.py` (`PARAMETER_TARGETS`, `VALUE_MAPS`,
-  `_GGUF_FILE_TYPE_LABELS`, `_DEFAULT_IMAGES`, `_TIMINGS_KEY`,
-  `_PREFILL_TIMING_KEYS`, `_DECODE_TIMING_KEYS`); the search space uses
-  engine-neutral enum values.
+  `_CHECKPOINT_QUANTIZATION_METHODS`, `_CHECKPOINT_EXPERT_COUNT_KEYS`,
+  `_CHECKPOINT_DTYPE_KEYS`, `_LINEAR_ATTENTION_UNSUPPORTED_DTYPES`,
+  `_DEFAULT_IMAGES`, `_METRICS_PATH`, `_PREFILL_RATE_SERIES`,
+  `_DECODE_RATE_SERIES`), and llama.cpp's in `inference/_llamacpp.py`
+  (`PARAMETER_TARGETS`, `VALUE_MAPS`, `_CPU_MOE_ALL_FLAG`,
+  `_GGUF_EXPERT_COUNT_SUFFIX`, `_GGUF_FILE_TYPE_LABELS`, `_DEFAULT_IMAGES`,
+  `_TIMINGS_KEY`, `_PREFILL_TIMING_KEYS`, `_DECODE_TIMING_KEYS`); the search
+  space uses engine-neutral enum values.
 - The metrics seam is engine-neutral: the host client knows only the standard
   Prometheus exposition format and a spec-declared `ServerSpec.metrics_path`,
   which it scrapes before and after every measured run and stores as parsed
@@ -75,12 +77,14 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
   tokenizer decides the cap. A dataset whose preflight could not run falls back
   to one slot. The cap lives in the backend's plan; the engine-neutral surfaces
   carry none of it.
-- vLLM's `validate` rejects an explicit `float16` or `bfloat16`
-  `kv_cache_dtype` unless the `dtype` dimension is pinned to the matching model
-  dtype, because vLLM stores a non-quantized KV cache in the model dtype; the
-  FP8 cache formats are exempt. The match table is `_FLOAT_CACHE_DTYPES` in
-  `inference/_vllm.py`, and the shipped vLLM examples use `auto`/FP8 caches so
-  they stay portable across checkpoints.
+- vLLM's `validate` rejects a pinned explicit `float16` or `bfloat16`
+  `kv_cache_dtype` only when the `dtype` dimension pins exactly one different
+  explicit precision, because vLLM stores a non-quantized KV cache in the model
+  dtype; an `auto`, deferred, or multi-value dtype is reconciled by
+  `assess_space` once the checkpoint is readable. The FP8 cache formats are
+  exempt. The match table is `_FLOAT_CACHE_DTYPES` in `inference/_vllm.py`,
+  and the shipped vLLM examples use `auto`/FP8 caches so they stay portable
+  across checkpoints.
 - llama.cpp's `validate` rejects a space that can sample a quantized
   `kv_cache_dtype` together with `attention_backend: off`: llama.cpp refuses
   to create a quantized V cache unless flash attention is enabled, so keeping
@@ -102,6 +106,46 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
   vLLM's quantization methods in `inference/_vllm.py`, GGUF metadata in
   `inference/_llamacpp.py` — so the engine-neutral surfaces carry no checkpoint
   vocabulary.
+- `InferenceBackend.assess_space` is the checkpoint-aware space half: it
+  receives the declared space, the whole `ExperimentConfig`, the detected
+  hardware, and the resolved model path, and returns a `SpaceAssessment` — the
+  effective space, one note per change, and problems the assessment cannot fix.
+  The composition root runs it after `validate_model` and before the image is
+  pulled, prints every note, maps problems onto the
+  unsupported-configuration exit path, and runs exactly one trial at engine
+  defaults when the effective space is empty. It may remove whole dimensions or
+  narrow a `Fixed`/`Categorical` dimension's declared values, preserving
+  canonical dimension order and declared value order; an `Interval` is never
+  narrowed. A dimension narrowed to no values is a problem, not a silent engine
+  default; an unreadable checkpoint fails open, so the engine stays the final
+  authority. The rules are backend-owned: vLLM treats a readable `config.json`
+  with a positive `num_experts`, `n_routed_experts`, or `num_local_experts` —
+  top level or nested in `text_config` — as MoE, drops both MoE dimensions on a
+  confidently dense checkpoint or when the tensor-parallel ceiling cannot
+  exceed one (a deferred dimension resolves through the detected device count,
+  a missing one leaves the rule inactive), and drops only `all2all_backend`
+  when expert parallelism can never be enabled (a deferred `expert_parallel`
+  forwards no flag, so it never enables it). llama.cpp treats a readable GGUF
+  header without a positive `<arch>.expert_count` as dense, drops `n_cpu_moe`
+  on a dense checkpoint and on a CPU target, drops `n_gpu_layers` on a CPU
+  target when every value it can select is already CPU-valid, and bounds the
+  retained exact `n_cpu_moe`/`n_gpu_layers` counts and interval maxima by the
+  architecture's block count.
+- vLLM's assessment also owns its checkpoint dtype rules: `CheckpointFacts` in
+  `inference/_vllm.py` reports the preferred `model_dtype` — `dtype` or
+  `torch_dtype`, with a nested `text_config` value winning — and whether a
+  top-level or nested `layer_types` list names `linear_attention`. The
+  preferred dtype is the precision an unset/`auto` `--dtype` adopts, not an
+  allowlist of supported values. A checkpoint with linear-attention layers
+  loses `DType.FLOAT32` (`ChunkGatedDeltaRuleFunction` requires
+  `float16`/`bfloat16`); explicit `float16`/`bfloat16` KV-cache values are then
+  retained only when every dtype the narrowed `dtype` dimension can still
+  select resolves to that precision, with `auto` resolving through
+  `model_dtype` and the `auto`/FP8 cache values always retained. When the
+  `dtype` dimension relies on an `auto` or deferred choice, an unknown
+  `model_dtype` fails open and leaves the declared cache values alone.
+  llama.cpp has no dtype-narrowing rule: GGUF's `general.file_type` describes
+  weight quantization, not activation support.
 - The search space is **total over the backend's applicable set**: every
   parameter the selected backend reports in `applicable_parameters(llm)` must
   be declared, so a value never silently falls back to an engine default. The
@@ -119,8 +163,8 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
   constrains only an integer branch, so a mode name can never masquerade as a
   numeric bound; booleans are strict and are never coerced from integers or
   strings; and numeric floors come from the loader (`_POSITIVE_PARAMETERS`,
-  plus `_NON_NEGATIVE_PARAMETERS` for `n_gpu_layers`, whose `0` disables
-  offload).
+  plus `_NON_NEGATIVE_PARAMETERS` for `n_gpu_layers` and `n_cpu_moe`, whose
+  `0` disables offload).
 - `n_gpu_layers` is llama.cpp-only: `GpuLayersMode` (`auto`, `all`) and exact
   integer counts are engine-neutral in `inference/types.py`, and
   `inference/_llamacpp.py` maps the modes and passes integers through as
@@ -129,6 +173,17 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
   the checkpoint resolves, an exact count above the GGUF architecture's block
   count is rejected with a pointer to `all`, and unreadable metadata fails
   open. The engine-neutral surfaces carry none of this vocabulary.
+- The MoE tunables are engine-neutral in the same way: `All2AllBackend`
+  (`allgather_reducescatter`, `naive`) and `CpuMoeMode` (`all`) live in
+  `inference/types.py`, and the engines' spellings stay in their modules. vLLM
+  forwards `expert_parallel` as a toggle in both directions
+  (`--enable-expert-parallel` / `--no-enable-expert-parallel`) and
+  `all2all_backend` as `--all2all-backend`; llama.cpp forwards an exact
+  `n_cpu_moe` count as `--n-cpu-moe N` and the `all` mode as the value-less
+  `--cpu-moe`, so the mode never becomes `--n-cpu-moe all`. `n_cpu_moe` accepts
+  `0`, which disables the offload. Each backend omits the settings only the
+  other forwards, so a cross-engine dimension is rejected by the per-dimension
+  support check.
 - A trial is host-driven: the backend plans an engine-neutral `ServerSpec` and
   the orchestrator starts the server container, drives it with the host
   benchmark client, stops it, and hands the measured outcome to
@@ -170,7 +225,8 @@ live under `src/llm_config_optimization/`; each exposes its public surface throu
 
 - **New inference engine** — implement `InferenceBackend` (`inference/types.py`):
   `applicable_parameters(llm)`, `validate(space, llm, hardware)`,
-  `validate_model`, `model_request`, `image_for`, `plan`, `parse_result`.
+  `validate_model`, `assess_space`, `model_request`, `image_for`, `plan`,
+  `parse_result`.
   `plan` returns a `ServerSpec`, so the shared host client and orchestrator need
   no engine-specific code; an engine
   with a scrapeable exposition declares `ServerSpec.metrics_path` and derives
@@ -241,7 +297,10 @@ Code:
   `_NON_NEGATIVE_PARAMETERS` for a `>= 0` floor such as an offload count.
 - [ ] `inference/_vllm.py`/`inference/_llamacpp.py` — if the engine imposes a
   cross-parameter rule, add it to `_ENGINE_BOUNDS` (or the equivalent
-  engine-specific validation).
+  engine-specific validation). If the parameter cannot affect some checkpoints,
+  targets, or fixed configurations, extend the backend's `assess_space` with
+  the rule that drops it, and report a model-aware problem when a declared
+  value is unusable rather than letting the trial fail at server startup.
 - [ ] `cli/arguments.py` + `cli/config.py` — only if the parameter should also
   be settable outside a sweep (like `seed` / `gpu_memory_utilization`, which are
   CLI flags and non-tunables). A pure tuning dimension needs no CLI change.
@@ -250,14 +309,17 @@ Docs and examples:
 
 - [ ] `docs/search-space.md` — add a row to the *Tunable parameters* table,
   fix the per-engine parameter counts in the surrounding prose ("vLLM forwards
-  all seven parameters below", "llama.cpp forwards all but ..."), and add the
+  twelve of the fourteen base parameters below", "llama.cpp forwards all but
+  ...") and the counts repeated in `docs/usage.md`'s engine table, and add the
   new dimension to the example YAML snippets so they stay complete. A gated
   dimension is documented in `docs/speculative-decoding.md` as well, and its
-  applicability rule is noted in `docs/architecture.md`.
+  applicability rule is noted in `docs/architecture.md`. A model-dependent
+  dimension needs its pruning rule in the *Model-aware assessment* section and
+  the invariant above.
 - [ ] Every example space whose backend forwards the parameter — vLLM's
-  `examples/vllm/space-full.yaml`, `space-all-fixed.yaml`,
+  `examples/vllm/space-full.yaml`, `space-all-fixed.yaml`, `space-moe.yaml`,
   `space-speculative-defaults.yaml`, and `space-speculative-full.yaml`, and
-  llama.cpp's corresponding four under `examples/llamacpp/` — declares it, over
+  llama.cpp's corresponding five under `examples/llamacpp/` — declares it, over
   its full range or pinned to one value respectively.
 - [ ] `AGENTS.md` — update this checklist only if the parameter introduces a new
   invariant (for example a new engine-neutral enum, or a new non-tunable field).
@@ -288,17 +350,22 @@ builds the base configuration, asks the backend's `model_request` what the main
 model and — when configured — the draft model refer to, resolves or downloads
 both through the shared progress helper, records them on
 `BenchmarkConfig.resolved_path` and `LLMConfig.resolved_draft_path`, asks the
-backend to `validate_model` each, warns when speculation runs on the synthetic
-workload without a dataset, pulls the image, tokenizes a JSONL dataset once
-through the backend's declared tokenizer endpoint so llama.cpp can cap its
-slots, then calls `optimization.optimize`. Each trial: Optuna samples a point → `inference`
-plans a `ServerSpec` → `runtime` starts the server container detached and
-resolves its host port → the host benchmark client waits for health, takes the
-warmup and measured runs, scraping the spec's metrics path around each measured
-run when one is declared, and aggregates them → `runtime` stops the container →
-the backend parses the outcome into a result and enriches it with the phase
-rates its engine reported → the selected objective maps the result to the trial
-value → the reporter callback runs. After the sweep — or on an interrupt — the
+backend to `validate_model` each, assesses the space against the resolved
+checkpoint, the fixed configuration, and the detected hardware, and replaces it
+with the effective one — printing one note per dropped dimension or narrowed
+value, failing through the unsupported path on a model-aware problem, and
+forcing a single trial when nothing remains — warns when speculation runs on
+the synthetic workload without a dataset, pulls the image, tokenizes a JSONL
+dataset once through the backend's declared tokenizer endpoint so llama.cpp can
+cap its slots, then calls `optimization.optimize`. Each trial: Optuna samples a
+point → `inference` plans a `ServerSpec` → `runtime` starts the server
+container detached and resolves its host port → the host benchmark client waits
+for health, takes the warmup and measured runs, scraping the spec's metrics
+path around each measured run when one is declared, and aggregates them →
+`runtime` stops the container → the backend parses the outcome into a result
+and enriches it with the phase rates its engine reported → the selected
+objective maps the result to the trial value → the reporter callback runs.
+After the sweep — or on an interrupt — the
 finish path prints the summary and, when `--output-config` is set, renders the
 recommended configuration through the format's writer: YAML from the config
 plus the resolved target and image alone, while `quadlet` and `compose` first

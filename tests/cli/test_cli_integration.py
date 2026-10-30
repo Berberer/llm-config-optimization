@@ -65,6 +65,11 @@ SPACE = {
         "tensor_parallel_size": {"fixed": 1},
         "attention_backend": {"default": True},
         "prefix_caching": {"fixed": True},
+        # opt-125m is dense, so the model-aware assessment drops both MoE
+        # dimensions before the sweep; they are still declared because the
+        # space is total over vLLM's applicable set.
+        "expert_parallel": {"default": True},
+        "all2all_backend": {"default": True},
     }
 }
 """A mostly-fixed CPU-safe space with one dimension the sweep varies."""
@@ -204,3 +209,5 @@ def test_two_trial_cpu_sweep_reports_progress_and_writes_the_winner(
     assert document["llm"]["gpu_memory_utilization"] == _CPU_MEMORY_UTILIZATION
     assert document["llm"]["seed"] == _CPU_SEED
     assert document["llm"]["attention_backend"] is None
+    assert document["llm"]["expert_parallel"] is None
+    assert document["llm"]["all2all_backend"] is None

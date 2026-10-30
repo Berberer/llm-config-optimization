@@ -26,3 +26,8 @@ space:
     fixed: flash_attention
   prefix_caching:
     fixed: true
+  # Expert parallelism is a no-op at tensor_parallel_size=1, so pin it off.
+  expert_parallel:
+    fixed: false
+  all2all_backend:
+    fixed: allgather_reducescatter

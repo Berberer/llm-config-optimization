@@ -2,7 +2,7 @@
 # with nothing for the optimizer to search. A sweep over this space runs exactly
 # one configuration, which is useful as a reference point before widening it.
 #
-# Only the seven parameters llama-server forwards are declared. `dtype` and
+# Only the eight parameters llama-server forwards are declared. `dtype` and
 # `tensor_parallel_size` are absent by design: a GGUF file carries its own
 # numerical format and llama.cpp has no tensor parallelism.
 #
@@ -28,3 +28,7 @@ space:
     fixed: true
   n_gpu_layers:
     fixed: all
+  # A dense checkpoint has no experts to keep on the CPU, and the baseline
+  # pins the offload off rather than leaving it to the engine.
+  n_cpu_moe:
+    fixed: 0

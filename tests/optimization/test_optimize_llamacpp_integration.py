@@ -102,6 +102,7 @@ SPACE = ExperimentSpace(
         Dimension("attention_backend", Default()),
         Dimension("prefix_caching", Fixed(True)),
         Dimension("n_gpu_layers", Fixed(0)),
+        Dimension("n_cpu_moe", Fixed(0)),
     )
 )
 """A mostly-fixed CPU-safe space declaring exactly llama.cpp's applicable set."""
@@ -201,6 +202,7 @@ def test_two_trial_sweep_returns_a_usable_best_configuration(
     assert best.llm.gpu_memory_utilization is None
     assert best.llm.attention_backend is None
     assert best.llm.n_gpu_layers == 0
+    assert best.llm.n_cpu_moe == 0
     assert best.llm.seed == _SEED
 
     recorded = result.study.best_trial.user_attrs["result"]

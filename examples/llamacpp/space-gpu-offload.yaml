@@ -13,8 +13,9 @@
 # the counts you want to compare, for example `categorical: [auto, 0, 8, 16, all]`;
 # a count above the block count is rejected by the model-aware validation.
 #
-# Only the seven parameters llama-server forwards are declared. `dtype` and
-# `tensor_parallel_size` are not applicable to a GGUF checkpoint.
+# Only the eight parameters llama-server forwards are declared. `dtype` and
+# `tensor_parallel_size` are not applicable to a GGUF checkpoint. `n_cpu_moe`
+# defers to the engine so it stays out of this GPU-offload comparison.
 space:
   kv_cache_dtype:
     fixed: float16
@@ -30,3 +31,5 @@ space:
     fixed: true
   n_gpu_layers:
     categorical: [auto, 0, all]
+  n_cpu_moe:
+    default: true

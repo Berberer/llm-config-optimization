@@ -2,9 +2,11 @@
 
 Both backends build on the same helpers, so this module pins the generic
 contract directly: how a declared dimension contributes problem paths, how an
-engine-neutral enum is translated through a backend's map, and how an
-unspellable member is reported. The engine maps themselves stay in the backend
-tests; these tests use small inline maps.
+engine-neutral enum is translated through a backend's map, how an unspellable
+member is reported, and how a model-aware assessment derives the effective
+space — dropping dimensions and narrowing declared values while preserving
+their order. The engine maps and pruning rules themselves stay in the backend
+tests; these tests use small inline maps and spaces.
 """
 
 from types import MappingProxyType
@@ -15,6 +17,8 @@ from llm_config_optimization.inference import DType, ExperimentError, KVCacheDTy
 from llm_config_optimization.inference._tunables import (
     Toggle,
     declared_values,
+    narrow_values,
+    prune_dimensions,
     toggle_arguments,
     translate_value,
     unsupported_values,
@@ -23,8 +27,10 @@ from llm_config_optimization.search_space import (
     Categorical,
     Default,
     Dimension,
+    ExperimentSpace,
     Fixed,
     Interval,
+    Spec,
 )
 
 _DTYPE_MAP = MappingProxyType({"dtype": MappingProxyType({DType.FLOAT16: "float16"})})
@@ -117,3 +123,112 @@ def test_a_non_enum_value_skips_the_value_map_check() -> None:
     dimension = Dimension("dtype", Fixed("float16"))
 
     assert unsupported_values(dimension, "dtype", {}, engine="engine") == []
+
+
+def _space(*dimensions: Dimension) -> ExperimentSpace:
+    """Assemble a space from explicit dimensions, bypassing the file parser."""
+    return ExperimentSpace(dimensions=dimensions)
+
+
+def test_pruning_removes_only_the_named_dimensions_in_canonical_order() -> None:
+    definition = _space(
+        Dimension("max_num_seqs", Fixed(4)),
+        Dimension("expert_parallel", Fixed(True)),
+        Dimension("all2all_backend", Default()),
+        Dimension("prefix_caching", Fixed(True)),
+    )
+
+    effective, notes = prune_dimensions(
+        definition, {"expert_parallel", "all2all_backend"}, reason="the model has no experts"
+    )
+
+    assert [dimension.name for dimension in effective.dimensions] == [
+        "max_num_seqs",
+        "prefix_caching",
+    ]
+    assert notes == (
+        "dropped space.expert_parallel: the model has no experts",
+        "dropped space.all2all_backend: the model has no experts",
+    )
+
+
+def test_pruning_a_parameter_the_space_omits_changes_nothing() -> None:
+    definition = _space(Dimension("max_num_seqs", Fixed(4)))
+
+    effective, notes = prune_dimensions(definition, {"n_cpu_moe"}, reason="irrelevant")
+
+    assert effective is definition
+    assert notes == ()
+
+
+def test_pruning_can_leave_the_effective_space_empty() -> None:
+    definition = _space(Dimension("n_cpu_moe", Fixed(0)))
+
+    effective, notes = prune_dimensions(definition, {"n_cpu_moe"}, reason="irrelevant")
+
+    assert effective.dimensions == ()
+    assert len(notes) == 1
+
+
+def _reject_float32(value: object) -> str | None:
+    """Stand in for a model-aware rule that rejects one dtype value."""
+    return "the checkpoint's kernels reject it" if value is DType.FLOAT32 else None
+
+
+def test_narrowing_keeps_the_retained_values_in_declared_order() -> None:
+    definition = _space(
+        Dimension("dtype", Categorical((DType.BFLOAT16, DType.FLOAT32, DType.FLOAT16))),
+        Dimension("prefix_caching", Fixed(True)),
+    )
+
+    narrowed = narrow_values(definition, "dtype", _reject_float32)
+
+    assert narrowed.space.dimensions == (
+        Dimension("dtype", Categorical((DType.BFLOAT16, DType.FLOAT16))),
+        Dimension("prefix_caching", Fixed(True)),
+    )
+    assert narrowed.notes == (
+        "dropped space.dtype.categorical[1] (float32): the checkpoint's kernels reject it",
+    )
+    assert narrowed.emptied is False
+
+
+def test_narrowing_a_fixed_dimension_to_nothing_reports_it_emptied() -> None:
+    definition = _space(Dimension("dtype", Fixed(DType.FLOAT32)))
+
+    narrowed = narrow_values(definition, "dtype", _reject_float32)
+
+    assert narrowed.space is definition
+    assert narrowed.notes == ()
+    assert narrowed.emptied is True
+
+
+@pytest.mark.parametrize("spec", [Interval(1, 2), Default()], ids=["interval", "default"])
+def test_a_value_less_dimension_is_never_narrowed(spec: Spec) -> None:
+    definition = _space(Dimension("max_num_seqs", spec))
+
+    narrowed = narrow_values(definition, "max_num_seqs", _reject_float32)
+
+    assert narrowed.space is definition
+    assert narrowed.notes == ()
+    assert narrowed.emptied is False
+
+
+def test_narrowing_a_parameter_the_space_omits_changes_nothing() -> None:
+    definition = _space(Dimension("max_num_seqs", Fixed(4)))
+
+    narrowed = narrow_values(definition, "dtype", _reject_float32)
+
+    assert narrowed.space is definition
+    assert narrowed.notes == ()
+    assert narrowed.emptied is False
+
+
+def test_narrowing_that_rejects_nothing_changes_nothing() -> None:
+    definition = _space(Dimension("dtype", Categorical((DType.FLOAT16, DType.BFLOAT16))))
+
+    narrowed = narrow_values(definition, "dtype", lambda value: None)
+
+    assert narrowed.space is definition
+    assert narrowed.notes == ()
+    assert narrowed.emptied is False

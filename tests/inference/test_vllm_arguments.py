@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from llm_config_optimization.inference import (
+    All2AllBackend,
     AttentionBackend,
     DType,
     ExperimentError,
@@ -35,12 +36,13 @@ from llm_config_optimization.inference._vllm import (
     serve_arguments,
 )
 
-_INAPPLICABLE_FIELDS = frozenset({"resolved_draft_path", "n_gpu_layers"})
+_INAPPLICABLE_FIELDS = frozenset({"resolved_draft_path", "n_gpu_layers", "n_cpu_moe"})
 """The :class:`LLMConfig` fields vLLM has no target for.
 
 ``resolved_draft_path`` is a host-side resolution artifact that an engine never
 receives; the speculative settings reach the engine through their group.
-``n_gpu_layers`` is llama.cpp's GPU-offload knob and has no vLLM equivalent.
+``n_gpu_layers`` and ``n_cpu_moe`` are llama.cpp's GPU-offload and
+CPU-resident expert-layer knobs and have no vLLM equivalent.
 """
 
 
@@ -117,6 +119,16 @@ def test_prefix_caching_emits_the_enabling_or_disabling_flag() -> None:
     assert serve_arguments(LLMConfig(prefix_caching=False)) == ["--no-enable-prefix-caching"]
 
 
+def test_expert_parallel_emits_the_enabling_or_disabling_flag() -> None:
+    """Both sides of the MoE switch are explicit, so ``False`` is a real setting."""
+    assert serve_arguments(LLMConfig(expert_parallel=True)) == ["--enable-expert-parallel"]
+    assert serve_arguments(LLMConfig(expert_parallel=False)) == ["--no-enable-expert-parallel"]
+
+
+def test_an_unset_expert_parallel_emits_neither_flag() -> None:
+    assert serve_arguments(LLMConfig(expert_parallel=None)) == []
+
+
 def test_an_unset_prefix_caching_emits_neither_flag() -> None:
     assert serve_arguments(LLMConfig(prefix_caching=None)) == []
 
@@ -163,6 +175,10 @@ def test_every_curated_value_has_a_vllm_spelling() -> None:
     assert VALUE_MAPS["speculative_mode"] == {
         SpeculativeMode.ENABLED: "enabled",
         SpeculativeMode.DISABLED: "disabled",
+    }
+    assert VALUE_MAPS["all2all_backend"] == {
+        All2AllBackend.ALLGATHER_REDUCESCATTER: "allgather_reducescatter",
+        All2AllBackend.NAIVE: "naive",
     }
 
 
@@ -220,6 +236,16 @@ def test_every_curated_value_has_a_vllm_spelling() -> None:
             "speculative_method",
             SpeculativeMethod.NGRAM,
             ["--speculative-config", '{"method": "ngram"}'],
+        ),
+        (
+            "all2all_backend",
+            All2AllBackend.ALLGATHER_REDUCESCATTER,
+            ["--all2all-backend", "allgather_reducescatter"],
+        ),
+        (
+            "all2all_backend",
+            All2AllBackend.NAIVE,
+            ["--all2all-backend", "naive"],
         ),
     ],
 )

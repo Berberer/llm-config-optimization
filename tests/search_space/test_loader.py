@@ -16,7 +16,9 @@ import pytest
 import yaml
 
 from llm_config_optimization.inference import (
+    All2AllBackend,
     AttentionBackend,
+    CpuMoeMode,
     DType,
     GpuLayersMode,
     SpeculativeMode,
@@ -48,6 +50,9 @@ VALID_SPACE: dict[str, object] = {
     "num_speculative_tokens": {"interval": {"min": 1, "max": 5}},
     "prefix_caching": {"fixed": True},
     "n_gpu_layers": {"default": True},
+    "expert_parallel": {"fixed": False},
+    "all2all_backend": {"categorical": ["allgather_reducescatter", "naive"]},
+    "n_cpu_moe": {"categorical": [0, 8, "all"]},
 }
 """A complete, valid definition covering every tunable and every spec kind."""
 
@@ -101,6 +106,12 @@ def test_a_complete_definition_parses_into_the_expected_dimensions() -> None:
         Dimension("num_speculative_tokens", Interval(1, 5)),
         Dimension("prefix_caching", Fixed(True)),
         Dimension("n_gpu_layers", Default()),
+        Dimension("expert_parallel", Fixed(False)),
+        Dimension(
+            "all2all_backend",
+            Categorical((All2AllBackend.ALLGATHER_REDUCESCATTER, All2AllBackend.NAIVE)),
+        ),
+        Dimension("n_cpu_moe", Categorical((0, 8, CpuMoeMode.ALL))),
     )
 
 
@@ -133,6 +144,40 @@ def test_each_spec_kind_parses_to_its_engine_neutral_type(
     space = parse_experiment_space(only_space(name, spec))
 
     assert spec_of(space, name) == expected
+
+
+def test_the_all2all_backend_coerces_its_string_values_to_the_enum() -> None:
+    space = parse_only("all2all_backend", {"categorical": ["allgather_reducescatter", "naive"]})
+
+    assert spec_of(space, "all2all_backend") == Categorical(
+        (All2AllBackend.ALLGATHER_REDUCESCATTER, All2AllBackend.NAIVE)
+    )
+
+
+def test_the_all2all_backend_rejects_an_engine_spelling() -> None:
+    with pytest.raises(ExperimentDefinitionError) as excinfo:
+        parse_only("all2all_backend", {"fixed": "deepep"})
+
+    assert any(
+        "space.all2all_backend.fixed: 'deepep' is not a valid All2AllBackend" in problem
+        for problem in excinfo.value.problems
+    ), excinfo.value.problems
+
+
+def test_the_n_cpu_moe_dimension_accepts_zero_and_the_all_mode() -> None:
+    space = parse_only("n_cpu_moe", {"categorical": [0, 8, "all"]})
+
+    assert spec_of(space, "n_cpu_moe") == Categorical((0, 8, CpuMoeMode.ALL))
+
+
+def test_the_n_cpu_moe_dimension_rejects_a_negative_count() -> None:
+    with pytest.raises(ExperimentDefinitionError) as excinfo:
+        parse_only("n_cpu_moe", {"fixed": -1})
+
+    assert any(
+        "space.n_cpu_moe.fixed: value must be at least 0, got -1" in problem
+        for problem in excinfo.value.problems
+    ), excinfo.value.problems
 
 
 def test_every_missing_tunable_is_named_with_its_accepted_spec_kinds() -> None:

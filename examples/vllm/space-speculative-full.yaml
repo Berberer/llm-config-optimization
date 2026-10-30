@@ -49,3 +49,7 @@ space:
     categorical: [1, 2, 4, 8]
   prefix_caching:
     categorical: [true, false]
+  expert_parallel:
+    categorical: [true, false]
+  all2all_backend:
+    categorical: [allgather_reducescatter, naive]

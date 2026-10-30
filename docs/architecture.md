@@ -23,21 +23,23 @@ Part of the [README](../README.md) documentation.
 
 The codebase is layered so engine details stay at the edges:
 
-- `search_space/`: Engine-neutral definition types, the tunable registry, the
-  YAML loader, and validation. Each tunable's kind is derived from its
-  `LLMConfig` annotation — enum, integer, boolean, or an int-or-enum union such
-  as `n_gpu_layers` — so `interval` constrains only a numeric branch and
-  booleans stay strict.
+- `search_space/`: Engine-neutral definition types — including the
+  `SpaceAssessment` result a backend returns for a resolved model — the tunable
+  registry, the YAML loader, and validation. Each tunable's kind is derived from
+  its `LLMConfig` annotation — enum, integer, boolean, or an int-or-enum union
+  such as `n_gpu_layers` or `n_cpu_moe` — so `interval` constrains only a
+  numeric branch and booleans stay strict.
 - `inference/`: The engine-neutral experiment surface (the `InferenceBackend`
   `Protocol` and the `ServerSpec` a backend plans) plus the `VLLMBackend` and
   `LlamaCppBackend`, the host-side benchmark client, and hardware detection. A
   backend reports the tunables applicable to the run's fixed `LLMConfig`
   (`applicable_parameters(llm)`), validates a space and that configuration
-  (`validate(space, llm, hardware)`), validates a resolved checkpoint, plans a
-  `ServerSpec`, and parses results; the client waits for the server's health —
-  failing the run as soon as the container exits during that wait — takes the
-  warmup and measured runs, snapshots the spec's declared metrics path around
-  each one, and aggregates the metrics. A second engine is another
+  (`validate(space, llm, hardware)`), validates a resolved checkpoint
+  (`validate_model`), assesses the declared space against it (`assess_space`),
+  plans a `ServerSpec`, and parses results; the client waits for the server's
+  health — failing the run as soon as the container exits during that wait —
+  takes the warmup and measured runs, snapshots the spec's declared metrics
+  path around each one, and aggregates the metrics. A second engine is another
   implementation of the protocol.
 - `runtime/`: Backend-agnostic container types, the detached start/stop
   lifecycle a host-driven run uses, and the Podman client (plus SELinux
@@ -92,9 +94,49 @@ resolved checkpoint's GGUF block count is caught once the metadata is readable,
 failing open otherwise. Its KV-cache validation rejects a space that can pair a
 quantized `kv_cache_dtype` with `attention_backend: off`, because llama.cpp
 refuses to build a quantized V cache without flash attention. vLLM's space
-validation likewise rejects an explicit `float16`/`bfloat16` cache unless
-`dtype` pins the matching model dtype, since the engine stores a non-quantized
-KV cache in the model dtype.
+validation likewise rejects an explicit `float16`/`bfloat16` cache when `dtype`
+pins exactly one different explicit precision, since the engine stores a
+non-quantized KV cache in the model dtype; `auto`, deferred, and multi-value
+dtype pairs are reconciled once the checkpoint is readable.
+
+Checkpoint-aware work is split between two backend hooks. `validate_model`
+rejects a configuration the checkpoint cannot serve — a quantization method it
+was not produced with, a non-GGUF file, an exact `n_gpu_layers` count above the
+GGUF architecture's block count — and returns problems rather than raising.
+`assess_space` then turns the declared space into the effective one the sweep
+runs: dimensions the resolved model, hardware, or fixed configuration make
+meaningless are removed, and a `fixed` or `categorical` dimension can be
+narrowed to the declared values the checkpoint can actually run. Every change
+is one note, and a mismatch the assessment cannot fix is reported through the
+same unsupported-configuration path. A dimension whose every declared value is
+removed is such a problem rather than a silent fallback to an engine default,
+while a space with no dimensions left runs once at engine defaults.
+
+The MoE rules are one family: vLLM reads `config.json` expert keys and
+llama.cpp the GGUF `<arch>.expert_count`, so a confidently dense checkpoint
+loses its MoE dimensions; a CPU target loses llama.cpp's offload dimensions it
+cannot use; and a vLLM space whose tensor-parallel ceiling is one loses expert
+parallelism with its all-to-all transport. Retained `n_cpu_moe` and
+`n_gpu_layers` counts are then bounded by the architecture's block count.
+vLLM's `CheckpointFacts` reader also reports the preferred model dtype —
+`dtype`/`torch_dtype`, with a nested `text_config` value winning — and whether
+any layer type is `linear_attention`. Those facts drive a kernel rule, not a
+supported-dtype allowlist: the declared dtype is the precision `auto` resolves
+to, and a linear-attention checkpoint loses `float32` because its kernel
+requires a half-precision activation. Explicit float KV-cache values are then
+reconciled against the dtypes the narrowed dimension can still select, with
+`auto` resolving through the checkpoint's declared dtype; `auto` and FP8 cache
+values are always retained. llama.cpp has no equivalent rule — GGUF's
+`general.file_type` describes weight quantization, not activation support.
+
+Every rule that reads the checkpoint fails open: unreadable or incomplete
+metadata leaves the affected dimensions as declared, so the engine stays the
+final authority for a checkpoint the reader cannot see. The rules that decide
+from the declared space and the detected hardware alone — vLLM's
+tensor-parallel/expert-parallel dependency and llama.cpp's CPU-target pruning —
+still apply, because they do not depend on checkpoint metadata. Detection and
+rules live in the backend modules that own the engine's format and vocabulary;
+the CLI only prints the notes and runs the effective space.
 
 ## Data flow
 
@@ -102,12 +144,18 @@ KV cache in the model dtype.
 selected backend's `applicable_parameters(base.llm)`, asks the backend to
 `validate` it, builds the base configuration, resolves or downloads the main and
 configured draft models through the backend's `model_request` rules, validates
-the resolved checkpoints, and pulls the image. A JSONL dataset is tokenized once
-through the backend's declared tokenizer endpoint before the sweep when the
-engine needs a request-length cap. `optimization.optimize` then drives the study:
-Optuna samples a point → the backend plans an engine-neutral `ServerSpec` →
-`runtime` starts the server container detached and resolves its host port → the
-host benchmark client waits for health, takes the warmup and measured runs
+the resolved checkpoints, assesses the declared space against them and the
+detected hardware, and pulls the image. The assessment replaces the declared
+space with the effective one and prints one note per dropped dimension or
+narrowed value; a model-aware problem exits through the
+unsupported-configuration path before the pull, and an effective space with no
+dimensions runs exactly one trial at engine defaults. A JSONL dataset is
+tokenized once through the backend's declared tokenizer endpoint before the
+sweep when the engine needs a request-length cap.
+`optimization.optimize` then drives the study: Optuna samples a point → the
+backend plans an engine-neutral `ServerSpec` → `runtime` starts the server
+container detached and resolves its host port → the host benchmark client waits
+for health, takes the warmup and measured runs
 (scraping the spec's metrics path around each measured run when one is declared),
 and aggregates them → `runtime` stops the container → the backend parses the
 outcome and enriches it with the phase rates its engine reported → the selected

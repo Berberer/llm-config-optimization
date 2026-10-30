@@ -11,7 +11,9 @@ from dataclasses import fields
 import pytest
 
 from llm_config_optimization.inference import (
+    All2AllBackend,
     AttentionBackend,
+    CpuMoeMode,
     DType,
     GpuLayersMode,
     KVCacheDType,
@@ -42,6 +44,9 @@ TUNABLES = (
     "num_speculative_tokens",
     "prefix_caching",
     "n_gpu_layers",
+    "expert_parallel",
+    "all2all_backend",
+    "n_cpu_moe",
 )
 
 
@@ -73,15 +78,25 @@ def test_registry_maps_every_tunable_to_an_llm_config_field() -> None:
         ("speculative_mode", SpeculativeMode),
         ("num_speculative_tokens", int),
         ("prefix_caching", bool),
+        ("expert_parallel", bool),
+        ("all2all_backend", All2AllBackend),
     ],
 )
 def test_expected_kind_is_read_from_the_config_annotation(parameter: str, kind: type) -> None:
     assert expected_kind(TUNABLE_PARAMETERS[parameter]) is kind
 
 
-def test_expected_kind_resolves_the_gpu_layers_union() -> None:
-    """The real field resolves to both branches, integer first."""
-    assert expected_kind("n_gpu_layers") == UnionKind((int, GpuLayersMode))
+@pytest.mark.parametrize(
+    ("parameter", "kind"),
+    [
+        ("n_gpu_layers", UnionKind((int, GpuLayersMode))),
+        ("n_cpu_moe", UnionKind((int, CpuMoeMode))),
+    ],
+    ids=["gpu-layers", "cpu-moe"],
+)
+def test_expected_kind_resolves_an_int_or_enum_union(parameter: str, kind: UnionKind) -> None:
+    """Both union fields resolve to both branches, integer first."""
+    assert expected_kind(parameter) == kind
 
 
 def test_expected_kind_resolves_a_boolean_annotation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -120,7 +135,7 @@ def test_prefix_caching_is_applicable_on_both_engines() -> None:
 def test_the_vllm_backend_declares_every_ungated_tunable_it_forwards_as_applicable() -> None:
     """Without a configured setup, the gated and llama.cpp-only dimensions are withheld."""
     assert VLLMBackend().applicable_parameters(LLMConfig()) == (
-        frozenset(TUNABLE_PARAMETERS) - SPECULATIVE_PARAMETERS - {"n_gpu_layers"}
+        frozenset(TUNABLE_PARAMETERS) - SPECULATIVE_PARAMETERS - {"n_gpu_layers", "n_cpu_moe"}
     )
 
 
@@ -136,5 +151,5 @@ def test_a_configured_speculative_setup_makes_the_gated_tunables_applicable(
     llm: LLMConfig,
 ) -> None:
     assert VLLMBackend().applicable_parameters(llm) == (
-        frozenset(TUNABLE_PARAMETERS) - {"n_gpu_layers"}
+        frozenset(TUNABLE_PARAMETERS) - {"n_gpu_layers", "n_cpu_moe"}
     )

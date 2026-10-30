@@ -1,4 +1,4 @@
-# The complete llama.cpp search space: only the seven parameters llama-server
+# The complete llama.cpp search space: only the eight parameters llama-server
 # forwards are declared. `dtype` and `tensor_parallel_size` are not applicable
 # and must be omitted — a GGUF checkpoint carries its own numerical format, and
 # llama.cpp spreads requests over `--parallel` slots rather than tensor-parallel
@@ -8,11 +8,12 @@
 # `--cache-type-k`/`--cache-type-v`, `max_model_len` to `--ctx-size`,
 # `max_num_seqs` to `--parallel`, `max_num_batched_tokens` to `--batch-size`
 # and `--ubatch-size`, `attention_backend` to `--flash-attn`, `prefix_caching`
-# to `--cache-prompt`/`--no-cache-prompt`, and `n_gpu_layers` to
-# `--n-gpu-layers`.
+# to `--cache-prompt`/`--no-cache-prompt`, `n_gpu_layers` to `--n-gpu-layers`,
+# and `n_cpu_moe` to `--n-cpu-moe` or the value-less `--cpu-moe`.
 #
-# `n_gpu_layers` defers to the engine so this space stays host-agnostic; sweep
-# it explicitly on a GPU host to compare partial and full offload.
+# `n_gpu_layers` and `n_cpu_moe` defer to the engine so this space stays
+# host-agnostic; sweep them explicitly on a GPU host to compare partial and
+# full offload, and on an MoE checkpoint to trade expert compute against VRAM.
 #
 # The enum ranges list only values llama.cpp can serve: the float and quantized
 # cache formats are modelled, while `auto` and the FP8 members have no KV-cache
@@ -51,4 +52,6 @@ space:
   prefix_caching:
     categorical: [true, false]
   n_gpu_layers:
+    default: true
+  n_cpu_moe:
     default: true

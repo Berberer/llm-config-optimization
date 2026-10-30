@@ -15,10 +15,12 @@ from ._orchestrate import measure_dataset_request_tokens, run_experiment
 from ._vllm import VLLMBackend
 from .hardware import detect_hardware
 from .types import (
+    All2AllBackend,
     AttentionBackend,
     BenchmarkConfig,
     BenchmarkOutcome,
     ContainerRuntimeConfig,
+    CpuMoeMode,
     DetectedHardware,
     DType,
     ExperimentConfig,
@@ -40,11 +42,13 @@ from .types import (
 )
 
 __all__ = [
+    "All2AllBackend",
     "AttentionBackend",
     "BenchmarkClient",
     "BenchmarkConfig",
     "BenchmarkOutcome",
     "ContainerRuntimeConfig",
+    "CpuMoeMode",
     "DType",
     "DetectedHardware",
     "ExperimentConfig",

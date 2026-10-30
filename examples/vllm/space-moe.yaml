@@ -1,0 +1,50 @@
+# A vLLM sweep over Mixture-of-Experts parallelism: tensor parallelism is
+# pinned above one so the model's experts are actually sharded, expert
+# parallelism is always enabled, and the two portable all-to-all transports
+# compete. Every other tunable is pinned so the comparison isolates the
+# transport.
+#
+# `tensor_parallel_size: 2` needs a host with at least two devices; raise it
+# only as far as the host's device count allows. vLLM derives its expert-parallel
+# size from the tensor-parallel and data-parallel sizes, so at a
+# tensor-parallel size of one both this toggle and the transport would be
+# no-ops.
+#
+# Only the two transports the default image can run are listed:
+# `allgather_reducescatter` and `naive`. Faster choices such as DeepEP or PPLX
+# need extra communication packages and are reachable only through
+# `--extra-arg`; sweeping them here would fail server startup.
+#
+# The checkpoint must be a Mixture-of-Experts model. On a dense checkpoint the
+# optimizer detects the absence of experts after resolving the model and drops
+# both MoE dimensions, so the sweep does not spend trials on a no-op.
+#
+# `dtype` and `kv_cache_dtype` stay at `auto` so the space runs on any
+# checkpoint. Declaring explicit values is still fine: after the model
+# resolves, the assessment removes values the checkpoint's kernels cannot run,
+# such as `float32` for a linear-attention model.
+space:
+  dtype:
+    fixed: auto
+  kv_cache_dtype:
+    fixed: auto
+  max_model_len:
+    fixed: 4096
+  max_num_seqs:
+    fixed: 64
+  max_num_batched_tokens:
+    fixed: 4096
+  max_num_active_seqs:
+    fixed: 64
+  max_num_scheduled_tokens:
+    fixed: 4096
+  tensor_parallel_size:
+    fixed: 2
+  attention_backend:
+    default: true
+  prefix_caching:
+    fixed: true
+  expert_parallel:
+    fixed: true
+  all2all_backend:
+    categorical: [allgather_reducescatter, naive]

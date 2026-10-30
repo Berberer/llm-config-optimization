@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from ..runtime.types import ContainerConfig, ContainerResult, Mount, PullPolicy
 
 if TYPE_CHECKING:
-    from ..search_space.types import ExperimentSpace
+    from ..search_space.types import ExperimentSpace, SpaceAssessment
 
 
 class HardwareTarget(StrEnum):
@@ -99,6 +99,19 @@ class GpuLayersMode(StrEnum):
     ALL = "all"
 
 
+class CpuMoeMode(StrEnum):
+    """How many Mixture-of-Experts layers llama.cpp keeps in system RAM.
+
+    llama.cpp accepts either an exact layer count or :attr:`ALL`, which keeps
+    every expert layer on the CPU through the value-less ``--cpu-moe`` flag. An
+    exact count is a plain integer rather than a member, so a CPU-expert
+    dimension is an int-or-enum union. vLLM has no equivalent setting and
+    rejects the field.
+    """
+
+    ALL = "all"
+
+
 class AttentionBackend(StrEnum):
     """Attention implementation to use, named engine-neutrally.
 
@@ -114,6 +127,19 @@ class AttentionBackend(StrEnum):
     XFORMERS = "xformers"
     AUTO = "auto"
     OFF = "off"
+
+
+class All2AllBackend(StrEnum):
+    """Transport for vLLM's Mixture-of-Experts all-to-all communication.
+
+    Only the portable transports are modelled: both work in the default vLLM
+    image without extra communication libraries. Faster transports that require
+    additional packages stay behind the backend's raw-argument escape hatch.
+    llama.cpp has no equivalent setting and rejects the field.
+    """
+
+    ALLGATHER_REDUCESCATTER = "allgather_reducescatter"
+    NAIVE = "naive"
 
 
 class SpeculativeMethod(StrEnum):
@@ -399,6 +425,18 @@ class LLMConfig:
     :attr:`n_gpu_layers` is an int-or-enum union: an exact offloaded-layer count
     or one of llama.cpp's :class:`GpuLayersMode` choices.
 
+    :attr:`expert_parallel` is vLLM's MoE expert-parallelism toggle, forwarded
+    as the enabling flag or its disabling counterpart, and
+    :attr:`all2all_backend` selects the transport its expert parallelism uses.
+    Both are vLLM-only and are the MoE counterpart of the dense-model fields;
+    llama.cpp rejects them. A backend that does not forward them never sees a
+    value, because the search space only requires the parameters it applies.
+
+    :attr:`n_cpu_moe` is llama.cpp's MoE CPU-offload setting: an exact count of
+    expert layers to keep in system RAM, or :class:`CpuMoeMode`'s ``all`` to
+    keep every one of them there. It is an int-or-enum union like
+    :attr:`n_gpu_layers`, and it is llama.cpp-only, so vLLM rejects it.
+
     :attr:`resolved_draft_path` is a resolution artifact like
     :class:`BenchmarkConfig`'s ``resolved_path``: it holds the local path the
     composition root fetched the draft to, and a backend never forwards it to
@@ -424,6 +462,9 @@ class LLMConfig:
     num_speculative_tokens: int | None = None
     prefix_caching: bool | None = None
     n_gpu_layers: int | GpuLayersMode | None = None
+    expert_parallel: bool | None = None
+    all2all_backend: All2AllBackend | None = None
+    n_cpu_moe: int | CpuMoeMode | None = None
     resolved_draft_path: Path | None = None
 
 
@@ -678,7 +719,9 @@ class InferenceBackend(Protocol):
     :class:`BenchmarkConfig`. Once the model has been resolved to a local
     directory, :meth:`validate_model` checks it against the configuration, so a
     checkpoint that cannot serve the experiment is rejected before anything is
-    pulled or run.
+    pulled or run. Finally, :meth:`assess_space` turns the declared space into
+    the effective one for that checkpoint, so a dimension the resolved model or
+    hardware makes meaningless is dropped instead of sampled.
 
     A trial is host-driven: the backend plans a :class:`ServerSpec`, the
     orchestrator starts that server container and drives it with the host
@@ -763,6 +806,41 @@ class InferenceBackend(Protocol):
         checkpoint whose metadata cannot be read is accepted: absence of
         evidence is not a mismatch, and the engine remains the final authority
         when the model loads.
+        """
+        ...
+
+    def assess_space(
+        self,
+        space: ExperimentSpace,
+        experiment: ExperimentConfig,
+        hardware: DetectedHardware,
+        model: Path,
+    ) -> SpaceAssessment:
+        """Derive the effective space for the resolved checkpoint ``model``.
+
+        A definition is written before the checkpoint is known, so it may
+        declare dimensions the resolved model can never be affected by: a
+        Mixture-of-Experts tunable does nothing on a dense checkpoint, and a
+        host-dependent parameter can be a no-op on the resolved hardware. The
+        composition root asks this once the checkpoint has been resolved and
+        validated, and runs the returned effective space instead of the
+        declared one.
+
+        The backend owns the rules, because each depends on engine vocabulary
+        and on the checkpoint format that engine reads. ``experiment`` is the
+        run's full fixed configuration and ``hardware`` the resolved host, so a
+        rule can consult a companion parameter — an all-to-all transport that
+        only matters when expert parallelism is reachable, for example — rather
+        than deciding from the dimension alone. ``model`` is the same
+        checkpoint the run will mount, so the assessment and the execution
+        inspect one model.
+
+        Model-aware problems are returned rather than raised, mirroring
+        :meth:`validate` and :meth:`validate_model`, and the caller reports
+        them through the same unsupported-configuration path. A checkpoint
+        whose metadata cannot be read keeps every declared dimension: absence
+        of evidence is not a reason to change the user's space, and the engine
+        remains the final authority when the model loads.
         """
         ...
 
