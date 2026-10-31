@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = https://github.com/Berberer/llm-config-optimization.git
+Repository = "https://github.com/Berberer/llm-config-optimization.git"
 
 [project.scripts]
 llm-config-optimization = "llm_config_optimization:main"
