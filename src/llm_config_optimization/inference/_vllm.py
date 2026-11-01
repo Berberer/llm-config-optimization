@@ -25,8 +25,10 @@ from types import MappingProxyType
 
 from ..runtime.types import ContainerConfig, ContainerResult, Mount
 from ..search_space.registry import (
+    DRAFT_MODEL_PARAMETERS,
     SPECULATIVE_PARAMETERS,
     TUNABLE_PARAMETERS,
+    draft_configured,
     speculative_configured,
 )
 from ..search_space.types import (
@@ -1340,18 +1342,21 @@ class VLLMBackend:
 
         vLLM models the whole registry except llama.cpp's GPU-layer dimension,
         which has no vLLM flag, so its applicable set is every tunable present
-        in :data:`PARAMETER_TARGETS`. The two speculative dimensions are added
-        only when ``llm`` configures a speculative method or draft model. A
-        space must therefore declare every applicable parameter, and each value
-        is still support-checked by :meth:`validate`.
+        in :data:`PARAMETER_TARGETS`. The speculative dimensions are added only
+        when ``llm`` configures a speculative method or draft model. The
+        draft-only dimensions stay out because vLLM forwards none of them, so
+        vLLM never requires a llama.cpp-only draft knob. A space must therefore
+        declare every applicable parameter, and each value is still
+        support-checked by :meth:`validate`.
         """
-        applicable = frozenset(
-            name
-            for name, field in TUNABLE_PARAMETERS.items()
-            if field in PARAMETER_TARGETS and name not in SPECULATIVE_PARAMETERS
+        forwarded = frozenset(
+            name for name, field in TUNABLE_PARAMETERS.items() if field in PARAMETER_TARGETS
         )
+        applicable = forwarded - SPECULATIVE_PARAMETERS - DRAFT_MODEL_PARAMETERS
         if speculative_configured(llm):
-            return applicable | SPECULATIVE_PARAMETERS
+            applicable |= SPECULATIVE_PARAMETERS & forwarded
+        if draft_configured(llm):
+            applicable |= DRAFT_MODEL_PARAMETERS & forwarded
         return applicable
 
     def validate(

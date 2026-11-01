@@ -9,10 +9,6 @@ is a non-speculative vLLM space, which declares all twelve base tunables:
 
 ```yaml
 space:
-  dtype:
-    categorical: [bfloat16, float16]
-  kv_cache_dtype:
-    categorical: [auto, fp8_e4m3]
   max_model_len:
     fixed: 4096
   max_num_seqs:
@@ -31,12 +27,16 @@ space:
     interval:
       min: 2048
       max: 4096
-  tensor_parallel_size:
-    fixed: 1
+  dtype:
+    categorical: [bfloat16, float16]
+  kv_cache_dtype:
+    categorical: [auto, fp8_e4m3]
   attention_backend:
     default: true
   prefix_caching:
     fixed: true
+  tensor_parallel_size:
+    fixed: 1
   expert_parallel:
     categorical: [true, false]
   all2all_backend:
@@ -69,11 +69,11 @@ Eleven example definitions live under [`examples/vllm/`](../examples/vllm/) and
   adds the full speculative sweep: `enabled`/`disabled` against the depths
   `1`, `2`, `4`, and `8`.
 * [`examples/llamacpp/space-all-fixed.yaml`](../examples/llamacpp/space-all-fixed.yaml)
-  pins the eight llama.cpp base tunables to a single value, for a reproducible
-  llama.cpp baseline.
+  pins the twenty-six base tunables llama.cpp forwards to a single value, for a
+  reproducible llama.cpp baseline.
 * [`examples/llamacpp/space-full.yaml`](../examples/llamacpp/space-full.yaml)
-  declares every llama.cpp base tunable with a broad range, deferring the
-  build-dependent `attention_backend` to the engine.
+  declares every base tunable llama.cpp forwards with a broad range, deferring
+  the build-dependent `attention_backend` to the engine.
 * [`examples/llamacpp/space-gpu-offload.yaml`](../examples/llamacpp/space-gpu-offload.yaml)
   pins the other tunables and sweeps `n_gpu_layers` over `auto`, `0`, and
   `all`, so a GPU host can compare no offload, full offload, and the engine's
@@ -87,9 +87,11 @@ Eleven example definitions live under [`examples/vllm/`](../examples/vllm/) and
   knowing the layer count.
 * [`examples/llamacpp/space-speculative-defaults.yaml`](../examples/llamacpp/space-speculative-defaults.yaml)
   is the llama.cpp broad space with speculation enabled at llama.cpp's default
-  draft depth.
+  draft depth and the six draft-only knobs left to the engine. It requires
+  `--draft-model`.
 * [`examples/llamacpp/space-speculative-full.yaml`](../examples/llamacpp/space-speculative-full.yaml)
-  is the llama.cpp speculative sweep over the same mode and depth values.
+  is the llama.cpp speculative sweep over the same mode and depth values, with
+  real ranges for every draft-only knob. It requires `--draft-model`.
 
 A shared 12-prompt corpus lives in
 [`examples/prompts.jsonl`](../examples/prompts.jsonl). Pass
@@ -103,8 +105,8 @@ Each dimension carries exactly one spec tag:
 | Spec          | Form                              | Meaning                                                                 |
 | ------------- | --------------------------------- | ----------------------------------------------------------------------- |
 | `fixed`       | `fixed: <value>`                  | Pin the parameter to one value that must not be varied.                 |
-| `categorical` | `categorical: [<value>, ...]`     | A non-empty, duplicate-free subset of allowed values, in declared order. For a numeric parameter, give integers to sweep only those values. |
-| `interval`    | `interval: {min: <int>, max: <int>}` | An inclusive integer range; the optimizer chooses where to sample. `min` must not exceed `max`. |
+| `categorical` | `categorical: [<value>, ...]`     | A non-empty, duplicate-free subset of allowed values, in declared order. For a numeric parameter, give numbers (integers, or reals for a float parameter) to sweep only those values. |
+| `interval`    | `interval: {min: <number>, max: <number>}` | An inclusive numeric range; the optimizer chooses where to sample. The bounds are integers for an integer parameter and reals for a float parameter (an integer bound is accepted there too). `min` must not exceed `max`. |
 | `default`     | `default: true`                   | Explicitly defer to the engine's own default. Must be exactly boolean `true`. |
 
 There is no step or count on an `interval`. When only specific numbers are
@@ -118,45 +120,77 @@ The definition must declare every parameter the selected engine forwards — the
 search space is **total over that engine's applicable set**, so a value can
 never silently fall back to an engine default. Omitting one is an error naming
 the missing parameter, and declaring one the engine does not forward is a
-backend problem (exit code `4`). vLLM forwards twelve of the fourteen base
-parameters below — every one except the two llama.cpp offload settings
-`n_gpu_layers` and `n_cpu_moe`; llama.cpp forwards all but `dtype`,
+backend problem (exit code `4`). Forty parameters are registered in total.
+
+vLLM forwards fourteen of them — its twelve base parameters plus the two
+speculative dimensions — and none of the six draft-only ones. llama.cpp
+forwards thirty-four: the twenty-six base parameters below, the two speculative
+dimensions, and the six draft-only dimensions, omitting only `dtype`,
 `tensor_parallel_size`, `max_num_active_seqs`, `max_num_scheduled_tokens`,
-`expert_parallel`, and `all2all_backend`, which it omits because a GGUF file
+`expert_parallel`, and `all2all_backend`. It omits those because a GGUF file
 carries its own numerical format, llama.cpp has no tensor or expert parallelism
-and no all-to-all transport, and its scheduler has no equivalent caps, leaving
-the eight that map to a `llama-server` flag. The two speculative parameters at
-the end of the table are **conditional**: a definition must declare them
+and no all-to-all transport, and its scheduler has no equivalent caps.
+
+The speculative dimensions are **conditional**: a definition must declare them
 exactly when the run configures a speculative setup (see
-[Speculative decoding](speculative-decoding.md)). Without one they are not part
-of the applicable set, so a space with no speculation stays unchanged. Write
-`default: true` for using an engine default.
+[Speculative decoding](speculative-decoding.md)). The draft-only dimensions
+are gated one step further and are required exactly when the run names a draft
+model, because they shape that model's sampling, depth, placement, and cache.
+Without the matching setup a dimension is not part of the applicable set, so a
+non-speculative space stays unchanged. Write `default: true` for using an
+engine default.
 
 | Parameter                | Kind                                            | Accepted values                                       |
 | ------------------------ | ----------------------------------------------- | ----------------------------------------------------- |
-| `dtype`                  | enum (fixed, categorical, default)              | `auto`, `float16`, `bfloat16`, `float32`              |
-| `kv_cache_dtype`         | enum (fixed, categorical, default)              | `auto`, `float16`, `bfloat16`, `fp8_e4m3`, `fp8_e5m2`; llama.cpp also `float32`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1` |
-| `attention_backend`      | enum (fixed, categorical, default)              | `flash_attention`, `flash_infer`; llama.cpp also `auto`, `off` |
 | `max_model_len`          | integer (interval, fixed, categorical, default) | ≥ 1                                                   |
 | `max_num_seqs`           | integer (interval, fixed, categorical, default) | ≥ 1                                                   |
 | `max_num_batched_tokens` | integer (interval, fixed, categorical, default) | ≥ 1                                                   |
 | `max_num_active_seqs`    | integer (interval, fixed, categorical, default) | ≥ 1; vLLM only                                        |
 | `max_num_scheduled_tokens` | integer (interval, fixed, categorical, default) | ≥ 1; vLLM only                                      |
-| `tensor_parallel_size`   | integer (interval, fixed, categorical, default) | ≥ 1                                                   |
-| `prefix_caching`         | boolean (fixed, categorical, default)           | `true`, `false`                                       |
+| `ubatch_size`            | integer (interval, fixed, categorical, default) | ≥ 1; llama.cpp only                                   |
+| `dtype`                  | enum (fixed, categorical, default)              | `auto`, `float16`, `bfloat16`, `float32`              |
+| `kv_cache_dtype`         | enum (fixed, categorical, default)              | `auto`, `float16`, `bfloat16`, `fp8_e4m3`, `fp8_e5m2`; llama.cpp also `float32`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1` |
+| `attention_backend`      | enum (fixed, categorical, default)              | `flash_attention`, `flash_infer`; llama.cpp also `auto`, `off` |
 | `n_gpu_layers`           | int-or-enum (fixed, categorical, interval, default) | `auto`, `all`, or an integer ≥ 0; llama.cpp only      |
+| `n_cpu_moe`              | int-or-enum (fixed, categorical, interval, default) | `all`, or an integer ≥ 0; llama.cpp only          |
+| `n_cpu_ffn`              | integer (interval, fixed, categorical, default) | ≥ 0; llama.cpp only                                   |
+| `kv_offload`             | boolean (fixed, categorical, default)           | `true`, `false`; llama.cpp only                       |
+| `op_offload`             | boolean (fixed, categorical, default)           | `true`, `false`; llama.cpp only                       |
+| `host_buffer`            | boolean (fixed, categorical, default)           | `true`, `false`; llama.cpp only                       |
+| `repack`                 | boolean (fixed, categorical, default)           | `true`, `false`; llama.cpp only                       |
+| `swa_full`               | boolean (fixed, categorical, default)           | `true`, `false`; llama.cpp only                       |
+| `load_mode`              | enum (fixed, categorical, default)              | `auto`, `none`, `mmap`, `mlock`, `mmap_mlock`, `dio`; llama.cpp only |
+| `prefix_caching`         | boolean (fixed, categorical, default)           | `true`, `false`                                       |
+| `cache_ram`              | integer (interval, fixed, categorical, default) | ≥ -1 (`-1` means no limit); llama.cpp only            |
+| `ctx_checkpoints`        | integer (interval, fixed, categorical, default) | ≥ 0; llama.cpp only                                   |
+| `checkpoint_min_step`    | integer (interval, fixed, categorical, default) | ≥ 0; llama.cpp only                                   |
+| `kv_unified`             | boolean (fixed, categorical, default)           | `true`, `false`; llama.cpp only                       |
+| `continuous_batching`    | boolean (fixed, categorical, default)           | `true`, `false`; llama.cpp only                       |
+| `cache_idle_slots`       | boolean (fixed, categorical, default)           | `true`, `false`; llama.cpp only                       |
+| `tensor_parallel_size`   | integer (interval, fixed, categorical, default) | ≥ 1                                                   |
 | `expert_parallel`        | boolean (fixed, categorical, default)           | `true`, `false`; vLLM only                            |
 | `all2all_backend`        | enum (fixed, categorical, default)              | `allgather_reducescatter`, `naive`; vLLM only         |
-| `n_cpu_moe`              | int-or-enum (fixed, categorical, interval, default) | `all`, or an integer ≥ 0; llama.cpp only          |
 | `speculative_mode`       | enum (fixed, categorical, default)              | `enabled`, `disabled`; conditional                    |
 | `num_speculative_tokens` | integer (interval, fixed, categorical, default) | ≥ 1; conditional                                      |
+| `spec_draft_n_min`       | integer (interval, fixed, categorical, default) | ≥ 0; draft only                                       |
+| `spec_draft_p_split`     | float (interval, fixed, categorical, default)   | `0.0`…`1.0`; draft only                               |
+| `spec_draft_sampling`    | enum (fixed, categorical, default)              | `greedy`, `probabilistic`; draft only                 |
+| `n_gpu_layers_draft`     | int-or-enum (fixed, categorical, interval, default) | `auto`, `all`, or an integer ≥ 0; draft only      |
+| `n_cpu_moe_draft`        | int-or-enum (fixed, categorical, interval, default) | `all`, or an integer ≥ 0; draft only              |
+| `draft_kv_cache_dtype`   | enum (fixed, categorical, default)              | `float16`, `bfloat16`, `float32`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1`; draft only |
+| `threads`                | integer (interval, fixed, categorical, default) | ≥ 1; llama.cpp only                                   |
+| `threads_batch`          | integer (interval, fixed, categorical, default) | ≥ 1; llama.cpp only                                   |
+| `poll`                   | integer (interval, fixed, categorical, default) | `0`…`100`; llama.cpp only                             |
+| `prio`                   | integer (interval, fixed, categorical, default) | `-1`…`3`; llama.cpp only                              |
 
-`interval` is only valid for the integer parameters and the integer branch of an
-int-or-enum union such as `n_gpu_layers` or `n_cpu_moe`; declaring one for an
-enum, a boolean, or a union without an integer branch is an error. `fixed` and
+`interval` is valid for the integer and float parameters and the integer branch
+of an int-or-enum union such as `n_gpu_layers` or `n_cpu_moe`; declaring one for
+an enum, a boolean, or a union without a numeric branch is an error. A float
+parameter's interval takes real bounds (an integer bound is accepted and stored
+as a float), while an integer parameter rejects a real one. `fixed` and
 `categorical` are valid for every kind: an enum parameter's categorical values
 are written using the engine-neutral spellings above (not the engine's own
-names), a numeric parameter's categorical values are the integers themselves,
+names), a numeric parameter's categorical values are the numbers themselves,
 and a boolean parameter's values are the YAML booleans `true` and `false`.
 Booleans are strict: the strings `"true"`/`"false"` and the integers `0`/`1`
 are rejected rather than coerced. On a union parameter, an `interval` constrains
@@ -179,6 +213,14 @@ stay within the values they narrow: `max_num_active_seqs` must not exceed
 point the space allows, and is skipped when either side defers to the engine
 with `default: true`; see [Validation](#validation). llama.cpp has no
 equivalent caps and does not forward either parameter.
+
+`max_num_batched_tokens` and `ubatch_size` split llama.cpp's logical and
+physical batches. On llama.cpp the first emits only `--batch-size` and the
+second `--ubatch-size`, so the micro-batch can be swept without changing the
+logical batch; llama.cpp clamps a physical batch above the logical one or above
+the context rather than rejecting it, so the backend adds no cross-field rule.
+vLLM keeps its own meaning for `max_num_batched_tokens` and does not forward
+`ubatch_size`.
 
 `n_gpu_layers` is llama.cpp-only and accepts the mode names `auto` and `all` or
 an exact offloaded-layer count, which is a non-negative integer (`0` keeps the
@@ -203,6 +245,34 @@ block count is rejected and the user is directed to `all`; unreadable metadata
 fails open. A CPU target drops the dimension entirely, because no weight ever
 leaves system RAM there. vLLM has no equivalent setting and does not forward the
 parameter.
+
+The remaining llama.cpp families are described in the
+[llama.cpp tuning guide](llamacpp-tuning.md):
+
+- **Placement and memory:** `n_cpu_ffn` keeps the dense FFN weights of a number
+  of layers in system RAM, `kv_offload` and `op_offload` move the KV cache and
+  tensor operations to the device, and `host_buffer`, `repack`, and `swa_full`
+  toggle the host buffer, weight repacking, and the full-size sliding-window
+  cache. `load_mode` selects a loading strategy, with the engine-neutral
+  `mmap_mlock` becoming llama.cpp's `mmap+mlock`.
+- **Cache and scheduling:** `cache_ram` bounds the host prompt cache in MiB
+  (`-1` means no limit, `0` disables it), `ctx_checkpoints` sizes the per-slot
+  context-checkpoint cache, and `checkpoint_min_step` sets the minimum spacing
+  between checkpoints (`0` means no minimum). `kv_unified`,
+  `continuous_batching`, and `cache_idle_slots` toggle a unified KV buffer,
+  continuous batching, and idle-slot caching.
+- **CPU and process:** `threads` and `threads_batch` size the generation and
+  prompt-processing thread pools, `poll` selects the busy-wait level on a
+  `0…100` scale, and `prio` sets the process priority in `-1…3`.
+- **Draft only:** `spec_draft_n_min`, `spec_draft_p_split` (a real-valued
+  probability), `spec_draft_sampling`, `n_gpu_layers_draft`,
+  `n_cpu_moe_draft`, and `draft_kv_cache_dtype` shape a configured draft model
+  and are required exactly when the run names one.
+
+The `fit` family is not in the table because it is not tunable: `--fit`,
+`--fit-target`, and `--fit-ctx` are fixed on the command line, with `--fit`
+defaulting to `off` so a trial measures the declared configuration. See the
+[llama.cpp tuning guide](llamacpp-tuning.md#the-fit-correctness-pin).
 
 `expert_parallel` and `all2all_backend` are vLLM's MoE pair. Expert parallelism
 shards the experts across devices and is forwarded in both directions: `true`
@@ -255,26 +325,62 @@ rejected as unsupported.
 
 ## Engine-specific spaces
 
-A llama.cpp space without a speculative setup declares exactly the eight base
-tunables that map to real `llama-server` flags:
+A llama.cpp space without a speculative setup declares exactly the twenty-six
+base tunables that map to real `llama-server` flags:
 
 ```yaml
 space:
-  kv_cache_dtype:
-    categorical: [float16, bfloat16, float32, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1]
   max_model_len:
-    interval: {min: 1024, max: 32768}
+    interval: {min: 18432, max: 32768}
   max_num_seqs:
     interval: {min: 1, max: 256}
   max_num_batched_tokens:
     interval: {min: 2048, max: 8192}
+  ubatch_size:
+    interval: {min: 256, max: 4096}
+  kv_cache_dtype:
+    categorical: [float16, bfloat16, float32, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1]
   attention_backend:
     categorical: [auto, flash_attention]
-  prefix_caching:
-    fixed: true
   n_gpu_layers:
     default: true
   n_cpu_moe:
+    default: true
+  n_cpu_ffn:
+    default: true
+  kv_offload:
+    default: true
+  op_offload:
+    default: true
+  host_buffer:
+    default: true
+  repack:
+    default: true
+  swa_full:
+    default: true
+  load_mode:
+    default: true
+  prefix_caching:
+    fixed: true
+  cache_ram:
+    default: true
+  ctx_checkpoints:
+    default: true
+  checkpoint_min_step:
+    default: true
+  kv_unified:
+    default: true
+  continuous_batching:
+    default: true
+  cache_idle_slots:
+    default: true
+  threads:
+    default: true
+  threads_batch:
+    default: true
+  poll:
+    default: true
+  prio:
     default: true
 ```
 
@@ -291,14 +397,40 @@ The engine-neutral names translate to llama.cpp as follows:
 
 | Parameter                | `llama-server` flags               | Accepted values                                                                     |
 | ------------------------ | ---------------------------------- | ----------------------------------------------------------------------------------- |
-| `kv_cache_dtype`         | `--cache-type-k`, `--cache-type-v` | `float16` → `f16`, `bfloat16` → `bf16`, `float32` → `f32`; `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1` pass through; `auto` and the FP8 members are unsupported. |
 | `max_model_len`          | `--ctx-size`                       | Any integer ≥ 1.                                                                    |
 | `max_num_seqs`           | `--parallel`                       | Any integer ≥ 1; capped to what `max_model_len` can serve (see below).              |
-| `max_num_batched_tokens` | `--batch-size`, `--ubatch-size`    | Any integer ≥ 1; sets both the logical and the physical batch, which llama.cpp clamps to the context size rather than rejecting. A larger value needs more compute-buffer memory. |
+| `max_num_batched_tokens` | `--batch-size`                     | Any integer ≥ 1; the logical batch, which llama.cpp clamps to the context size. A larger value needs more compute-buffer memory. |
+| `ubatch_size`            | `--ubatch-size`                    | Any integer ≥ 1; the physical micro-batch, forwarded independently of the logical batch. Upstream clamps it to the logical batch and the context. |
+| `kv_cache_dtype`         | `--cache-type-k`, `--cache-type-v` | `float16` → `f16`, `bfloat16` → `bf16`, `float32` → `f32`; `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1` pass through; `auto` and the FP8 members are unsupported. |
 | `attention_backend`      | `--flash-attn`                     | `auto` → `auto`, `flash_attention` → `on`, `off` → `off`; `off` needs a float KV cache; `flash_infer` and `xformers` are unsupported. |
-| `prefix_caching`         | `--cache-prompt`, `--no-cache-prompt` | `true` → `--cache-prompt`, `false` → `--no-cache-prompt`; unset → neither.       |
 | `n_gpu_layers`           | `--n-gpu-layers`                   | `auto` → `auto`, `all` → `all`; any integer ≥ 0 passes through unchanged.           |
 | `n_cpu_moe`              | `--n-cpu-moe`, `--cpu-moe`         | `all` → the value-less `--cpu-moe`; any integer ≥ 0 → `--n-cpu-moe N`.              |
+| `n_cpu_ffn`              | `--n-cpu-ffn`                      | Any integer ≥ 0; there is no `all` mode.                                            |
+| `kv_offload`             | `--kv-offload`, `--no-kv-offload`  | `true` → `--kv-offload`, `false` → `--no-kv-offload`; unset → neither.              |
+| `op_offload`             | `--op-offload`, `--no-op-offload`  | `true` → `--op-offload`, `false` → `--no-op-offload`; unset → neither.              |
+| `host_buffer`            | `--no-host`                        | `false` → `--no-host`; `true` emits nothing and leaves the engine's default.        |
+| `repack`                 | `--repack`, `--no-repack`          | `true` → `--repack`, `false` → `--no-repack`; unset → neither.                      |
+| `swa_full`               | `--swa-full`                       | `true` → `--swa-full`; `false` emits nothing and leaves the engine's default.       |
+| `load_mode`              | `--load-mode`                      | `auto`, `none`, `mmap`, `mlock`, `dio` pass through; `mmap_mlock` → `mmap+mlock`.   |
+| `prefix_caching`         | `--cache-prompt`, `--no-cache-prompt` | `true` → `--cache-prompt`, `false` → `--no-cache-prompt`; unset → neither.       |
+| `cache_ram`              | `--cache-ram`                      | Any integer ≥ -1; `-1` means no limit and `0` disables the cache.                  |
+| `ctx_checkpoints`        | `--ctx-checkpoints`                | Any integer ≥ 0.                                                                    |
+| `checkpoint_min_step`    | `--checkpoint-min-step`            | Any integer ≥ 0; `0` means no minimum spacing.                                      |
+| `kv_unified`             | `--kv-unified`, `--no-kv-unified`  | `true` → `--kv-unified`, `false` → `--no-kv-unified`; unset → neither.              |
+| `continuous_batching`    | `--cont-batching`, `--no-cont-batching` | `true` → `--cont-batching`, `false` → `--no-cont-batching`; unset → neither.   |
+| `cache_idle_slots`       | `--cache-idle-slots`, `--no-cache-idle-slots` | `true` → `--cache-idle-slots`, `false` → `--no-cache-idle-slots`; unset → neither. |
+| `threads`                | `--threads`                        | Any integer ≥ 1.                                                                    |
+| `threads_batch`          | `--threads-batch`                  | Any integer ≥ 1.                                                                    |
+| `poll`                   | `--poll`                           | Any integer in `0…100`.                                                             |
+| `prio`                   | `--prio`                           | Any integer in `-1…3`.                                                              |
+
+The speculative dimensions add `--spec-draft-n-max`, and the six draft-only
+dimensions add `--spec-draft-n-min`, `--spec-draft-p-split`,
+`--spec-draft-sampling`, `--n-gpu-layers-draft`,
+`--n-cpu-moe-draft`/`--cpu-moe-draft`, and
+`--cache-type-k-draft`/`--cache-type-v-draft`. `speculative_mode` is a gate
+rather than a forwarded flag: a disabled trial emits none of them. See
+[Speculative decoding](speculative-decoding.md).
 
 llama.cpp divides `--ctx-size` evenly across the `--parallel` slots, so a
 request longer than a slot's share is rejected. The backend therefore keeps
@@ -318,9 +450,10 @@ Only the values above are spellable: a fixed or categorical value with no
 mapping — an `auto` KV cache, say — is rejected before the sweep starts rather
 than silently dropped, so a declared value always reaches the server. Use
 `default: true` to let llama.cpp choose for itself. `dtype`,
-`tensor_parallel_size`, `expert_parallel`, and `all2all_backend` must not be
-declared for llama.cpp; the backend reports them as parameters it does not
-forward.
+`tensor_parallel_size`, `max_num_active_seqs`, `max_num_scheduled_tokens`,
+`expert_parallel`, and `all2all_backend` must not be declared for llama.cpp;
+the backend reports them as parameters it does not forward. The draft-only
+dimensions may only be declared together with a configured draft model.
 
 vLLM's non-speculative space is the sample at the top of this section: it
 declares all twelve base tunables, and every value is translated to vLLM's own
@@ -328,10 +461,13 @@ spelling. The KV-cache `auto` and FP8 members and the `flash_infer` attention
 backend have no llama.cpp mapping, while vLLM has no spelling for `float32` or
 the quantized KV-cache formats and for llama.cpp's `auto` and `off` attention
 modes; `xformers` is not modelled by either engine. vLLM's MoE pair has no
-llama.cpp counterpart, just as `n_cpu_moe` has no vLLM one.
+llama.cpp counterpart, just as `n_cpu_moe` and the other llama.cpp-only knobs
+have no vLLM one.
 A run that configures speculative decoding adds the two gated dimensions to
-either engine's space; see
-[Speculative decoding](speculative-decoding.md).
+either engine's space, and a configured draft model adds llama.cpp's six
+draft-only dimensions as well; see
+[Speculative decoding](speculative-decoding.md). For a task-oriented tour of the
+llama.cpp-only families, see the [llama.cpp tuning guide](llamacpp-tuning.md).
 
 `seed`, `gpu_memory_utilization`, and `quantization` are intentionally **not**
 tunable. `seed` (vLLM only) and `gpu_memory_utilization` (vLLM only) are
@@ -362,8 +498,11 @@ Validation happens in three stages, all before any container runs:
    top-level shape, registry membership, that each dimension carries exactly one
    recognized tag, that values match the parameter's kind, that enum values are
    known, that categoricals are non-empty and unique, that intervals are ordered,
-   and the universal `≥ 1` bounds. **Every problem found is reported at once**,
-   so a broken definition can be fixed in a single pass.
+   and each parameter's numeric floor — `≥ 1` for sizes and token budgets, `≥ 0`
+   for counts such as `n_cpu_ffn` whose zero disables an offload. Real-valued
+   parameters such as `spec_draft_p_split` have no loader floor; the backend
+   checks their range. **Every problem found is reported at once**, so a broken
+   definition can be fixed in a single pass.
 2. **Backend-specific**: The selected backend is asked whether it forwards each
    declared parameter and supports each value. vLLM additionally checks that a
    value is supported on the resolved accelerator class and fits the resolved
@@ -377,10 +516,12 @@ Validation happens in three stages, all before any container runs:
    vLLM stores a non-quantized KV cache in the model dtype; an `auto`,
    deferred, or multi-value `dtype` is reconciled after the checkpoint
    resolves, and FP8 caches are exempt. llama.cpp
-   rejects a parameter it does not forward, any enum value it has no spelling
-   for, a space that can pair a quantized KV cache with
-   `attention_backend: off`, and — on a CPU target — `n_gpu_layers=all` or a
-   positive exact count.
+   rejects a parameter it does not forward (including a draft-only dimension
+   without a configured draft model), any enum value it has no spelling for, a
+   space that can pair a quantized target or draft KV cache with
+   `attention_backend: off`, a value outside the engine's accepted range for
+   `poll`, `prio`, `spec_draft_p_split`, or `cache_ram`, and — on a CPU target —
+   `n_gpu_layers=all` or a positive exact count.
 3. **Model-aware**: Once the checkpoint is resolved to a local path (a host path,
    the snapshot a Hugging Face download produced, or the single GGUF file
    llama.cpp fetches), the backend inspects it and rejects a configuration it
@@ -432,6 +573,16 @@ dimensions are kept and the engine remains the final authority. The asymmetry
 is deliberate — confident dense detection avoids wasted trials, while an
 unreadable custom checkpoint must not be treated as dense on a guess.
 
+### Sliding-window detection
+
+llama.cpp reads the GGUF header's architecture-prefixed
+`<arch>.attention.sliding_window`. A readable header whose value is absent or
+zero is confidently **full attention**, so a full-size sliding-window cache
+cannot change it; a positive window keeps the dimension. The architecture named
+by `general.architecture` is honoured strictly, so a checkpoint cannot borrow
+another architecture's key. An unreadable header is unknown and the dimension
+is kept.
+
 ### Dimensions dropped
 
 On a confidently dense checkpoint, vLLM drops `expert_parallel` and
@@ -449,10 +600,15 @@ model with no experts. Beyond that:
   or a deferred `expert_parallel: {default: true}`, which forwards no flag and
   leaves vLLM's own default (off) in place. The toggle stays samplable, because
   it can still matter to a space that splits the model.
-* llama.cpp drops `n_cpu_moe` on a CPU target, where no weight ever leaves
-  system RAM, and `n_gpu_layers` when every value it can select already
-  disables offload (`auto` or an exact `0`). `all` and positive counts are
-  still rejected before the sweep by the CPU-target validation, so a
+* llama.cpp drops `swa_full` on a readable checkpoint that declares no positive
+  sliding window, because a full-size sliding-window cache changes nothing on a
+  full-attention model.
+* llama.cpp drops, on a CPU target, `n_cpu_moe`, `n_cpu_ffn`, `kv_offload`, and
+  `op_offload` — no weight ever leaves system RAM and no operation runs on a
+  device there — plus the draft model's `n_cpu_moe_draft` and
+  `n_gpu_layers_draft`. It drops `n_gpu_layers` when every value it can select
+  already disables offload (`auto` or an exact `0`). `all` and positive counts
+  are still rejected before the sweep by the CPU-target validation, so a
   GPU-oriented space never silently changes meaning on a CPU host.
 
 ### Model dtype and value narrowing
@@ -501,12 +657,17 @@ activation dtypes the engine can execute.
 
 ### Layer-count bounds
 
-The retained llama.cpp dimensions are checked against the checkpoint's block
-count: an exact `n_cpu_moe` or `n_gpu_layers` count above it, or an interval
-whose maximum exceeds it, is a model-aware problem that points at the matching
-`all` mode. `all`, `auto`, and deferred dimensions declare no count and are
-never bounded, and absent or unreadable block-count metadata fails open so the
-engine remains the final authority.
+The retained llama.cpp dimensions are checked against the relevant checkpoint's
+block count. `n_gpu_layers`, `n_cpu_moe`, and `n_cpu_ffn` are bounded by the
+**target** checkpoint, while `n_gpu_layers_draft` and `n_cpu_moe_draft` are
+bounded by the **draft** checkpoint, because that is the model the count
+applies to. An exact count above the block count, or an interval whose maximum
+exceeds it, is a model-aware problem. `n_gpu_layers`, `n_cpu_moe`, and the two
+draft counts point at their matching `all` mode as the unambiguous alternative;
+`n_cpu_ffn` has no `all` mode, so its hint asks for a smaller count. `all`,
+`auto`, and deferred dimensions declare no count and are never bounded, and
+absent or unreadable block-count metadata — including an absent draft path —
+fails open so the engine remains the final authority.
 
 ### Reported changes and the empty space
 
@@ -516,6 +677,7 @@ parameter, the value, and the fact that made it unusable, for example:
 ```text
 dropped space.expert_parallel: the checkpoint declares no experts
 dropped space.all2all_backend: the checkpoint declares no experts
+dropped space.swa_full: the checkpoint declares no sliding-window attention
 dropped space.dtype.categorical[0] (float32): the checkpoint's linear-attention layers reject float32 (ChunkGatedDeltaRuleFunction requires float16 or bfloat16)
 dropped space.kv_cache_dtype.categorical[0] (float16): vLLM stores an explicit float KV cache in the model dtype, but the dtype dimension does not resolve only to 'float16'
 ```
@@ -537,42 +699,59 @@ A vLLM space that pins nothing and lets the engine choose everything:
 
 ```yaml
 space:
-  dtype: {default: true}
-  kv_cache_dtype: {default: true}
   max_model_len: {default: true}
   max_num_seqs: {default: true}
   max_num_batched_tokens: {default: true}
   max_num_active_seqs: {default: true}
   max_num_scheduled_tokens: {default: true}
-  tensor_parallel_size: {default: true}
+  dtype: {default: true}
+  kv_cache_dtype: {default: true}
   attention_backend: {default: true}
   prefix_caching: {default: true}
+  tensor_parallel_size: {default: true}
   expert_parallel: {default: true}
   all2all_backend: {default: true}
 ```
 
-The llama.cpp equivalent declares only the eight it forwards:
+The llama.cpp equivalent declares only the twenty-six it forwards:
 
 ```yaml
 space:
-  kv_cache_dtype: {default: true}
   max_model_len: {default: true}
   max_num_seqs: {default: true}
   max_num_batched_tokens: {default: true}
+  ubatch_size: {default: true}
+  kv_cache_dtype: {default: true}
   attention_backend: {default: true}
-  prefix_caching: {default: true}
   n_gpu_layers: {default: true}
   n_cpu_moe: {default: true}
+  n_cpu_ffn: {default: true}
+  kv_offload: {default: true}
+  op_offload: {default: true}
+  host_buffer: {default: true}
+  repack: {default: true}
+  swa_full: {default: true}
+  load_mode: {default: true}
+  prefix_caching: {default: true}
+  cache_ram: {default: true}
+  ctx_checkpoints: {default: true}
+  checkpoint_min_step: {default: true}
+  kv_unified: {default: true}
+  continuous_batching: {default: true}
+  cache_idle_slots: {default: true}
+  threads: {default: true}
+  threads_batch: {default: true}
+  poll: {default: true}
+  prio: {default: true}
 ```
+
+A configured speculative setup adds the two gated dimensions to either engine's
+space, and a configured draft model adds llama.cpp's six draft-only dimensions.
 
 A mixed vLLM space exploring sequence length, batch size, and precision:
 
 ```yaml
 space:
-  dtype:
-    categorical: [bfloat16, float16]
-  kv_cache_dtype:
-    categorical: [auto, fp8_e4m3]
   max_model_len:
     fixed: 8192
   max_num_seqs:
@@ -583,12 +762,16 @@ space:
     interval: {min: 1, max: 32}
   max_num_scheduled_tokens:
     interval: {min: 1024, max: 2048}
-  tensor_parallel_size:
-    categorical: [1, 2]
+  dtype:
+    categorical: [bfloat16, float16]
+  kv_cache_dtype:
+    categorical: [auto, fp8_e4m3]
   attention_backend:
     default: true
   prefix_caching:
     categorical: [true, false]
+  tensor_parallel_size:
+    categorical: [1, 2]
   expert_parallel:
     categorical: [true, false]
   all2all_backend:

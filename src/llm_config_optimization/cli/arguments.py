@@ -130,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument(
         "--num-prompts",
         type=int,
-        default=200,
+        default=50,
         help="Number of prompts to send per benchmark run.",
     )
     benchmark.add_argument(
@@ -166,7 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument(
         "--timeout",
         type=float,
-        default=900,
+        default=1500,
         help="Overall time limit for a trial's container, covering startup, warmup, and every measured run, in seconds.",
     )
 
@@ -205,6 +205,34 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Draft model or speculator, in the same source forms as MODEL; implies "
             "--speculative-method draft_model when no method is given. A usage error for ngram."
+        ),
+    )
+    engine.add_argument(
+        "--fit",
+        choices=("on", "off"),
+        default=None,
+        help=(
+            "Whether llama.cpp may rewrite arguments to fit the available memory. The "
+            "command line pins it off so a trial measures the declared configuration; pass "
+            "on to opt into engine auto-fit. llama.cpp only; a usage error for vllm."
+        ),
+    )
+    engine.add_argument(
+        "--fit-target",
+        type=int,
+        default=None,
+        help=(
+            "Headroom, in MiB, that --fit leaves on each device; the engine's default when "
+            "omitted. Requires --fit on. llama.cpp only; a usage error for vllm."
+        ),
+    )
+    engine.add_argument(
+        "--fit-ctx",
+        type=int,
+        default=None,
+        help=(
+            "Minimum context --fit preserves while fitting; the engine's default when "
+            "omitted. Requires --fit on. llama.cpp only; a usage error for vllm."
         ),
     )
     engine.add_argument(

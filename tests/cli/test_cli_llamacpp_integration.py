@@ -9,10 +9,10 @@ prints one log line per completed trial, and writes the winning configuration.
 It asserts the observable contract — the exit code, the log lines, and the
 written YAML — rather than the throughput, which is hardware-dependent.
 
-The search space declares only the eight tunables llama.cpp forwards, and no
-engine-scoped flag is passed, so the sweep exercises the engine-scoped CLI rules
-that reject ``--quantization`` and ``--gpu-memory-utilization`` for this engine
-from the accepting side.
+The search space declares every tunable llama.cpp forwards, and no engine-scoped
+flag is passed, so the sweep exercises the engine-scoped CLI rules that reject
+``--quantization`` and ``--gpu-memory-utilization`` for this engine from the
+accepting side.
 
 The test is marked ``integration`` and deselected by default; run it with
 ``uv run pytest -m integration``. The module skips when Podman is unavailable,
@@ -49,6 +49,7 @@ _N_TRIALS = 2
 
 _MAX_MODEL_LEN = 512
 _MAX_NUM_BATCHED_TOKENS = 512
+_UBATCH_SIZE = 256
 _MAX_NUM_SEQS = (1, 2)
 
 _VOCAB_SIZE = 512
@@ -60,17 +61,39 @@ does not have, so the test narrows the bound to what the checkpoint serves.
 
 SPACE = {
     "space": {
-        "kv_cache_dtype": {"fixed": "float16"},
         "max_model_len": {"fixed": _MAX_MODEL_LEN},
         "max_num_seqs": {"categorical": list(_MAX_NUM_SEQS)},
         "max_num_batched_tokens": {"fixed": _MAX_NUM_BATCHED_TOKENS},
+        "ubatch_size": {"fixed": _UBATCH_SIZE},
+        "kv_cache_dtype": {"fixed": "float16"},
         "attention_backend": {"default": True},
-        "prefix_caching": {"fixed": True},
         "n_gpu_layers": {"fixed": 0},
         "n_cpu_moe": {"fixed": 0},
+        # The space is total over llama.cpp's applicable set, so every remaining
+        # tunable is declared. The offload and SWA dimensions cannot affect this
+        # CPU run and are dropped by the model-aware assessment; the rest defer
+        # to the engine default so the sweep stays focused on ``max_num_seqs``.
+        "n_cpu_ffn": {"default": True},
+        "kv_offload": {"default": True},
+        "op_offload": {"default": True},
+        "host_buffer": {"default": True},
+        "repack": {"default": True},
+        "swa_full": {"default": True},
+        "load_mode": {"default": True},
+        "prefix_caching": {"fixed": True},
+        "cache_ram": {"default": True},
+        "ctx_checkpoints": {"default": True},
+        "checkpoint_min_step": {"default": True},
+        "kv_unified": {"default": True},
+        "continuous_batching": {"default": True},
+        "cache_idle_slots": {"default": True},
+        "threads": {"default": True},
+        "threads_batch": {"default": True},
+        "poll": {"default": True},
+        "prio": {"default": True},
     }
 }
-"""A mostly-fixed CPU-safe space with only llama.cpp's eight tunables declared."""
+"""A mostly-fixed CPU-safe space declaring every llama.cpp tunable."""
 
 _MODEL_CACHE = (
     Path.home() / ".cache" / "huggingface" / "hub" / "models--ggml-org--test-model-stories260K"
@@ -176,7 +199,7 @@ def test_two_trial_cpu_sweep_reports_progress_and_writes_the_winner(
     assert "engine: llamacpp" in stdout
     assert "resolved target: cpu" in stdout
     assert "assessing search space against the resolved model" in stdout
-    # The assessment drops both offload dimensions: the checkpoint is dense and
+    # The assessment drops the offload dimensions: the checkpoint is dense and
     # a CPU target can never offload GPU layers.
     assert "dropped space.n_gpu_layers" in stdout
     assert "dropped space.n_cpu_moe" in stdout
@@ -206,6 +229,7 @@ def test_two_trial_cpu_sweep_reports_progress_and_writes_the_winner(
     assert document["llm"]["max_model_len"] == _MAX_MODEL_LEN
     assert document["llm"]["max_num_seqs"] in _MAX_NUM_SEQS
     assert document["llm"]["max_num_batched_tokens"] == _MAX_NUM_BATCHED_TOKENS
+    assert document["llm"]["ubatch_size"] == _UBATCH_SIZE
     assert document["llm"]["tensor_parallel_size"] is None
     assert document["llm"]["gpu_memory_utilization"] is None
     assert document["llm"]["seed"] == 0

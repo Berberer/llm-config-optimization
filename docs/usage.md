@@ -14,8 +14,11 @@ are identical, but their defaults and scoped options differ.
 
 | Engine     | Checkpoint                                              | Applicable tunables                                    | Cache reset between runs      | Phase rates from               |
 | ---------- | ------------------------------------------------------- | ------------------------------------------------------ | ----------------------------- | ------------------------------ |
-| `vllm`     | A Hugging Face id or a local snapshot directory.        | The twelve base tunables in [the search-space format](search-space.md), plus the two speculative dimensions when a setup is configured. | vLLM dev-mode endpoints.      | Prometheus `/metrics`.         |
-| `llamacpp` | A local `.gguf` file or a Hub repository with `:QUANT`. | The eight base tunables llama.cpp forwards, plus the two speculative dimensions when a setup is configured. | None; llama.cpp exposes none. | The `timings` response object. |
+| `vllm`     | A Hugging Face id or a local snapshot directory.        | The fourteen it forwards: its twelve base tunables in [the search-space format](search-space.md), plus the two speculative dimensions when a setup is configured. | vLLM dev-mode endpoints.      | Prometheus `/metrics`.         |
+| `llamacpp` | A local `.gguf` file or a Hub repository with `:QUANT`. | The thirty-four it forwards: its twenty-six base tunables, plus the two speculative dimensions when a setup is configured and the six draft-only dimensions when a draft model is configured. | None; llama.cpp exposes none. | The `timings` response object. |
+
+For what each llama.cpp knob changes, when it applies, and which model-aware
+rule may drop it, see the [llama.cpp tuning guide](llamacpp-tuning.md).
 
 The **default images**, used when `--image` is omitted, are:
 
@@ -49,9 +52,12 @@ else on the command line behaves the same for both engines.
 
 Both engines also support **speculative decoding**. Its method and draft model
 are fixed on the command line, while whether it is enabled and how deep it
-drafts are two gated search-space dimensions; see
-[Speculative decoding](speculative-decoding.md) for the method
-mapping and a complete example.
+drafts are two gated search-space dimensions. A configured draft model adds
+llama.cpp's six draft-only dimensions, which shape that model's sampling and
+placement; see [Speculative decoding](speculative-decoding.md) for the method
+mapping and a complete example, and the
+[llama.cpp tuning guide](llamacpp-tuning.md#speculative-decoding) for the
+draft-only knobs.
 
 ## Objective and phase metrics
 
@@ -144,13 +150,21 @@ error.
 | ------------------- | ------------ | -------------------------------------------------------------- |
 | `--dataset-name`    | `random`     | Benchmark dataset to serve prompts from.                       |
 | `--dataset-path`    | unset        | Host path to a custom dataset file; the built-in dataset when omitted. |
-| `--num-prompts`     | `200`        | Number of prompts to send per benchmark run.                   |
+| `--num-prompts`     | `50`         | Number of prompts to send per benchmark run.                   |
 | `--input-len`       | `1024`       | Input prompt length, in tokens.                                |
 | `--output-len`      | `128`        | Number of tokens to generate per prompt.                       |
 | `--repetitions`     | `3`          | Measured benchmark runs taken per trial.                       |
 | `--warmup-runs`     | `1`          | Discarded warmup runs taken before the measured runs.          |
 | `--startup-timeout` | `600`        | Seconds to wait for the served model to become healthy; the wait ends early if the container exits. |
-| `--timeout`         | `900`        | Overall time limit for a trial's container, covering startup, warmup, and every measured run, in seconds. |
+| `--timeout`         | `1500`       | Overall time limit for a trial's container, covering startup, warmup, and every measured run, in seconds. |
+
+The defaults balance a stable measurement against a feasible sweep: 50
+prompts over one warmup and three measured runs is enough to rank
+configurations for a single model, while `--timeout 1500` leaves room for a
+slow configuration without letting a hopeless trial run indefinitely. A space
+that deliberately includes slow points (CPU offload, or a small context that
+caps `--parallel`) may still need a larger timeout; a smoke test can lower
+`--num-prompts` or `--repetitions` further.
 
 `--dataset-path` reads a JSONL file, one JSON object per line, with a required
 string `prompt` and an optional positive integer `output_len` that falls back
@@ -202,6 +216,9 @@ kept on the result, so the spread behind the mean stays inspectable.
 | `--gpu-memory-utilization`   | engine default   | Fraction of GPU memory the engine may use.                                   |
 | `--speculative-method`       | unset            | Speculative-decoding method, named engine-neutrally: `draft_model`, `eagle3`, `mtp`, `dflash`, `dspark`, or `ngram`; fixed for the run. No speculative flags are sent unless a method or draft is configured. |
 | `--draft-model`              | unset            | Speculator for the run, in the same source forms as `MODEL`; implies `--speculative-method draft_model` when no method is given. A usage error with `ngram`. |
+| `--fit`                      | `off`            | Whether llama.cpp may rewrite arguments to fit the available memory. Pinning it `off` makes a trial measure the declared configuration; pass `on` to opt into engine auto-fit. llama.cpp only; a usage error for vllm. |
+| `--fit-target`               | engine default   | Headroom, in MiB, that `--fit` leaves on each device; requires `--fit on` and must be at least 1. llama.cpp only; a usage error for vllm. |
+| `--fit-ctx`                  | engine default   | Minimum context `--fit` preserves while fitting; requires `--fit on` and must be at least 1. llama.cpp only; a usage error for vllm. |
 | `--sampler-seed`             | unset            | Seed for the optimization sampler; a non-deterministic search when omitted.  |
 
 `--quantization` and `--gpu-memory-utilization` are vLLM-only and are rejected

@@ -61,30 +61,57 @@ benchmark:
   startup_timeout: 600.0
   timeout: null
 llm:
-  dtype: float16
-  quantization: null
-  kv_cache_dtype: null
   max_model_len: 2048
   max_num_seqs: null
   max_num_batched_tokens: null
   max_num_active_seqs: null
   max_num_scheduled_tokens: null
-  gpu_memory_utilization: null
-  tensor_parallel_size: null
-  seed: null
+  ubatch_size: null
+  dtype: float16
+  quantization: null
+  kv_cache_dtype: null
   attention_backend: null
+  n_gpu_layers: null
+  n_cpu_moe: null
+  n_cpu_ffn: null
+  kv_offload: null
+  op_offload: null
+  host_buffer: null
+  repack: null
+  swa_full: null
+  load_mode: null
+  prefix_caching: null
+  cache_ram: null
+  ctx_checkpoints: null
+  checkpoint_min_step: null
+  kv_unified: null
+  continuous_batching: null
+  cache_idle_slots: null
+  tensor_parallel_size: null
+  expert_parallel: null
+  all2all_backend: null
   speculative_method: null
   draft_model: null
   speculative_mode: null
   num_speculative_tokens: null
-  prefix_caching: null
-  n_gpu_layers: null
-  expert_parallel: null
-  all2all_backend: null
-  n_cpu_moe: null
+  spec_draft_n_min: null
+  spec_draft_p_split: null
+  spec_draft_sampling: null
+  n_gpu_layers_draft: null
+  n_cpu_moe_draft: null
+  draft_kv_cache_dtype: null
+  threads: null
+  threads_batch: null
+  poll: null
+  prio: null
+  fit: null
+  fit_target: null
+  fit_ctx: null
+  seed: null
+  gpu_memory_utilization: null
   resolved_draft_path: null
 """
-"""The document consumers already know; the move must not change a byte of it."""
+"""The pinned document user scripts consume; a deliberate field change updates it here."""
 
 
 def test_the_yaml_writer_never_requires_a_plan() -> None:

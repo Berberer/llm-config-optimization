@@ -21,6 +21,7 @@ from llm_config_optimization.cli.arguments import parse_args
 from llm_config_optimization.cli.config import build_base_config, resolve_objective
 from llm_config_optimization.inference import (
     BenchmarkConfig,
+    FitMode,
     HardwareTarget,
     QuantizationMethod,
     SpeculativeMethod,
@@ -39,16 +40,19 @@ def test_defaults_produce_the_documented_base_config() -> None:
     assert config.benchmark.model == "facebook/opt-125m"
     assert config.benchmark.dataset_name == "random"
     assert config.benchmark.dataset_path is None
-    assert config.benchmark.num_prompts == 200
+    assert config.benchmark.num_prompts == 50
     assert config.benchmark.input_len == 1024
     assert config.benchmark.output_len == 128
     assert config.benchmark.repetitions == 3
     assert config.benchmark.warmup == 1
     assert config.benchmark.startup_timeout == 600
-    assert config.benchmark.timeout == 900
+    assert config.benchmark.timeout == 1500
     assert config.llm.seed == 0
     assert config.llm.quantization is None
     assert config.llm.gpu_memory_utilization is None
+    assert config.llm.fit is FitMode.OFF
+    assert config.llm.fit_target is None
+    assert config.llm.fit_ctx is None
 
 
 def test_tunable_serving_parameters_are_left_unset_for_the_space() -> None:
@@ -61,6 +65,7 @@ def test_tunable_serving_parameters_are_left_unset_for_the_space() -> None:
     assert config.llm.max_num_batched_tokens is None
     assert config.llm.max_num_active_seqs is None
     assert config.llm.max_num_scheduled_tokens is None
+    assert config.llm.ubatch_size is None
     assert config.llm.tensor_parallel_size is None
     assert config.llm.attention_backend is None
     assert config.llm.speculative_method is None
@@ -138,6 +143,51 @@ def test_explicit_flags_override_the_base_config() -> None:
     assert config.llm.seed == 7
     assert config.llm.quantization is QuantizationMethod.AWQ
     assert config.llm.gpu_memory_utilization == 0.9
+
+
+def test_fit_can_be_enabled_with_its_optional_settings() -> None:
+    config = build_base_config(
+        parse_args(
+            [
+                "facebook/opt-125m",
+                "space.yaml",
+                "llamacpp",
+                "--fit",
+                "on",
+                "--fit-target",
+                "1024",
+                "--fit-ctx",
+                "8192",
+            ]
+        )
+    )
+
+    assert config.llm.fit is FitMode.ON
+    assert config.llm.fit_target == 1024
+    assert config.llm.fit_ctx == 8192
+
+
+def test_the_default_fit_pins_the_declared_configuration() -> None:
+    """The command line pins fit off so a trial measures what the space declared."""
+    config = build_base_config(parse_args(["facebook/opt-125m", "space.yaml", "llamacpp"]))
+
+    assert config.llm.fit is FitMode.OFF
+
+
+@pytest.mark.parametrize("option", ["--fit-target", "--fit-ctx"])
+def test_fit_settings_without_fit_on_are_rejected(option: str) -> None:
+    with pytest.raises(ValueError, match="require --fit on"):
+        build_base_config(
+            parse_args(["facebook/opt-125m", "space.yaml", "llamacpp", option, "1024"])
+        )
+
+
+@pytest.mark.parametrize("option", ["--fit-target", "--fit-ctx"])
+def test_non_positive_fit_settings_are_rejected(option: str) -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        build_base_config(
+            parse_args(["facebook/opt-125m", "space.yaml", "llamacpp", "--fit", "on", option, "0"])
+        )
 
 
 def test_the_speculative_flags_populate_the_base_config() -> None:

@@ -102,5 +102,6 @@ Detailed guides are linked here:
 | ----- | -------- |
 | [Usage reference](docs/usage.md) | Engine selection, benchmark workload, objectives and phase metrics, every CLI option, winning-configuration output formats, study persistence, exit codes, and complete example calls. |
 | [Search-space YAML format](docs/search-space.md) | Definition format, spec kinds, tunable parameters, per-engine mappings, validation, shipped example spaces, and the shared prompt corpus. |
+| [llama.cpp tuning guide](docs/llamacpp-tuning.md) | What each llama.cpp knob changes, when it applies, the model-aware rules, the fit correctness pin, and the engine's accepted ranges. |
 | [Speculative decoding](docs/speculative-decoding.md) | Methods and draft sources, the gated mode and depth dimensions, engine flag mappings, end-to-end examples, and the random-workload caveat. |
 | [Architecture and tech stack](docs/architecture.md) | Layer boundaries, the engine extension surface, and the technology stack. |

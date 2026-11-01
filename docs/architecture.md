@@ -26,9 +26,13 @@ The codebase is layered so engine details stay at the edges:
 - `search_space/`: Engine-neutral definition types — including the
   `SpaceAssessment` result a backend returns for a resolved model — the tunable
   registry, the YAML loader, and validation. Each tunable's kind is derived from
-  its `LLMConfig` annotation — enum, integer, boolean, or an int-or-enum union
-  such as `n_gpu_layers` or `n_cpu_moe` — so `interval` constrains only a
-  numeric branch and booleans stay strict.
+  its `LLMConfig` annotation — enum, integer, float, boolean, or an int-or-enum
+  union such as `n_gpu_layers` or `n_cpu_moe` — so `interval` constrains only a
+  numeric branch and booleans stay strict. Float is a first-class kind: a
+  `fixed`, `categorical`, or `interval` value is parsed as a real number (an
+  integer is accepted and stored as a float) without letting a boolean satisfy a
+  numeric bound, and an interval over a float field admits fractional
+  endpoints.
 - `inference/`: The engine-neutral experiment surface (the `InferenceBackend`
   `Protocol` and the `ServerSpec` a backend plans) plus the `VLLMBackend` and
   `LlamaCppBackend`, the host-side benchmark client, and hardware detection. A
@@ -39,15 +43,24 @@ The codebase is layered so engine details stay at the edges:
   plans a `ServerSpec`, and parses results; the client waits for the server's
   health — failing the run as soon as the container exits during that wait —
   takes the warmup and measured runs, snapshots the spec's declared metrics
-  path around each one, and aggregates the metrics. A second engine is another
-  implementation of the protocol.
+  path around each one, and aggregates the metrics. Categorical fields hold
+  engine-neutral `StrEnum`s declared in the same module — `DType`,
+  `QuantizationMethod`, `KVCacheDType`, `AttentionBackend`, `GpuLayersMode`,
+  `CpuMoeMode`, `All2AllBackend`, `LoadMode`, `FitMode`, `SpecDraftSampling`,
+  and the speculative method and mode — while an exact count stays a plain
+  integer in a union; each backend maps only the members it serves, so no
+  engine's spelling appears here. A second engine is another implementation of
+  the protocol.
 - `runtime/`: Backend-agnostic container types, the detached start/stop
   lifecycle a host-driven run uses, and the Podman client (plus SELinux
   auto-detection).
 - `optimization/`: The engine-neutral objective model (`ObjectiveMode`,
   `ObjectiveWeights`, and the scoring functions) and the Optuna adapter that
   maps spec kinds to suggestions, scores each trial, drives a study, and guards
-  its recorded mode.
+  its recorded mode. A float interval is sampled with a float suggestion and a
+  float choice with a categorical suggestion, while reconstruction dispatches
+  on the declared kind, so a resumed study's float is not truncated to an
+  integer.
 - `output/`: Engine-neutral winning-configuration writers and their registry.
   `OutputFormat` names the artifact styles (`yaml`, `quadlet`, `compose`),
   `RenderContext` carries the recommended experiment with the resolved target
@@ -68,13 +81,33 @@ search space and validation workflow can target a different inference backend
 later without changing the file format. The search space is total over the
 selected backend's applicable set **for the run's fixed configuration**, so the
 engine — not the file format — decides which parameters a definition must
-declare. A parameter can be applicable only under a configured setup: the two
-speculative tunables (`speculative_mode` and `num_speculative_tokens`) are
-required exactly when the run fixes a speculative method or draft model, and
-rejected otherwise. Each backend keeps its vocabulary — flags, value spellings,
-checkpoint handling, metric series, and default images — in its own module, and
-the host client only fetches and parses the Prometheus exposition a spec's
-`metrics_path` names.
+declare. A parameter can be applicable only under a configured setup, and the
+registry declares two such gates. The two speculative tunables
+(`speculative_mode` and `num_speculative_tokens`) are required exactly when the
+run fixes a speculative method or draft model and rejected otherwise. The six
+draft-only tunables (`spec_draft_n_min`, `spec_draft_p_split`,
+`spec_draft_sampling`, `n_gpu_layers_draft`, `n_cpu_moe_draft`, and
+`draft_kv_cache_dtype`) are required exactly when the run names a separate
+draft model, because methods such as n-gram and the target's own MTP heads do
+not use one. Both backends subtract both gated sets from their base applicable
+set and add back only the gated parameters they actually forward, intersected
+with their own forwarded-parameter table, so gating cannot drift between
+engines and vLLM never requires a llama.cpp-only field. Each backend keeps its
+vocabulary — flags, value spellings, checkpoint handling, metric series, and
+default images — in its own module, and the host client only fetches and parses
+the Prometheus exposition a spec's `metrics_path` names.
+
+The fit family is the one deliberate exception to "`None` leaves it to the
+engine": the command line pins `--fit off` by default, because llama.cpp's own
+default lets the engine rewrite arguments to fit the device and a trial would
+then measure something other than the point the search space declared. The
+family is fixed for a run and stays out of the tunable registry, since sweeping
+a correctness pin could undo the guarantee it exists to provide. `fit` selects
+the engine-neutral `FitMode`, while `fit_target` and `fit_ctx` carry an
+optional MiB headroom and minimum context; `--fit on` opts back into auto-fit,
+`--fit-target` and `--fit-ctx` require it and are rejected as a usage error
+otherwise, and a hand-built configuration that leaves fit unset or off
+suppresses them rather than forwarding flags the engine would ignore.
 
 Model resolution also follows the backend's rules rather than the CLI's. The
 composition root asks `model_request` what the main model argument refers to,
@@ -93,11 +126,16 @@ rejects `all` and positive exact counts before the run, while a count above the
 resolved checkpoint's GGUF block count is caught once the metadata is readable,
 failing open otherwise. Its KV-cache validation rejects a space that can pair a
 quantized `kv_cache_dtype` with `attention_backend: off`, because llama.cpp
-refuses to build a quantized V cache without flash attention. vLLM's space
-validation likewise rejects an explicit `float16`/`bfloat16` cache when `dtype`
-pins exactly one different explicit precision, since the engine stores a
-non-quantized KV cache in the model dtype; `auto`, deferred, and multi-value
-dtype pairs are reconciled once the checkpoint is readable.
+refuses to build a quantized V cache without flash attention; the same rule
+applies to `draft_kv_cache_dtype` when the run names a draft model. Its
+flag-level validation also rejects values the engine's parser would refuse at
+startup, naming the value and the permitted range: `poll` outside `0…100`,
+`prio` outside `-1…3`, `spec_draft_p_split` outside `0.0…1.0`, and
+`cache_ram` below `-1`. vLLM's space validation likewise rejects an explicit
+`float16`/`bfloat16` cache when `dtype` pins exactly one different explicit
+precision, since the engine stores a non-quantized KV cache in the model dtype;
+`auto`, deferred, and multi-value dtype pairs are reconciled once the
+checkpoint is readable.
 
 Checkpoint-aware work is split between two backend hooks. `validate_model`
 rejects a configuration the checkpoint cannot serve — a quantization method it
@@ -114,10 +152,18 @@ while a space with no dimensions left runs once at engine defaults.
 
 The MoE rules are one family: vLLM reads `config.json` expert keys and
 llama.cpp the GGUF `<arch>.expert_count`, so a confidently dense checkpoint
-loses its MoE dimensions; a CPU target loses llama.cpp's offload dimensions it
-cannot use; and a vLLM space whose tensor-parallel ceiling is one loses expert
-parallelism with its all-to-all transport. Retained `n_cpu_moe` and
-`n_gpu_layers` counts are then bounded by the architecture's block count.
+loses its MoE dimensions. llama.cpp also reads the sliding-window fact from
+`<arch>.attention.sliding_window`, so a confidently full-attention checkpoint
+loses `swa_full`. On a CPU target llama.cpp loses the offload dimensions that
+cannot matter there — `n_cpu_moe`, `n_cpu_ffn`, `kv_offload`, `op_offload`, and
+the draft model's `n_cpu_moe_draft` and `n_gpu_layers_draft` — plus
+`n_gpu_layers` when every declared value already disables offload; a vLLM space
+whose tensor-parallel ceiling is one loses expert parallelism with its
+all-to-all transport. Retained layer counts are then bounded by the relevant
+checkpoint's block count: `n_gpu_layers`, `n_cpu_moe`, and `n_cpu_ffn` by the
+target checkpoint, and `n_gpu_layers_draft` and `n_cpu_moe_draft` by the draft
+checkpoint. `n_cpu_ffn` has no `all` mode, so its hint asks for a smaller count
+while the others point at `all`.
 vLLM's `CheckpointFacts` reader also reports the preferred model dtype —
 `dtype`/`torch_dtype`, with a nested `text_config` value winning — and whether
 any layer type is `linear_attention`. Those facts drive a kernel rule, not a

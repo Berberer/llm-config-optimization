@@ -18,6 +18,7 @@ tests' use of engine-neutral enums.
 """
 
 from enum import StrEnum
+from pathlib import Path
 
 import optuna
 import pytest
@@ -52,45 +53,47 @@ from llm_config_optimization.search_space import (
 
 FULL_SPACE = ExperimentSpace(
     dimensions=(
-        Dimension("dtype", Categorical((DType.FLOAT16, DType.BFLOAT16))),
-        Dimension("kv_cache_dtype", Categorical((KVCacheDType.AUTO, KVCacheDType.FP8_E4M3))),
         Dimension("max_model_len", Interval(1024, 8192)),
         Dimension("max_num_seqs", Fixed(256)),
         Dimension("max_num_batched_tokens", Interval(2048, 8192)),
         Dimension("max_num_active_seqs", Fixed(16)),
         Dimension("max_num_scheduled_tokens", Interval(2048, 4096)),
-        Dimension("tensor_parallel_size", Categorical((1, 2, 4))),
+        Dimension("ubatch_size", Categorical((256, 512, 1024))),
+        Dimension("dtype", Categorical((DType.FLOAT16, DType.BFLOAT16))),
+        Dimension("kv_cache_dtype", Categorical((KVCacheDType.AUTO, KVCacheDType.FP8_E4M3))),
         Dimension(
             "attention_backend",
             Categorical((AttentionBackend.XFORMERS, AttentionBackend.FLASH_ATTENTION)),
         ),
-        Dimension("prefix_caching", Categorical((True, False))),
         Dimension("n_gpu_layers", Categorical((GpuLayersMode.AUTO, 0, GpuLayersMode.ALL, 8))),
+        Dimension("n_cpu_moe", Categorical((0, 8, CpuMoeMode.ALL))),
+        Dimension("prefix_caching", Categorical((True, False))),
+        Dimension("tensor_parallel_size", Categorical((1, 2, 4))),
         Dimension("expert_parallel", Categorical((True, False))),
         Dimension(
             "all2all_backend",
             Categorical((All2AllBackend.ALLGATHER_REDUCESCATTER, All2AllBackend.NAIVE)),
         ),
-        Dimension("n_cpu_moe", Categorical((0, 8, CpuMoeMode.ALL))),
     )
 )
 """A complete space over every tunable, with all four spec kinds represented."""
 
 PARAMETERS: dict[str, object] = {
-    "dtype": "bfloat16",
-    "kv_cache_dtype": "fp8_e4m3",
     "max_model_len": 4096,
     "max_num_seqs": 256,
     "max_num_batched_tokens": 4096,
     "max_num_active_seqs": 16,
     "max_num_scheduled_tokens": 2048,
-    "tensor_parallel_size": 2,
+    "ubatch_size": 1024,
+    "dtype": "bfloat16",
+    "kv_cache_dtype": "fp8_e4m3",
     "attention_backend": "flash_attention",
-    "prefix_caching": True,
     "n_gpu_layers": "all",
+    "n_cpu_moe": "all",
+    "prefix_caching": True,
+    "tensor_parallel_size": 2,
     "expert_parallel": False,
     "all2all_backend": "naive",
-    "n_cpu_moe": "all",
 }
 """A parameter mapping as a persisted study would return it: plain JSON values."""
 
@@ -302,23 +305,24 @@ def test_reconstruct_llm_takes_tunables_from_the_mapping_and_inherits_the_rest()
     result = reconstruct_llm(FULL_SPACE, BASE_LLM, PARAMETERS)
 
     assert result == LLMConfig(
-        dtype=DType.BFLOAT16,
-        quantization=QuantizationMethod.AWQ,
-        kv_cache_dtype=KVCacheDType.FP8_E4M3,
         max_model_len=4096,
         max_num_seqs=256,
         max_num_batched_tokens=4096,
         max_num_active_seqs=16,
         max_num_scheduled_tokens=2048,
-        gpu_memory_utilization=0.85,
-        tensor_parallel_size=2,
-        seed=7,
+        ubatch_size=1024,
+        dtype=DType.BFLOAT16,
+        quantization=QuantizationMethod.AWQ,
+        kv_cache_dtype=KVCacheDType.FP8_E4M3,
         attention_backend=AttentionBackend.FLASH_ATTENTION,
-        prefix_caching=True,
         n_gpu_layers=GpuLayersMode.ALL,
+        n_cpu_moe=CpuMoeMode.ALL,
+        prefix_caching=True,
+        tensor_parallel_size=2,
         expert_parallel=False,
         all2all_backend=All2AllBackend.NAIVE,
-        n_cpu_moe=CpuMoeMode.ALL,
+        seed=7,
+        gpu_memory_utilization=0.85,
     )
 
 
@@ -328,3 +332,61 @@ def test_reconstruct_config_reuses_the_base_container_and_benchmark() -> None:
     assert result.container is BASE_EXPERIMENT.container
     assert result.benchmark is BASE_EXPERIMENT.benchmark
     assert result.llm == reconstruct_llm(FULL_SPACE, BASE_EXPERIMENT.llm, PARAMETERS)
+
+
+def test_a_float_interval_is_sampled_and_reconstructed_as_a_float() -> None:
+    """A float field gets a real-valued suggestion and keeps its precision."""
+    space = ExperimentSpace(dimensions=(Dimension("spec_draft_p_split", Interval(0.05, 0.95)),))
+
+    (trial,) = _sample(space)
+    distribution = trial.distributions["spec_draft_p_split"]
+    result = reconstruct_llm(space, LLMConfig(), trial.params)
+
+    assert isinstance(distribution, optuna.distributions.FloatDistribution)
+    assert (distribution.low, distribution.high) == (0.05, 0.95)
+    assert isinstance(trial.params["spec_draft_p_split"], float)
+    assert 0.05 <= trial.params["spec_draft_p_split"] <= 0.95
+    assert isinstance(result.spec_draft_p_split, float)
+    assert result.spec_draft_p_split == trial.params["spec_draft_p_split"]
+
+
+def test_float_categorical_values_stay_floats_when_reconstructed() -> None:
+    """A float choice is offered unchanged and reconstructed without truncation."""
+    space = ExperimentSpace(
+        dimensions=(Dimension("spec_draft_p_split", Categorical((0.25, 0.75, 0.9))),)
+    )
+
+    trials = _sample(space, 20, seed=5)
+    distribution = trials[0].distributions["spec_draft_p_split"]
+    reconstructed = {
+        reconstruct_llm(space, LLMConfig(), trial.params).spec_draft_p_split for trial in trials
+    }
+
+    assert list(distribution.choices) == [0.25, 0.75, 0.9]
+    assert reconstructed <= {0.25, 0.75, 0.9}
+    assert all(isinstance(value, float) for value in reconstructed)
+
+
+def test_a_resumed_float_study_reconstructs_the_recorded_float(tmp_path: Path) -> None:
+    """A reloaded study returns plain floats and reconstruction preserves them."""
+    storage = f"sqlite:///{tmp_path / 'study.db'}"
+    space = ExperimentSpace(dimensions=(Dimension("spec_draft_p_split", Interval(0.05, 0.95)),))
+    study = optuna.create_study(storage=storage, study_name="sweep", direction="maximize")
+    trial = study.ask()
+    suggest_parameters(trial, space)
+    study.tell(trial, 1.0)
+    sampled = trial.params["spec_draft_p_split"]
+
+    resumed = optuna.load_study(study_name="sweep", storage=storage)
+    result = reconstruct_llm(space, LLMConfig(), resumed.best_trial.params)
+
+    assert resumed.best_trial.params["spec_draft_p_split"] == sampled
+    assert isinstance(result.spec_draft_p_split, float)
+    assert result.spec_draft_p_split == sampled
+
+
+def test_a_float_field_rejects_a_boolean_value() -> None:
+    space = ExperimentSpace(dimensions=(Dimension("spec_draft_p_split", Fixed(0.5)),))
+
+    with pytest.raises(ValueError, match="spec_draft_p_split"):
+        reconstruct_llm(space, LLMConfig(), {"spec_draft_p_split": True})

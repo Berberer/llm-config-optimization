@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from llm_config_optimization.inference import (
     All2AllBackend,
@@ -27,6 +28,7 @@ from llm_config_optimization.inference import (
     VLLMBackend,
 )
 from llm_config_optimization.search_space import (
+    TUNABLE_PARAMETERS,
     Categorical,
     ExperimentSpace,
     Fixed,
@@ -50,6 +52,19 @@ _EXAMPLE_HARDWARE = {
 }
 """The examples whose defining configuration needs more than one device."""
 
+_LLAMACPP_DRAFT = "bartowski/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q4_K_M.gguf"
+"""A representative draft source for the llama.cpp speculative examples."""
+
+_LLAMACPP_DRAFT_DIMENSIONS = (
+    "spec_draft_n_min",
+    "spec_draft_p_split",
+    "spec_draft_sampling",
+    "n_gpu_layers_draft",
+    "n_cpu_moe_draft",
+    "draft_kv_cache_dtype",
+)
+"""The draft-only dimensions every llama.cpp speculative example declares."""
+
 _PORTABLE_VLLM_CHECKPOINTS = {
     "dense": {"torch_dtype": "bfloat16"},
     "full-attention": {"torch_dtype": "bfloat16", "layer_types": ["full_attention"]},
@@ -64,11 +79,14 @@ _PORTABLE_VLLM_CHECKPOINTS = {
 def _load_example(path: Path) -> tuple[VLLMBackend | LlamaCppBackend, ExperimentSpace, LLMConfig]:
     """Load a shipped example against its engine's applicable parameter set."""
     backend = VLLMBackend() if path.parent.name == "vllm" else LlamaCppBackend()
-    llm = (
-        LLMConfig(speculative_method=SpeculativeMethod.MTP)
-        if "speculative" in path.stem
-        else LLMConfig()
-    )
+    if "speculative" not in path.stem:
+        llm = LLMConfig()
+    elif path.parent.name == "llamacpp":
+        llm = LLMConfig(
+            speculative_method=SpeculativeMethod.DRAFT_MODEL, draft_model=_LLAMACPP_DRAFT
+        )
+    else:
+        llm = LLMConfig(speculative_method=SpeculativeMethod.MTP)
     return backend, load_experiment_space(path, required=backend.applicable_parameters(llm)), llm
 
 
@@ -109,6 +127,44 @@ def test_llamacpp_moe_example_sweeps_offload_counts_and_full_offload() -> None:
         for value in spec.values
     )
     assert dimensions["n_gpu_layers"].spec == Fixed(GpuLayersMode.ALL)
+    assert list(backend.validate(space, llm, _GPU)) == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    sorted((_EXAMPLES / "llamacpp").glob("*.yaml")),
+    ids=lambda path: path.name,
+)
+def test_llamacpp_examples_declare_dimensions_in_canonical_order(path: Path) -> None:
+    """Every llama.cpp example writes its dimensions in canonical registry order.
+
+    The loader reorders dimensions regardless of the file, so this guards the
+    examples as documentation: a reader sees related knobs adjacent, and an
+    omitted dimension (a gated or engine-specific one) keeps the remaining
+    order intact rather than shifting entries around the gap.
+    """
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    declared = list(document["space"])
+    canonical = [name for name in TUNABLE_PARAMETERS if name in set(declared)]
+
+    assert declared == canonical
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["space-speculative-full.yaml", "space-speculative-defaults.yaml"],
+    ids=["full", "defaults"],
+)
+def test_llamacpp_speculative_examples_declare_the_draft_dimensions(name: str) -> None:
+    """A draft-configured llama.cpp speculative space declares every draft knob."""
+    path = _EXAMPLES / "llamacpp" / name
+    backend, space, llm = _load_example(path)
+    names = [dimension.name for dimension in space.dimensions]
+
+    for dimension in _LLAMACPP_DRAFT_DIMENSIONS:
+        assert dimension in names
+    assert names.index("cache_idle_slots") < names.index("speculative_mode")
+    assert names.index("draft_kv_cache_dtype") < names.index("threads")
     assert list(backend.validate(space, llm, _GPU)) == []
 
 

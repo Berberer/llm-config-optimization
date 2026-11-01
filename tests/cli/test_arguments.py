@@ -32,18 +32,21 @@ def test_defaults_match_the_documented_settings() -> None:
     assert args.pull_policy == "missing"
     assert args.dataset_name == "random"
     assert args.dataset_path is None
-    assert args.num_prompts == 200
+    assert args.num_prompts == 50
     assert args.input_len == 1024
     assert args.output_len == 128
     assert args.repetitions == 3
     assert args.warmup_runs == 1
     assert args.startup_timeout == 600
-    assert args.timeout == 900
+    assert args.timeout == 1500
     assert args.llm_seed == 0
     assert args.quantization is None
     assert args.gpu_memory_utilization is None
     assert args.speculative_method is None
     assert args.draft_model is None
+    assert args.fit is None
+    assert args.fit_target is None
+    assert args.fit_ctx is None
     assert args.sampler_seed is None
     assert args.n_trials is None
     assert args.sweep_timeout is None

@@ -169,6 +169,7 @@ _ENGINES: Mapping[str, _EngineEntry] = {
     "vllm": _EngineEntry(
         factory=_vllm_backend,
         deployment_factory=_vllm_deployment_backend,
+        rejected_options=("fit", "fit-target", "fit-ctx"),
     ),
     "llamacpp": _EngineEntry(
         factory=_llamacpp_backend,

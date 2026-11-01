@@ -1,8 +1,9 @@
 # The complete llama.cpp search space with the speculative trade-off in the
 # sweep: every trial either runs with the configured setup or with no
-# speculative flags at all, and the enabled trials sample one of four draft
-# depths. Configure the method and the optional draft model on the command
-# line, for example:
+# speculative flags at all, the enabled trials sample one of four draft depths,
+# and the draft-only knobs shape how the draft model samples and where it lives.
+# This space therefore requires a separate draft model. Configure the method and
+# the draft model on the command line, for example:
 #
 #   --speculative-method draft_model --draft-model path/to/draft.gguf
 #
@@ -10,16 +11,18 @@
 # on/off comparison on constrained hardware meaningful. The depth is sampled on
 # every trial but only applied when the mode is enabled, so disabled points can
 # repeat across depth values; this is expected and harmless to the optimizer.
+# The draft-only dimensions are still sampled on disabled trials — they are
+# applicable because the run names a draft — but their flags are suppressed
+# along with the rest of the speculative setup.
 #
-# Only the eight parameters llama-server forwards are declared; `dtype` and
-# `tensor_parallel_size` are not applicable to a GGUF checkpoint. The slot cap
-# and context-size notes from `space-full.yaml` apply unchanged.
+# Only the parameters llama-server forwards are declared, in canonical registry
+# order; `dtype` and `tensor_parallel_size` are not applicable to a GGUF
+# checkpoint. The slot cap and context-size notes from `space-full.yaml` apply
+# unchanged.
 space:
-  kv_cache_dtype:
-    categorical: [float16, bfloat16, float32, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1]
   max_model_len:
     interval:
-      min: 1024
+      min: 18432
       max: 32768
   max_num_seqs:
     interval:
@@ -29,15 +32,69 @@ space:
     interval:
       min: 2048
       max: 8192
+  ubatch_size:
+    default: true
+  kv_cache_dtype:
+    categorical: [float16, bfloat16, float32, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1]
   attention_backend:
     categorical: [auto, flash_attention]
+  n_gpu_layers:
+    default: true
+  n_cpu_moe:
+    default: true
+  n_cpu_ffn:
+    default: true
+  kv_offload:
+    default: true
+  op_offload:
+    default: true
+  host_buffer:
+    default: true
+  repack:
+    default: true
+  swa_full:
+    default: true
+  load_mode:
+    default: true
+  prefix_caching:
+    categorical: [true, false]
+  cache_ram:
+    default: true
+  ctx_checkpoints:
+    default: true
+  checkpoint_min_step:
+    default: true
+  kv_unified:
+    default: true
+  continuous_batching:
+    default: true
+  cache_idle_slots:
+    default: true
   speculative_mode:
     categorical: [enabled, disabled]
   num_speculative_tokens:
     categorical: [1, 2, 4, 8]
-  prefix_caching:
-    categorical: [true, false]
-  n_gpu_layers:
+  spec_draft_n_min:
+    interval:
+      min: 0
+      max: 8
+  spec_draft_p_split:
+    interval:
+      min: 0.0
+      max: 1.0
+  spec_draft_sampling:
+    categorical: [greedy, probabilistic]
+  n_gpu_layers_draft:
+    categorical: [auto, 0, all]
+  n_cpu_moe_draft:
+    categorical: [0, 8, all]
+  draft_kv_cache_dtype:
+    categorical: [float16, bfloat16, float32, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1]
+  threads:
     default: true
-  n_cpu_moe:
+  threads_batch:
+    default: true
+  poll:
+    default: true
+  prio:
     default: true

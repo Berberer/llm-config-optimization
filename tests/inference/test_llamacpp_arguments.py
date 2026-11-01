@@ -17,10 +17,13 @@ from llm_config_optimization.inference import (
     CpuMoeMode,
     DType,
     ExperimentError,
+    FitMode,
     GpuLayersMode,
     KVCacheDType,
     LLMConfig,
+    LoadMode,
     QuantizationMethod,
+    SpecDraftSampling,
     SpeculativeMethod,
     SpeculativeMode,
 )
@@ -73,7 +76,8 @@ def test_applicable_parameters_are_the_registry_minus_llama_cpp_inapplicable_one
     """The forwarding table covers exactly the tunables llama.cpp can serve."""
     forwarded_tunables = {name for name in TUNABLE_PARAMETERS if name in PARAMETER_TARGETS}
     assert forwarded_tunables == set(TUNABLE_PARAMETERS) - _INAPPLICABLE_TUNABLES
-    assert set(PARAMETER_TARGETS) == forwarded_tunables | {"speculative_method", "draft_model"}
+    fixed_only = {"speculative_method", "draft_model", "fit", "fit_target", "fit_ctx"}
+    assert set(PARAMETER_TARGETS) == forwarded_tunables | fixed_only
 
 
 def test_every_llm_config_field_is_classified_as_mapped_or_inapplicable() -> None:
@@ -94,8 +98,9 @@ def test_every_llm_config_field_is_classified_as_mapped_or_inapplicable() -> Non
         (LLMConfig(max_num_seqs=8), ["--parallel", "8"]),
         (
             LLMConfig(max_num_batched_tokens=8192),
-            ["--batch-size", "8192", "--ubatch-size", "8192"],
+            ["--batch-size", "8192"],
         ),
+        (LLMConfig(ubatch_size=2048), ["--ubatch-size", "2048"]),
         (
             LLMConfig(kv_cache_dtype=KVCacheDType.FLOAT16),
             ["--cache-type-k", "f16", "--cache-type-v", "f16"],
@@ -109,6 +114,18 @@ def test_every_llm_config_field_is_classified_as_mapped_or_inapplicable() -> Non
         (LLMConfig(n_gpu_layers=40), ["--n-gpu-layers", "40"]),
         (LLMConfig(n_cpu_moe=0), ["--n-cpu-moe", "0"]),
         (LLMConfig(n_cpu_moe=8), ["--n-cpu-moe", "8"]),
+        (LLMConfig(n_cpu_ffn=0), ["--n-cpu-ffn", "0"]),
+        (LLMConfig(n_cpu_ffn=12), ["--n-cpu-ffn", "12"]),
+        (LLMConfig(cache_ram=-1), ["--cache-ram", "-1"]),
+        (LLMConfig(cache_ram=0), ["--cache-ram", "0"]),
+        (LLMConfig(cache_ram=2048), ["--cache-ram", "2048"]),
+        (LLMConfig(ctx_checkpoints=4), ["--ctx-checkpoints", "4"]),
+        (LLMConfig(checkpoint_min_step=0), ["--checkpoint-min-step", "0"]),
+        (LLMConfig(load_mode=LoadMode.MMAP), ["--load-mode", "mmap"]),
+        (LLMConfig(spec_draft_n_min=2), ["--spec-draft-n-min", "2"]),
+        (LLMConfig(spec_draft_p_split=0.75), ["--spec-draft-p-split", "0.75"]),
+        (LLMConfig(n_gpu_layers_draft=8), ["--n-gpu-layers-draft", "8"]),
+        (LLMConfig(n_cpu_moe_draft=8), ["--n-cpu-moe-draft", "8"]),
     ],
 )
 def test_each_tunable_maps_to_its_server_flags(config: LLMConfig, expected: list[str]) -> None:
@@ -176,6 +193,142 @@ def test_an_unset_n_cpu_moe_emits_no_flag() -> None:
     assert serve_arguments(LLMConfig(n_cpu_moe=None)) == []
 
 
+def test_the_all_draft_cpu_moe_mode_emits_the_value_less_flag() -> None:
+    """``all`` is ``--cpu-moe-draft``, never ``--n-cpu-moe-draft all``."""
+    assert serve_arguments(LLMConfig(n_cpu_moe_draft=CpuMoeMode.ALL)) == ["--cpu-moe-draft"]
+
+
+@pytest.mark.parametrize(
+    ("value", "spelling"),
+    [
+        (GpuLayersMode.AUTO, "auto"),
+        (GpuLayersMode.ALL, "all"),
+    ],
+)
+def test_every_draft_gpu_layers_mode_translates(value: GpuLayersMode, spelling: str) -> None:
+    assert serve_arguments(LLMConfig(n_gpu_layers_draft=value)) == [
+        "--n-gpu-layers-draft",
+        spelling,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "spelling"),
+    [
+        (SpecDraftSampling.GREEDY, "greedy"),
+        (SpecDraftSampling.PROBABILISTIC, "probabilistic"),
+    ],
+)
+def test_every_draft_sampling_strategy_translates(value: SpecDraftSampling, spelling: str) -> None:
+    assert serve_arguments(LLMConfig(spec_draft_sampling=value)) == [
+        "--spec-draft-sampling",
+        spelling,
+    ]
+
+
+def test_the_draft_cache_dtype_targets_both_cache_flags() -> None:
+    assert serve_arguments(LLMConfig(draft_kv_cache_dtype=KVCacheDType.Q8_0)) == [
+        "--cache-type-k-draft",
+        "q8_0",
+        "--cache-type-v-draft",
+        "q8_0",
+    ]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "spec_draft_n_min",
+        "spec_draft_p_split",
+        "spec_draft_sampling",
+        "n_gpu_layers_draft",
+        "n_cpu_moe_draft",
+        "draft_kv_cache_dtype",
+    ],
+)
+def test_an_unset_draft_field_emits_no_flag(field: str) -> None:
+    assert serve_arguments(LLMConfig(**{field: None})) == []
+
+
+@pytest.mark.parametrize(
+    ("value", "spelling"),
+    [
+        (LoadMode.AUTO, "auto"),
+        (LoadMode.NONE, "none"),
+        (LoadMode.MMAP, "mmap"),
+        (LoadMode.MLOCK, "mlock"),
+        (LoadMode.MMAP_MLOCK, "mmap+mlock"),
+        (LoadMode.DIO, "dio"),
+    ],
+)
+def test_every_load_mode_translates(value: LoadMode, spelling: str) -> None:
+    """The compound mode becomes llama.cpp's ``mmap+mlock``, not its enum name."""
+    assert serve_arguments(LLMConfig(load_mode=value)) == ["--load-mode", spelling]
+
+
+@pytest.mark.parametrize(("value", "spelling"), [(FitMode.ON, "on"), (FitMode.OFF, "off")])
+def test_every_fit_mode_translates(value: FitMode, spelling: str) -> None:
+    assert serve_arguments(LLMConfig(fit=value)) == ["--fit", spelling]
+
+
+def test_fit_settings_are_forwarded_only_when_fit_is_enabled() -> None:
+    """llama.cpp discards a target or context that arrives without ``--fit on``."""
+    assert serve_arguments(LLMConfig(fit=FitMode.ON, fit_target=1024, fit_ctx=8192)) == [
+        "--fit",
+        "on",
+        "--fit-target",
+        "1024",
+        "--fit-ctx",
+        "8192",
+    ]
+    assert serve_arguments(LLMConfig(fit=FitMode.OFF, fit_target=1024, fit_ctx=8192)) == [
+        "--fit",
+        "off",
+    ]
+    assert serve_arguments(LLMConfig(fit_target=1024, fit_ctx=8192)) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "enabled", "disabled"),
+    [
+        ("kv_offload", "--kv-offload", "--no-kv-offload"),
+        ("op_offload", "--op-offload", "--no-op-offload"),
+        ("repack", "--repack", "--no-repack"),
+        ("kv_unified", "--kv-unified", "--no-kv-unified"),
+        ("continuous_batching", "--cont-batching", "--no-cont-batching"),
+        ("cache_idle_slots", "--cache-idle-slots", "--no-cache-idle-slots"),
+    ],
+)
+def test_each_two_sided_toggle_emits_both_flags(field: str, enabled: str, disabled: str) -> None:
+    """Both sides are explicit, so ``False`` is a real setting."""
+    assert serve_arguments(LLMConfig(**{field: True})) == [enabled]
+    assert serve_arguments(LLMConfig(**{field: False})) == [disabled]
+
+
+def test_the_cpu_and_process_fields_forward_their_flags() -> None:
+    assert serve_arguments(LLMConfig(threads=8)) == ["--threads", "8"]
+    assert serve_arguments(LLMConfig(threads_batch=4)) == ["--threads-batch", "4"]
+    assert serve_arguments(LLMConfig(poll=50)) == ["--poll", "50"]
+    assert serve_arguments(LLMConfig(prio=2)) == ["--prio", "2"]
+
+
+@pytest.mark.parametrize("field", ["threads", "threads_batch", "poll", "prio"])
+def test_an_unset_cpu_or_process_field_emits_no_flag(field: str) -> None:
+    assert serve_arguments(LLMConfig(**{field: None})) == []
+
+
+def test_the_one_sided_host_buffer_toggle_only_has_a_disabling_flag() -> None:
+    """llama.cpp has ``--no-host`` but no enabling counterpart."""
+    assert serve_arguments(LLMConfig(host_buffer=True)) == []
+    assert serve_arguments(LLMConfig(host_buffer=False)) == ["--no-host"]
+
+
+def test_the_one_sided_swa_full_toggle_only_has_an_enabling_flag() -> None:
+    """llama.cpp has ``--swa-full`` but no disabling counterpart."""
+    assert serve_arguments(LLMConfig(swa_full=True)) == ["--swa-full"]
+    assert serve_arguments(LLMConfig(swa_full=False)) == []
+
+
 @pytest.mark.parametrize(
     ("config", "field"),
     [
@@ -224,6 +377,14 @@ def test_every_supported_value_has_a_map_entry_and_no_unsupported_one_does() -> 
         SpeculativeMode.DISABLED: "disabled",
     }
     assert VALUE_MAPS["n_cpu_moe"] == {CpuMoeMode.ALL: "all"}
+    assert VALUE_MAPS["load_mode"] == {
+        LoadMode.AUTO: "auto",
+        LoadMode.NONE: "none",
+        LoadMode.MMAP: "mmap",
+        LoadMode.MLOCK: "mlock",
+        LoadMode.MMAP_MLOCK: "mmap+mlock",
+        LoadMode.DIO: "dio",
+    }
 
 
 @pytest.mark.parametrize(
@@ -302,6 +463,12 @@ def test_a_disabled_mode_suppresses_every_speculative_flag() -> None:
         draft_model="org/eagle3-draft",
         speculative_mode=SpeculativeMode.DISABLED,
         num_speculative_tokens=5,
+        spec_draft_n_min=2,
+        spec_draft_p_split=0.5,
+        spec_draft_sampling=SpecDraftSampling.PROBABILISTIC,
+        n_gpu_layers_draft=8,
+        n_cpu_moe_draft=4,
+        draft_kv_cache_dtype=KVCacheDType.Q8_0,
     )
 
     assert serve_arguments(config) == ["--ctx-size", "4096"]
@@ -329,12 +496,31 @@ def test_all_tunables_assemble_in_the_declared_order() -> None:
         max_model_len=2048,
         max_num_seqs=4,
         max_num_batched_tokens=4096,
+        ubatch_size=2048,
         attention_backend=AttentionBackend.FLASH_ATTENTION,
         speculative_method=SpeculativeMethod.DRAFT_MODEL,
         draft_model="org/draft.gguf",
         speculative_mode=SpeculativeMode.ENABLED,
         num_speculative_tokens=3,
+        spec_draft_n_min=2,
+        spec_draft_p_split=0.5,
+        spec_draft_sampling=SpecDraftSampling.PROBABILISTIC,
+        n_gpu_layers_draft=8,
+        n_cpu_moe_draft=4,
+        draft_kv_cache_dtype=KVCacheDType.BFLOAT16,
+        prefix_caching=True,
         n_cpu_moe=16,
+        n_cpu_ffn=4,
+        kv_offload=True,
+        op_offload=False,
+        host_buffer=False,
+        repack=True,
+        swa_full=True,
+        load_mode=LoadMode.MMAP_MLOCK,
+        threads=8,
+        threads_batch=4,
+        poll=50,
+        prio=2,
     )
 
     assert serve_arguments(config) == [
@@ -349,7 +535,7 @@ def test_all_tunables_assemble_in_the_declared_order() -> None:
         "--batch-size",
         "4096",
         "--ubatch-size",
-        "4096",
+        "2048",
         "--flash-attn",
         "on",
         "--spec-type",
@@ -358,8 +544,40 @@ def test_all_tunables_assemble_in_the_declared_order() -> None:
         "org/draft.gguf",
         "--spec-draft-n-max",
         "3",
+        "--spec-draft-n-min",
+        "2",
+        "--spec-draft-p-split",
+        "0.5",
+        "--spec-draft-sampling",
+        "probabilistic",
+        "--n-gpu-layers-draft",
+        "8",
+        "--n-cpu-moe-draft",
+        "4",
+        "--cache-type-k-draft",
+        "bf16",
+        "--cache-type-v-draft",
+        "bf16",
+        "--cache-prompt",
         "--n-cpu-moe",
         "16",
+        "--n-cpu-ffn",
+        "4",
+        "--kv-offload",
+        "--no-op-offload",
+        "--no-host",
+        "--repack",
+        "--swa-full",
+        "--load-mode",
+        "mmap+mlock",
+        "--threads",
+        "8",
+        "--threads-batch",
+        "4",
+        "--poll",
+        "50",
+        "--prio",
+        "2",
     ]
 
 

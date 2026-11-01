@@ -11,9 +11,10 @@ The mapping is deliberately faithful to the search-space semantics: a
 one-choice categorical so its value is recorded on the trial, a
 :class:`~llm_config_optimization.search_space.types.Categorical` dimension samples only
 its declared values in declared order, which for a numeric parameter is the set
-of integers it declares, an
+of integers or floats it declares, an
 :class:`~llm_config_optimization.search_space.types.Interval` dimension samples
-integers from its inclusive bounds with the default step, and a
+numbers from its inclusive bounds — integers for an integer field and floats
+for a float field — and a
 :class:`~llm_config_optimization.search_space.types.Default` dimension produces no
 suggestion at all, so deferral to the engine survives the sweep.
 
@@ -61,7 +62,7 @@ from ..inference.types import (
     InferenceBackend,
     LLMConfig,
 )
-from ..search_space.registry import TUNABLE_PARAMETERS, UnionKind, expected_kind
+from ..search_space.registry import TUNABLE_PARAMETERS, ParameterKind, UnionKind, expected_kind
 from ..search_space.types import (
     Categorical,
     Default,
@@ -107,13 +108,14 @@ def suggest_parameters(trial: optuna.Trial, space: ExperimentSpace) -> dict[str,
 
     Each dimension is submitted according to its spec kind: a ``Fixed`` or
     ``Categorical`` dimension becomes a categorical suggestion over the declared
-    values, and an ``Interval`` dimension becomes an integer suggestion over its
-    inclusive bounds. A numeric ``Categorical`` dimension's declared values are
-    integers, so Optuna treats them as unordered choices and samples only those
-    integers; use an ``Interval`` when the values should be modeled as an
-    ordered range. A ``Default`` dimension is skipped entirely, so its
-    parameter is absent from ``trial.params`` and reconstruction leaves the
-    field unset.
+    values, and an ``Interval`` dimension becomes a numeric suggestion over its
+    inclusive bounds: an integer suggestion for an ``int`` field and a float
+    suggestion for a ``float`` field. A numeric ``Categorical`` dimension's
+    declared values are integers or floats, so Optuna treats them as unordered
+    choices and samples only those values; use an ``Interval`` when the values
+    should be modeled as an ordered range. A ``Default`` dimension is skipped
+    entirely, so its parameter is absent from ``trial.params`` and
+    reconstruction leaves the field unset.
 
     Categorical values are submitted as their string values rather than enum
     members, because a study persisted and reloaded returns plain strings;
@@ -134,9 +136,14 @@ def suggest_parameters(trial: optuna.Trial, space: ExperimentSpace) -> dict[str,
                 dimension.name, [_choice_value(value) for value in spec.values]
             )
         else:
-            parameters[dimension.name] = trial.suggest_int(
-                dimension.name, int(spec.minimum), int(spec.maximum)
-            )
+            if _interval_is_float(expected_kind(TUNABLE_PARAMETERS[dimension.name])):
+                parameters[dimension.name] = trial.suggest_float(
+                    dimension.name, float(spec.minimum), float(spec.maximum)
+                )
+            else:
+                parameters[dimension.name] = trial.suggest_int(
+                    dimension.name, int(spec.minimum), int(spec.maximum)
+                )
     return parameters
 
 
@@ -582,11 +589,12 @@ def _project_result(result: ExperimentResult) -> dict[str, object]:
     }
 
 
-def _choice_value(value: ParameterValue) -> str | int:
+def _choice_value(value: ParameterValue) -> str | int | float:
     """Render a declared value as the JSON-native choice Optuna records.
 
     An engine-neutral enum member becomes its string value, because a persisted
-    study is reloaded with plain strings; an integer passes through unchanged.
+    study is reloaded with plain strings; an integer or float passes through
+    unchanged.
     """
     return value.value if isinstance(value, Enum) else value
 
@@ -598,23 +606,11 @@ def _coerce_value(field: str, value: object) -> object:
     named by the ``LLMConfig`` field's own type annotation, so the backend's
     value maps apply exactly as they would for a hand-written config. A boolean
     field keeps its sampled boolean unchanged, and a numeric field's value is
-    coerced to an integer. A union field (an exact count or an enum mode) is
-    resolved against the first branch that accepts the sampled value, so a raw
-    choice that arrived as a string becomes the enum member and one that
-    arrived as a number stays an integer.
-
-    The numeric branch is intentionally narrow: this function knows only enums,
-    booleans, and integers, so any other kind falls through to :func:`int` and
-    is silently truncated rather than rejected — ``issubclass(float, Enum)`` is
-    ``False``. That is sound for the current tunable set, where every non-enum,
-    non-boolean tunable is an ``int`` field and the one float field,
-    ``gpu_memory_utilization``, is a non-tunable absent from
-    :data:`~llm_config_optimization.search_space.registry.TUNABLE_PARAMETERS`; the YAML
-    loader additionally rejects a float ``Interval``. Two paths bypass those
-    guards and would need a float branch: a hand-built ``Interval`` with float
-    bounds, and a resumed study whose ``best.params`` came from a float
-    suggestion. Adding a float tunable therefore means dispatching on the
-    resolved kind here instead of assuming an integer.
+    coerced to the kind its annotation declares: an integer stays an integer and
+    a float becomes a float rather than being truncated. A union field (an exact
+    count or an enum mode) is resolved against the first branch that accepts the
+    sampled value, so a raw choice that arrived as a string becomes the enum
+    member and one that arrived as a number stays numeric.
     """
     kind = expected_kind(field)
     if isinstance(kind, UnionKind):
@@ -625,6 +621,10 @@ def _coerce_value(field: str, value: object) -> object:
         return value
     if issubclass(kind, Enum):
         return kind(value)
+    if issubclass(kind, float):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{field} expects a number, got {type(value).__name__}")
+        return float(value)
     return int(cast("str | int | float", value))
 
 
@@ -632,7 +632,8 @@ def _coerce_union_value(field: str, value: object, kind: UnionKind) -> object:
     """Resolve a sampled value against a union field's branches.
 
     An enum branch accepts its own string spelling, a boolean branch only a real
-    boolean, and an integer branch only an integer that is not a boolean. A
+    boolean, an integer branch only an integer that is not a boolean, and a float
+    branch an integer or float that is not a boolean, returned as a float. A
     value no branch accepts is rejected rather than coerced to the wrong
     domain, so a mode name is never handed to :func:`int` and an integer is
     never reinterpreted as an enum value.
@@ -646,6 +647,24 @@ def _coerce_union_value(field: str, value: object, kind: UnionKind) -> object:
                 return atom(value)
             except TypeError, ValueError:
                 continue
+        elif issubclass(atom, float):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
         elif isinstance(value, int) and not isinstance(value, bool):
             return value
     raise ValueError(f"{field} expects {kind}, got {type(value).__name__}")
+
+
+def _interval_is_float(kind: ParameterKind) -> bool:
+    """Whether an ``Interval`` over ``kind`` should be sampled as a float range.
+
+    A plain ``float`` field gets a float suggestion. A union field gets one only
+    when it admits no integer branch, so an int-or-enum count keeps its integer
+    sampling while an annotation that mixes a float in is sampled as a real
+    number. The YAML loader rejects a float bound for an integer-only field, so
+    a declared ``Interval`` on a float kind always carries float endpoints.
+    """
+    atoms = kind.kinds if isinstance(kind, UnionKind) else (kind,)
+    if any(issubclass(atom, int) and not issubclass(atom, bool) for atom in atoms):
+        return False
+    return any(issubclass(atom, float) for atom in atoms)

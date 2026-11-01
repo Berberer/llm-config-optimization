@@ -26,6 +26,7 @@ from ..inference.types import (
     BenchmarkConfig,
     ContainerRuntimeConfig,
     ExperimentConfig,
+    FitMode,
     HardwareTarget,
     LLMConfig,
     QuantizationMethod,
@@ -74,8 +75,12 @@ def build_base_config(args: argparse.Namespace) -> ExperimentConfig:
         gpu_memory_utilization=args.gpu_memory_utilization,
         speculative_method=_speculative_method(args),
         draft_model=args.draft_model,
+        fit=FitMode(args.fit) if args.fit is not None else FitMode.OFF,
+        fit_target=args.fit_target,
+        fit_ctx=args.fit_ctx,
     )
     _check_speculative_setup(llm)
+    _check_fit_setup(llm)
     return ExperimentConfig(container=container, benchmark=benchmark, llm=llm)
 
 
@@ -124,6 +129,21 @@ def _check_speculative_setup(llm: LLMConfig) -> None:
         )
     if method is not None and method in _DRAFT_REQUIRED_METHODS and llm.draft_model is None:
         raise ValueError(f"the {method.value} speculative method requires --draft-model")
+
+
+def _check_fit_setup(llm: LLMConfig) -> None:
+    """Reject fit settings the engine would silently ignore or cannot serve.
+
+    ``--fit-target`` and ``--fit-ctx`` only shape an enabled fit, so passing
+    either without ``--fit on`` is a usage error caught here rather than a flag
+    the engine discards. Both values must be at least one: a zero or negative
+    headroom or context describes no usable fit.
+    """
+    if (llm.fit_target is not None or llm.fit_ctx is not None) and llm.fit is not FitMode.ON:
+        raise ValueError("--fit-target and --fit-ctx require --fit on")
+    for option, value in (("--fit-target", llm.fit_target), ("--fit-ctx", llm.fit_ctx)):
+        if value is not None and value < 1:
+            raise ValueError(f"{option} must be at least 1")
 
 
 def resolve_objective(

@@ -1,15 +1,27 @@
-# The complete llama.cpp search space: only the eight parameters llama-server
-# forwards are declared. `dtype` and `tensor_parallel_size` are not applicable
+# The complete llama.cpp search space: every parameter llama-server forwards is
+# declared. `dtype` and `tensor_parallel_size` are not applicable
 # and must be omitted — a GGUF checkpoint carries its own numerical format, and
 # llama.cpp spreads requests over `--parallel` slots rather than tensor-parallel
-# ranks. Declaring either one makes the llama.cpp backend reject the space.
+# ranks. Declaring either one makes the llama.cpp backend reject the space. The
+# draft-only dimensions are also absent: they are applicable only when the run
+# configures `--draft-model`, so the speculative examples declare them.
 #
-# Each dimension maps to a real llama-server flag: `kv_cache_dtype` to
+# Dimensions are written in canonical registry order, so related knobs sit
+# together. Each dimension maps to a real llama-server flag: `kv_cache_dtype` to
 # `--cache-type-k`/`--cache-type-v`, `max_model_len` to `--ctx-size`,
-# `max_num_seqs` to `--parallel`, `max_num_batched_tokens` to `--batch-size`
-# and `--ubatch-size`, `attention_backend` to `--flash-attn`, `prefix_caching`
-# to `--cache-prompt`/`--no-cache-prompt`, `n_gpu_layers` to `--n-gpu-layers`,
-# and `n_cpu_moe` to `--n-cpu-moe` or the value-less `--cpu-moe`.
+# `max_num_seqs` to `--parallel`, `max_num_batched_tokens` to `--batch-size`,
+# `ubatch_size` to `--ubatch-size`, `attention_backend` to `--flash-attn`,
+# `prefix_caching` to `--cache-prompt`/`--no-cache-prompt`, `n_gpu_layers` to
+# `--n-gpu-layers`, `n_cpu_moe` to `--n-cpu-moe` or the value-less `--cpu-moe`,
+# `n_cpu_ffn` to `--n-cpu-ffn`, `kv_offload` to `--kv-offload`/`--no-kv-offload`,
+# `op_offload` to `--op-offload`/`--no-op-offload`, `host_buffer` to `--no-host`
+# (only its disabling side exists), `repack` to `--repack`/`--no-repack`,
+# `swa_full` to `--swa-full` (only its enabling side exists), `load_mode`
+# to `--load-mode`, the cache knobs to `--cache-ram`, `--ctx-checkpoints`,
+# `--checkpoint-min-step`, `--kv-unified`/`--no-kv-unified`,
+# `--cont-batching`/`--no-cont-batching`, and
+# `--cache-idle-slots`/`--no-cache-idle-slots`, and the CPU/process knobs to
+# `--threads`, `--threads-batch`, `--poll`, and `--prio`.
 #
 # `n_gpu_layers` and `n_cpu_moe` defer to the engine so this space stays
 # host-agnostic; sweep them explicitly on a GPU host to compare partial and
@@ -26,18 +38,42 @@
 # llama.cpp divides `--ctx-size` evenly across the `--parallel` slots, so the
 # backend caps the slot count at `max_model_len // (input_len + output_len)`
 # (at least one). The sampled `max_model_len` is always sent as `--ctx-size`
-# unchanged: a point below the benchmark's request length cannot be served at
-# any slot count and its trial fails, so keep this interval's floor above
-# `--input-len + --output-len` for a sweep that never fails on context size.
-# `max_num_batched_tokens` is independent: it sizes both the logical
-# `--batch-size` and the physical `--ubatch-size`, and upstream clamps them to
-# the context size rather than rejecting.
+# unchanged. The floor below is deliberately above the workload's request
+# length: with the default 1024-token prompt and 128-token generation it keeps
+# at least 16 slots in play, because a low context silently collapses
+# concurrency and turns a few-minute trial into one that exceeds its overall
+# timeout. Raise the floor further when the workload's request length grows.
+# `max_num_batched_tokens` and `ubatch_size` are independent: the first sizes
+# the logical `--batch-size` and the second the physical `--ubatch-size` the
+# engine processes at once. The logical batch must be at least the physical
+# batch, and upstream clamps both to the context size rather than rejecting.
+# Keep `ubatch_size` at or below `max_num_batched_tokens`; a smaller physical
+# batch trades prefill throughput for a lower peak activation footprint.
+#
+# The placement and memory knobs trade VRAM for speed: `n_cpu_ffn` keeps the
+# dense feed-forward weights of an exact number of layers in system RAM (zero
+# disables it), `kv_offload` moves the KV cache there, and `op_offload` runs
+# tensor operations on the device. `host_buffer` bypasses the host buffer,
+# `repack` toggles weight repacking, and `swa_full` selects a full-size
+# sliding-window cache. `load_mode` chooses how the weights are loaded; its
+# `mmap_mlock` member becomes the engine's `mmap+mlock`.
+#
+# The cache and scheduling knobs shape cached time-to-first-token and multi-turn
+# reuse: `cache_ram` bounds the host prompt cache in MiB (`-1` means no limit and
+# `0` disables it), `ctx_checkpoints` sizes the per-slot context-checkpoint cache,
+# and `checkpoint_min_step` sets the minimum token spacing between checkpoints
+# (`0` means no minimum). `kv_unified` shares one KV buffer across sequences,
+# `continuous_batching` enables dynamic batching, and `cache_idle_slots` keeps
+# idle slots in the prompt cache.
+#
+# The CPU and process knobs shape single-turn latency and host contention:
+# `threads` and `threads_batch` set the generation and prompt-processing thread
+# counts, `poll` selects the busy-wait level (0…100), and `prio` the process
+# priority (-1…3).
 space:
-  kv_cache_dtype:
-    categorical: [float16, bfloat16, float32, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1]
   max_model_len:
     interval:
-      min: 1024
+      min: 18432
       max: 32768
   max_num_seqs:
     interval:
@@ -47,11 +83,63 @@ space:
     interval:
       min: 2048
       max: 8192
+  ubatch_size:
+    interval:
+      min: 256
+      max: 4096
+  kv_cache_dtype:
+    categorical: [float16, bfloat16, float32, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1]
   attention_backend:
     categorical: [auto, flash_attention]
-  prefix_caching:
-    categorical: [true, false]
   n_gpu_layers:
     default: true
   n_cpu_moe:
     default: true
+  n_cpu_ffn:
+    interval:
+      min: 0
+      max: 16
+  kv_offload:
+    categorical: [true, false]
+  op_offload:
+    categorical: [true, false]
+  host_buffer:
+    categorical: [true, false]
+  repack:
+    categorical: [true, false]
+  swa_full:
+    categorical: [true, false]
+  load_mode:
+    categorical: [auto, none, mmap, mlock, mmap_mlock, dio]
+  prefix_caching:
+    categorical: [true, false]
+  cache_ram:
+    categorical: [-1, 0, 1024, 4096]
+  ctx_checkpoints:
+    interval:
+      min: 0
+      max: 8
+  checkpoint_min_step:
+    interval:
+      min: 0
+      max: 512
+  kv_unified:
+    categorical: [true, false]
+  continuous_batching:
+    categorical: [true, false]
+  cache_idle_slots:
+    categorical: [true, false]
+  threads:
+    interval:
+      min: 1
+      max: 32
+  threads_batch:
+    interval:
+      min: 1
+      max: 32
+  poll:
+    interval:
+      min: 0
+      max: 100
+  prio:
+    categorical: [-1, 0, 1, 2, 3]

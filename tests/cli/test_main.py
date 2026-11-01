@@ -14,8 +14,9 @@ scenarios mirror the exit-code contract: a successful bounded sweep, a space the
 backend rejects, a model the backend rejects, an invalid definition, a sweep that
 completes no trial, an interrupt, and an explicit TUI request without a terminal.
 The engine-scoped option rules are covered here too: the registry selects the
-llama.cpp backend for the ``llamacpp`` token, and a vLLM-only option paired with
-it is a usage error rather than a value the engine ignores.
+llama.cpp backend for the ``llamacpp`` token, a vLLM-only option paired with it
+is a usage error rather than a value the engine ignores, and the llama.cpp-only
+``--fit`` family is likewise rejected for ``vllm``.
 """
 
 import json
@@ -750,6 +751,34 @@ def test_a_vllm_only_option_is_rejected_for_llamacpp_as_a_usage_error(
     assert "llamacpp" in err.getvalue()
     assert backend.plan_calls == []
     assert client.pull_calls == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("--fit", "on"),
+        ("--fit", "off"),
+        ("--fit-target", "1024"),
+        ("--fit-ctx", "1024"),
+    ],
+    ids=["fit-on", "fit-off", "fit-target", "fit-ctx"],
+)
+def test_a_llamacpp_only_fit_option_is_rejected_for_vllm_as_a_usage_error(
+    tmp_path: Path, model: str, extra: tuple[str, ...]
+) -> None:
+    """A llama.cpp-only fit option paired with vLLM fails before any preparation.
+
+    vLLM has no ``--fit`` family, so passing one is a usage error rather than a
+    value the backend silently ignores.
+    """
+    space = _write_space(tmp_path / "space.yaml")
+
+    code, out, err = _invoke(model, space, *extra)
+
+    assert code == 2
+    assert out == ""
+    assert extra[0] in err
+    assert "vllm" in err
 
 
 def test_the_vllm_only_options_are_preserved_for_vllm(tmp_path: Path, model: str) -> None:

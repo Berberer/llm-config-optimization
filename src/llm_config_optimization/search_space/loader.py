@@ -65,11 +65,26 @@ _POSITIVE_PARAMETERS = frozenset(
         "max_num_batched_tokens",
         "max_num_active_seqs",
         "max_num_scheduled_tokens",
+        "ubatch_size",
         "tensor_parallel_size",
         "num_speculative_tokens",
+        "threads",
+        "threads_batch",
     }
 )
-_NON_NEGATIVE_PARAMETERS: frozenset[str] = frozenset({"n_gpu_layers", "n_cpu_moe"})
+_NON_NEGATIVE_PARAMETERS: frozenset[str] = frozenset(
+    {
+        "n_gpu_layers",
+        "n_cpu_moe",
+        "n_cpu_ffn",
+        "ctx_checkpoints",
+        "checkpoint_min_step",
+        "poll",
+        "spec_draft_n_min",
+        "n_gpu_layers_draft",
+        "n_cpu_moe_draft",
+    }
+)
 """Numerically tunable parameters whose floor is zero rather than one.
 
 The loader applies a per-parameter numeric floor so a count that legitimately
@@ -256,9 +271,10 @@ def _parse_categorical(
 ) -> Categorical | None:
     """Parse a ``categorical`` spec, preserving the declared order of values.
 
-    A numeric parameter's values are integers, so the same kind, uniqueness, and
-    floor checks apply as for ``fixed`` and ``interval``. A union parameter may
-    mix its branches in one list, such as an enum mode and exact integer counts.
+    A numeric parameter's values are integers or floats, so the same kind,
+    uniqueness, and floor checks apply as for ``fixed`` and ``interval``. A
+    union parameter may mix its branches in one list, such as an enum mode and
+    exact integer counts.
     """
     value_path = f"{path}.categorical"
     if not isinstance(value, list):
@@ -294,17 +310,19 @@ def _parse_interval(
     minimum: int | None,
     problems: list[str],
 ) -> Interval | None:
-    """Parse an ``interval`` spec, valid only when the parameter has an integer branch.
+    """Parse an ``interval`` spec, valid only when the parameter has a numeric branch.
 
-    A union parameter's interval constrains the integer branch alone: the enum
-    modes are not numeric values, so they cannot appear in ``min`` or ``max``.
+    A union parameter's interval constrains its numeric branch alone: the enum
+    modes are not numeric values, so they cannot appear in ``min`` or ``max``. A
+    float branch admits both integer and float bounds and stores them as floats;
+    an integer-only branch rejects a float bound.
     """
     value_path = f"{path}.interval"
     atoms = _kind_atoms(kind)
     if all(issubclass(atom, bool) for atom in atoms):
         problems.append(f"{value_path}: not valid for a boolean parameter")
         return None
-    if not any(atom is int for atom in atoms):
+    if not any(atom is int or atom is float for atom in atoms):
         problems.append(f"{value_path}: not valid for a categorical parameter")
         return None
     if not isinstance(value, Mapping):
@@ -322,8 +340,9 @@ def _parse_interval(
     if unknown or missing:
         return None
 
-    lower = _coerce_int(f"{value_path}.min", value["min"], problems)
-    upper = _coerce_int(f"{value_path}.max", value["max"], problems)
+    coerce_bound = _coerce_float if any(atom is float for atom in atoms) else _coerce_int
+    lower = coerce_bound(f"{value_path}.min", value["min"], problems)
+    upper = coerce_bound(f"{value_path}.max", value["max"], problems)
     if lower is None or upper is None:
         return None
     if lower > upper:
@@ -403,6 +422,8 @@ def _coerce_atom(
                 f"{path}: {value!r} is not a valid {kind.__name__}; "
                 f"expected one of {_format_values(kind)}"
             )
+    elif kind is float:
+        problems.append(f"{path}: expected a number, got {type(value).__name__}")
     else:
         problems.append(f"{path}: expected an integer, got {type(value).__name__}")
     return None
@@ -421,6 +442,8 @@ def _match_atom(value: object, kind: AtomKind) -> ParameterValue | None:
             return cast("ParameterValue", kind(value))
         except ValueError:
             return None
+    if kind is float:
+        return _coerce_float_if_possible(value)
     return _coerce_int_if_possible(value)
 
 
@@ -429,6 +452,31 @@ def _coerce_int_if_possible(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def _coerce_float_if_possible(value: object) -> float | None:
+    """Return ``value`` as a float, rejecting booleans and non-numbers.
+
+    An integer is accepted for a float parameter so a YAML ``0`` and ``0.0``
+    describe the same declared value, but the result is always a float so a
+    float dimension reconstructs consistently.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _coerce_float(path: str, value: object, problems: list[str]) -> float | None:
+    """Coerce a declared value to a float, rejecting booleans.
+
+    Booleans are rejected explicitly for the same reason as in
+    :func:`_coerce_int`: YAML's ``true``/``false`` must never satisfy a numeric
+    bound.
+    """
+    coerced = _coerce_float_if_possible(value)
+    if coerced is None:
+        problems.append(f"{path}: expected a number, got {type(value).__name__}")
+    return coerced
 
 
 def _coerce_int(path: str, value: object, problems: list[str]) -> int | None:
@@ -452,6 +500,8 @@ def _format_kind(kind: ParameterKind) -> str:
             descriptions.append("a boolean")
         elif issubclass(atom, StrEnum):
             descriptions.append(f"one of {_format_values(atom)}")
+        elif issubclass(atom, float):
+            descriptions.append("a number")
         else:
             descriptions.append("an integer")
     return " or ".join(descriptions)

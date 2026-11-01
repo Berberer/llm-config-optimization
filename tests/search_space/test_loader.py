@@ -21,6 +21,8 @@ from llm_config_optimization.inference import (
     CpuMoeMode,
     DType,
     GpuLayersMode,
+    LoadMode,
+    SpecDraftSampling,
     SpeculativeMode,
 )
 from llm_config_optimization.search_space import (
@@ -37,22 +39,46 @@ from llm_config_optimization.search_space import (
 )
 
 VALID_SPACE: dict[str, object] = {
-    "dtype": {"fixed": "float16"},
-    "kv_cache_dtype": {"default": True},
     "max_model_len": {"interval": {"min": 1024, "max": 8192}},
     "max_num_seqs": {"fixed": 256},
     "max_num_batched_tokens": {"interval": {"min": 2048, "max": 8192}},
     "max_num_active_seqs": {"fixed": 16},
     "max_num_scheduled_tokens": {"fixed": 4096},
-    "tensor_parallel_size": {"categorical": [1, 2, 4]},
+    "ubatch_size": {"interval": {"min": 256, "max": 2048}},
+    "dtype": {"fixed": "float16"},
+    "kv_cache_dtype": {"default": True},
     "attention_backend": {"default": True},
-    "speculative_mode": {"fixed": "enabled"},
-    "num_speculative_tokens": {"interval": {"min": 1, "max": 5}},
-    "prefix_caching": {"fixed": True},
     "n_gpu_layers": {"default": True},
+    "n_cpu_moe": {"categorical": [0, 8, "all"]},
+    "n_cpu_ffn": {"interval": {"min": 0, "max": 16}},
+    "kv_offload": {"fixed": True},
+    "op_offload": {"fixed": False},
+    "host_buffer": {"categorical": [True, False]},
+    "repack": {"default": True},
+    "swa_full": {"default": True},
+    "load_mode": {"categorical": ["mmap", "mmap_mlock"]},
+    "prefix_caching": {"fixed": True},
+    "cache_ram": {"categorical": [-1, 0, 1024]},
+    "ctx_checkpoints": {"interval": {"min": 0, "max": 8}},
+    "checkpoint_min_step": {"fixed": 0},
+    "kv_unified": {"fixed": True},
+    "continuous_batching": {"categorical": [True, False]},
+    "cache_idle_slots": {"default": True},
+    "tensor_parallel_size": {"categorical": [1, 2, 4]},
     "expert_parallel": {"fixed": False},
     "all2all_backend": {"categorical": ["allgather_reducescatter", "naive"]},
-    "n_cpu_moe": {"categorical": [0, 8, "all"]},
+    "speculative_mode": {"fixed": "enabled"},
+    "num_speculative_tokens": {"interval": {"min": 1, "max": 5}},
+    "spec_draft_n_min": {"interval": {"min": 0, "max": 5}},
+    "spec_draft_p_split": {"interval": {"min": 0.0, "max": 1.0}},
+    "spec_draft_sampling": {"categorical": ["greedy", "probabilistic"]},
+    "n_gpu_layers_draft": {"categorical": [0, 8, "all"]},
+    "n_cpu_moe_draft": {"categorical": [0, 8, "all"]},
+    "draft_kv_cache_dtype": {"default": True},
+    "threads": {"interval": {"min": 1, "max": 32}},
+    "threads_batch": {"fixed": 8},
+    "poll": {"interval": {"min": 0, "max": 100}},
+    "prio": {"categorical": [-1, 0, 1, 2, 3]},
 }
 """A complete, valid definition covering every tunable and every spec kind."""
 
@@ -93,25 +119,52 @@ def test_a_complete_definition_parses_into_the_expected_dimensions() -> None:
     space = parse_experiment_space(definition())
 
     assert space.dimensions == (
-        Dimension("dtype", Fixed(DType.FLOAT16)),
-        Dimension("kv_cache_dtype", Default()),
         Dimension("max_model_len", Interval(1024, 8192)),
         Dimension("max_num_seqs", Fixed(256)),
         Dimension("max_num_batched_tokens", Interval(2048, 8192)),
         Dimension("max_num_active_seqs", Fixed(16)),
         Dimension("max_num_scheduled_tokens", Fixed(4096)),
-        Dimension("tensor_parallel_size", Categorical((1, 2, 4))),
+        Dimension("ubatch_size", Interval(256, 2048)),
+        Dimension("dtype", Fixed(DType.FLOAT16)),
+        Dimension("kv_cache_dtype", Default()),
         Dimension("attention_backend", Default()),
-        Dimension("speculative_mode", Fixed(SpeculativeMode.ENABLED)),
-        Dimension("num_speculative_tokens", Interval(1, 5)),
-        Dimension("prefix_caching", Fixed(True)),
         Dimension("n_gpu_layers", Default()),
+        Dimension("n_cpu_moe", Categorical((0, 8, CpuMoeMode.ALL))),
+        Dimension("n_cpu_ffn", Interval(0, 16)),
+        Dimension("kv_offload", Fixed(True)),
+        Dimension("op_offload", Fixed(False)),
+        Dimension("host_buffer", Categorical((True, False))),
+        Dimension("repack", Default()),
+        Dimension("swa_full", Default()),
+        Dimension("load_mode", Categorical((LoadMode.MMAP, LoadMode.MMAP_MLOCK))),
+        Dimension("prefix_caching", Fixed(True)),
+        Dimension("cache_ram", Categorical((-1, 0, 1024))),
+        Dimension("ctx_checkpoints", Interval(0, 8)),
+        Dimension("checkpoint_min_step", Fixed(0)),
+        Dimension("kv_unified", Fixed(True)),
+        Dimension("continuous_batching", Categorical((True, False))),
+        Dimension("cache_idle_slots", Default()),
+        Dimension("tensor_parallel_size", Categorical((1, 2, 4))),
         Dimension("expert_parallel", Fixed(False)),
         Dimension(
             "all2all_backend",
             Categorical((All2AllBackend.ALLGATHER_REDUCESCATTER, All2AllBackend.NAIVE)),
         ),
-        Dimension("n_cpu_moe", Categorical((0, 8, CpuMoeMode.ALL))),
+        Dimension("speculative_mode", Fixed(SpeculativeMode.ENABLED)),
+        Dimension("num_speculative_tokens", Interval(1, 5)),
+        Dimension("spec_draft_n_min", Interval(0, 5)),
+        Dimension("spec_draft_p_split", Interval(0.0, 1.0)),
+        Dimension(
+            "spec_draft_sampling",
+            Categorical((SpecDraftSampling.GREEDY, SpecDraftSampling.PROBABILISTIC)),
+        ),
+        Dimension("n_gpu_layers_draft", Categorical((0, 8, GpuLayersMode.ALL))),
+        Dimension("n_cpu_moe_draft", Categorical((0, 8, CpuMoeMode.ALL))),
+        Dimension("draft_kv_cache_dtype", Default()),
+        Dimension("threads", Interval(1, 32)),
+        Dimension("threads_batch", Fixed(8)),
+        Dimension("poll", Interval(0, 100)),
+        Dimension("prio", Categorical((-1, 0, 1, 2, 3))),
     )
 
 
@@ -134,9 +187,21 @@ def test_dimensions_follow_the_registry_order_not_the_file_order() -> None:
         ),
         ("max_model_len", {"interval": {"min": 1024, "max": 8192}}, Interval(1024, 8192)),
         ("max_num_seqs", {"categorical": [1, 20, 99]}, Categorical((1, 20, 99))),
+        (
+            "load_mode",
+            {"categorical": ["mmap", "mmap_mlock"]},
+            Categorical((LoadMode.MMAP, LoadMode.MMAP_MLOCK)),
+        ),
         ("kv_cache_dtype", {"default": True}, Default()),
     ],
-    ids=["fixed", "categorical", "interval", "categorical-integers", "default"],
+    ids=[
+        "fixed",
+        "categorical",
+        "interval",
+        "categorical-integers",
+        "categorical-load-mode",
+        "default",
+    ],
 )
 def test_each_spec_kind_parses_to_its_engine_neutral_type(
     name: str, spec: object, expected: object
@@ -176,6 +241,20 @@ def test_the_n_cpu_moe_dimension_rejects_a_negative_count() -> None:
 
     assert any(
         "space.n_cpu_moe.fixed: value must be at least 0, got -1" in problem
+        for problem in excinfo.value.problems
+    ), excinfo.value.problems
+
+
+def test_the_n_cpu_ffn_dimension_accepts_zero_and_rejects_a_negative_count() -> None:
+    """``0`` disables the dense FFN offload, so the floor is zero rather than one."""
+    space = parse_only("n_cpu_ffn", {"categorical": [0, 8]})
+
+    assert spec_of(space, "n_cpu_ffn") == Categorical((0, 8))
+    with pytest.raises(ExperimentDefinitionError) as excinfo:
+        parse_only("n_cpu_ffn", {"fixed": -1})
+
+    assert any(
+        "space.n_cpu_ffn.fixed: value must be at least 0, got -1" in problem
         for problem in excinfo.value.problems
     ), excinfo.value.problems
 
@@ -364,6 +443,59 @@ def test_a_union_without_an_integer_branch_rejects_an_interval(
     )
 
 
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ({"fixed": 0.5}, Fixed(0.5)),
+        ({"fixed": 1}, Fixed(1.0)),
+        ({"categorical": [0.0, 0.5, 1.0]}, Categorical((0.0, 0.5, 1.0))),
+        ({"categorical": [0, 0.5, 1]}, Categorical((0.0, 0.5, 1.0))),
+        ({"interval": {"min": 0.0, "max": 1.0}}, Interval(0.0, 1.0)),
+        ({"interval": {"min": 0, "max": 1}}, Interval(0.0, 1.0)),
+        ({"default": True}, Default()),
+    ],
+    ids=[
+        "fixed-float",
+        "fixed-integer",
+        "categorical-floats",
+        "categorical-mixed",
+        "interval-floats",
+        "interval-integers",
+        "default",
+    ],
+)
+def test_a_float_dimension_parses_to_floats(
+    monkeypatch: pytest.MonkeyPatch, spec: dict[str, object], expected: object
+) -> None:
+    monkeypatch.setattr(
+        "llm_config_optimization.search_space.loader.expected_kind",
+        lambda _: float,
+    )
+
+    space = parse_only("n_cpu_moe", spec)
+
+    assert spec_of(space, "n_cpu_moe") == expected
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [{"fixed": True}, {"categorical": [False, 0.5]}, {"interval": {"min": True, "max": 1}}],
+    ids=["fixed-boolean", "categorical-boolean", "interval-boolean"],
+)
+def test_a_float_dimension_keeps_booleans_out(
+    monkeypatch: pytest.MonkeyPatch, spec: dict[str, object]
+) -> None:
+    monkeypatch.setattr(
+        "llm_config_optimization.search_space.loader.expected_kind",
+        lambda _: float,
+    )
+
+    with pytest.raises(ExperimentDefinitionError) as excinfo:
+        parse_only("n_cpu_moe", spec)
+
+    assert any("expected a number" in found for found in excinfo.value.problems)
+
+
 def test_a_reduced_required_set_makes_a_declared_space_total_over_it() -> None:
     required = {"max_model_len", "max_num_seqs"}
     document = {"space": {"max_model_len": {"default": True}, "max_num_seqs": {"default": True}}}
@@ -403,9 +535,9 @@ def test_a_declared_parameter_outside_the_required_set_is_not_a_loader_problem()
     space = parse_experiment_space(document, required=required)
 
     assert tuple(dimension.name for dimension in space.dimensions) == (
-        "dtype",
         "max_model_len",
         "max_num_seqs",
+        "dtype",
     )
 
 
@@ -498,6 +630,7 @@ def test_top_level_shape_problems_are_reported(document: object, problem: str) -
         ),
         ({"max_model_len": {"fixed": "4096"}}, "space.max_model_len.fixed: expected an integer"),
         ({"max_model_len": {"fixed": True}}, "space.max_model_len.fixed: expected an integer"),
+        ({"max_model_len": {"fixed": 1.5}}, "space.max_model_len.fixed: expected an integer"),
         (
             {"dtype": {"categorical": "float16"}},
             "space.dtype.categorical: expected a non-empty list",
@@ -533,8 +666,44 @@ def test_top_level_shape_problems_are_reported(document: object, problem: str) -
             "space.max_num_scheduled_tokens.interval.min: value must be at least 1",
         ),
         (
+            {"ubatch_size": {"fixed": 0}},
+            "space.ubatch_size.fixed: value must be at least 1",
+        ),
+        (
+            {"ctx_checkpoints": {"fixed": -1}},
+            "space.ctx_checkpoints.fixed: value must be at least 0",
+        ),
+        (
+            {"checkpoint_min_step": {"interval": {"min": -1, "max": 10}}},
+            "space.checkpoint_min_step.interval.min: value must be at least 0",
+        ),
+        (
             {"num_speculative_tokens": {"fixed": 0}},
             "space.num_speculative_tokens.fixed: value must be at least 1",
+        ),
+        (
+            {"spec_draft_n_min": {"fixed": -1}},
+            "space.spec_draft_n_min.fixed: value must be at least 0",
+        ),
+        (
+            {"n_gpu_layers_draft": {"interval": {"min": -1, "max": 8}}},
+            "space.n_gpu_layers_draft.interval.min: value must be at least 0",
+        ),
+        (
+            {"n_cpu_moe_draft": {"fixed": -1}},
+            "space.n_cpu_moe_draft.fixed: value must be at least 0",
+        ),
+        (
+            {"threads": {"fixed": 0}},
+            "space.threads.fixed: value must be at least 1",
+        ),
+        (
+            {"threads_batch": {"interval": {"min": 0, "max": 32}}},
+            "space.threads_batch.interval.min: value must be at least 1",
+        ),
+        (
+            {"poll": {"fixed": -1}},
+            "space.poll.fixed: value must be at least 0",
         ),
         (
             {"max_model_len": {"interval": {"min": 0, "max": 10}}},

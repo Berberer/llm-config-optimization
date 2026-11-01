@@ -31,11 +31,12 @@ from typing import get_args, get_type_hints
 
 from ..inference.types import LLMConfig
 
-type AtomKind = type[StrEnum] | type[int] | type[bool]
+type AtomKind = type[StrEnum] | type[int] | type[float] | type[bool]
 """A single engine-neutral kind a tunable's ``LLMConfig`` field may expect.
 
 A categorical parameter resolves to its engine-neutral enum class, a numeric
-parameter to :class:`int`, and a boolean parameter to :class:`bool`.
+parameter to :class:`int` or :class:`float`, and a boolean parameter to
+:class:`bool`.
 """
 
 
@@ -46,8 +47,10 @@ class UnionKind:
     A field such as ``int | GpuLayersMode | None`` has no single kind: a value
     may be an exact integer or one of the enum's mode names, and the loader
     validates a declared value against either branch. The order is the order of
-    the annotation. An ``interval`` spec constrains the integer branch only, so
-    a mode name can never masquerade as a numeric bound.
+    the annotation. An ``interval`` spec constrains a numeric branch only, so a
+    mode name can never masquerade as a numeric bound. A float branch accepts
+    integer and fractional bounds and stores them as floats, while an integer
+    branch rejects a fractional bound.
     """
 
     kinds: tuple[AtomKind, ...]
@@ -61,32 +64,56 @@ type ParameterKind = AtomKind | UnionKind
 """The engine-neutral kind a tunable's ``LLMConfig`` field expects.
 
 A categorical parameter resolves to its engine-neutral enum class, a numeric
-parameter to :class:`int`, a boolean parameter to :class:`bool`, and a union
-field to a :class:`UnionKind`. The validator uses this to reject a spec that
-cannot describe the field, such as an
+parameter to :class:`int` or :class:`float`, a boolean parameter to
+:class:`bool`, and a union field to a :class:`UnionKind`. The validator uses
+this to reject a spec that cannot describe the field, such as an
 :class:`~llm_config_optimization.search_space.types.Interval` declared for an
-enum, a boolean, or a union that carries no integer branch.
+enum, a boolean, or a union that carries no numeric branch.
 """
 
 
 TUNABLE_PARAMETERS: Mapping[str, str] = MappingProxyType(
     {
-        "dtype": "dtype",
-        "kv_cache_dtype": "kv_cache_dtype",
         "max_model_len": "max_model_len",
         "max_num_seqs": "max_num_seqs",
         "max_num_batched_tokens": "max_num_batched_tokens",
         "max_num_active_seqs": "max_num_active_seqs",
         "max_num_scheduled_tokens": "max_num_scheduled_tokens",
-        "tensor_parallel_size": "tensor_parallel_size",
+        "ubatch_size": "ubatch_size",
+        "dtype": "dtype",
+        "kv_cache_dtype": "kv_cache_dtype",
         "attention_backend": "attention_backend",
-        "speculative_mode": "speculative_mode",
-        "num_speculative_tokens": "num_speculative_tokens",
-        "prefix_caching": "prefix_caching",
         "n_gpu_layers": "n_gpu_layers",
+        "n_cpu_moe": "n_cpu_moe",
+        "n_cpu_ffn": "n_cpu_ffn",
+        "kv_offload": "kv_offload",
+        "op_offload": "op_offload",
+        "host_buffer": "host_buffer",
+        "repack": "repack",
+        "swa_full": "swa_full",
+        "load_mode": "load_mode",
+        "prefix_caching": "prefix_caching",
+        "cache_ram": "cache_ram",
+        "ctx_checkpoints": "ctx_checkpoints",
+        "checkpoint_min_step": "checkpoint_min_step",
+        "kv_unified": "kv_unified",
+        "continuous_batching": "continuous_batching",
+        "cache_idle_slots": "cache_idle_slots",
+        "tensor_parallel_size": "tensor_parallel_size",
         "expert_parallel": "expert_parallel",
         "all2all_backend": "all2all_backend",
-        "n_cpu_moe": "n_cpu_moe",
+        "speculative_mode": "speculative_mode",
+        "num_speculative_tokens": "num_speculative_tokens",
+        "spec_draft_n_min": "spec_draft_n_min",
+        "spec_draft_p_split": "spec_draft_p_split",
+        "spec_draft_sampling": "spec_draft_sampling",
+        "n_gpu_layers_draft": "n_gpu_layers_draft",
+        "n_cpu_moe_draft": "n_cpu_moe_draft",
+        "draft_kv_cache_dtype": "draft_kv_cache_dtype",
+        "threads": "threads",
+        "threads_batch": "threads_batch",
+        "poll": "poll",
+        "prio": "prio",
     }
 )
 """Which serving parameters a sweep may vary, and the ``LLMConfig`` field each fills.
@@ -94,8 +121,9 @@ TUNABLE_PARAMETERS: Mapping[str, str] = MappingProxyType(
 The insertion order is canonical: the parser emits dimensions in this order, so
 a space is deterministic regardless of the YAML key order. The mapping is a
 strict allow-list, so a parameter absent from it is either a known non-tunable
-(an ``LLMConfig`` field such as ``seed``) or unknown entirely. The two
-speculative dimensions are gated: see :data:`SPECULATIVE_PARAMETERS`.
+(an ``LLMConfig`` field such as ``seed``) or unknown entirely. The speculative
+dimensions are gated by :data:`SPECULATIVE_PARAMETERS`, and the draft-only ones
+by :data:`DRAFT_MODEL_PARAMETERS`.
 """
 
 SPECULATIVE_PARAMETERS: frozenset[str] = frozenset({"speculative_mode", "num_speculative_tokens"})
@@ -104,6 +132,24 @@ SPECULATIVE_PARAMETERS: frozenset[str] = frozenset({"speculative_mode", "num_spe
 A definition declares these exactly when the run fixes a speculative method or
 draft model; otherwise no value would ever reach the engine, so a definition
 that declares them is rejected by the backend's support check.
+"""
+
+DRAFT_MODEL_PARAMETERS: frozenset[str] = frozenset(
+    {
+        "spec_draft_n_min",
+        "spec_draft_p_split",
+        "spec_draft_sampling",
+        "n_gpu_layers_draft",
+        "n_cpu_moe_draft",
+        "draft_kv_cache_dtype",
+    }
+)
+"""The tunables that are applicable only under a configured draft model.
+
+These shape the draft model's own sampling, depth, offload placement, and KV
+cache, so they cannot affect a run that names no draft. A backend that forwards
+a member adds it to its applicable set exactly when :func:`draft_configured`;
+one that does not forward it never requires it.
 """
 
 
@@ -115,6 +161,16 @@ def speculative_configured(llm: LLMConfig) -> bool:
     gates the speculative dimensions in.
     """
     return llm.speculative_method is not None or llm.draft_model is not None
+
+
+def draft_configured(llm: LLMConfig) -> bool:
+    """Whether ``llm`` names a separate draft model.
+
+    Draft-only dimensions are gated on the draft model rather than on the
+    speculative method, because methods such as n-gram and the target model's
+    own MTP heads do not use a separate checkpoint.
+    """
+    return llm.draft_model is not None
 
 
 def expected_kind(field: str) -> ParameterKind:

@@ -18,6 +18,12 @@ setup, and rejected when it does not. Omitting either with a setup is a missing
 parameter error (exit code `3`); declaring either without one is a backend
 problem (exit code `4`). A non-speculative space is therefore unchanged.
 
+For llama.cpp a configured draft model also makes six **draft-only**
+dimensions mandatory — `spec_draft_n_min`, `spec_draft_p_split`,
+`spec_draft_sampling`, `n_gpu_layers_draft`, `n_cpu_moe_draft`, and
+`draft_kv_cache_dtype` — because they shape the draft model itself; see
+[llama.cpp draft-only knobs](#llamacpp-draft-only-knobs) below.
+
 The method is fixed per run on purpose: methods are checkpoint-specific, so
 sweeping them would mostly produce server-start-up failures. Compare setups
 with one run each.
@@ -38,10 +44,6 @@ speculative dimensions:
 
 ```yaml
 space:
-  dtype:
-    categorical: [auto, float16, bfloat16]
-  kv_cache_dtype:
-    categorical: [auto, fp8_e4m3, fp8_e5m2]
   max_model_len:
     interval: {min: 1024, max: 32768}
   max_num_seqs:
@@ -52,12 +54,16 @@ space:
     interval: {min: 1, max: 16}
   max_num_scheduled_tokens:
     interval: {min: 2048, max: 4096}
-  tensor_parallel_size:
-    default: true
+  dtype:
+    categorical: [auto, float16, bfloat16]
+  kv_cache_dtype:
+    categorical: [auto, fp8_e4m3, fp8_e5m2]
   attention_backend:
     default: true
   prefix_caching:
     fixed: true
+  tensor_parallel_size:
+    default: true
   expert_parallel:
     categorical: [true, false]
   all2all_backend:
@@ -68,10 +74,13 @@ space:
     categorical: [1, 2, 4, 8]
 ```
 
-For llama.cpp the space is the eight base tunables for that engine — including
-`n_gpu_layers` and `n_cpu_moe` — plus the same two speculative dimensions, and
-`--draft-model` takes a local `.gguf` file or a Hub repository with the optional
-`:QUANT` selector, exactly like `MODEL`:
+For llama.cpp the space is the twenty-six base tunables for that engine —
+including `n_gpu_layers` and `n_cpu_moe` — plus the same two speculative
+dimensions. Because the run names a draft model, it must also declare the six
+draft-only dimensions; `space-speculative-defaults.yaml` defers them to the
+engine while `space-speculative-full.yaml` sweeps them. `--draft-model` takes a
+local `.gguf` file or a Hub repository with the optional `:QUANT` selector,
+exactly like `MODEL`:
 
 ```console
 $ llm-config-optimization /models/Qwen3.5-8B-Q4_K_M.gguf examples/llamacpp/space-speculative-full.yaml llamacpp \
@@ -131,6 +140,33 @@ How the dimensions' values behave:
 - The method and draft model are fixed and are written into the winning
   configuration along with the recommended mode, depth, and the resolved draft
   path, so `--output-config` produces a re-runnable speculative configuration.
+
+## llama.cpp draft-only knobs
+
+llama.cpp exposes six dimensions beyond the shared mode and depth, applicable
+exactly when the run configures a draft model:
+
+| Dimension | `llama-server` flags | Meaning |
+| --------- | -------------------- | ------- |
+| `spec_draft_n_min` | `--spec-draft-n-min` | Minimum number of draft tokens; an integer ≥ 0. |
+| `spec_draft_p_split` | `--spec-draft-p-split` | Split probability; a real number in `0.0…1.0`, so the optimizer can interpolate. |
+| `spec_draft_sampling` | `--spec-draft-sampling` | `greedy` or `probabilistic` draft sampling. |
+| `n_gpu_layers_draft` | `--n-gpu-layers-draft` | Draft GPU-layer offload: `auto`, `all`, or an exact count. |
+| `n_cpu_moe_draft` | `--n-cpu-moe-draft`, `--cpu-moe-draft` | Draft expert layers kept in system RAM: `all` or an exact count. |
+| `draft_kv_cache_dtype` | `--cache-type-k-draft`, `--cache-type-v-draft` | Draft KV-cache format, independent of the target's. |
+
+These dimensions are gated on a configured draft model rather than on the
+speculative method, because methods such as `ngram` and the target model's own
+`mtp` heads do not use a separate checkpoint. A draft-only dimension declared
+without one is a backend problem (exit code `4`). The dimensions stay
+applicable on a trial that samples `speculative_mode: disabled` — the run still
+names a draft — but their flags are suppressed with the rest of the setup.
+When the draft checkpoint is readable, its block count bounds
+`n_gpu_layers_draft` and `n_cpu_moe_draft`; a CPU target drops both, and an
+unreadable draft header fails open. A quantized `draft_kv_cache_dtype` cannot
+be paired with `attention_backend: off`, mirroring the target-cache rule. See
+the [llama.cpp tuning guide](llamacpp-tuning.md#speculative-decoding) for the
+full model-aware rules.
 
 A study records neither the method nor the draft model, so use a distinct
 `--study-name` per speculative setup; see

@@ -52,16 +52,16 @@ _CPU = DetectedHardware(target=HardwareTarget.CPU, device_count=1)
 
 VLLM_SPACE = ExperimentSpace(
     dimensions=(
-        Dimension("dtype", Fixed(DType.BFLOAT16)),
-        Dimension("kv_cache_dtype", Default()),
         Dimension("max_model_len", Interval(1024, 8192)),
         Dimension("max_num_seqs", Fixed(128)),
         Dimension("max_num_batched_tokens", Interval(2048, 8192)),
         Dimension("max_num_active_seqs", Fixed(16)),
         Dimension("max_num_scheduled_tokens", Fixed(2048)),
-        Dimension("tensor_parallel_size", Categorical((1, 2))),
+        Dimension("dtype", Fixed(DType.BFLOAT16)),
+        Dimension("kv_cache_dtype", Default()),
         Dimension("attention_backend", Default()),
         Dimension("prefix_caching", Fixed(True)),
+        Dimension("tensor_parallel_size", Categorical((1, 2))),
         Dimension("expert_parallel", Fixed(True)),
         Dimension(
             "all2all_backend",
@@ -76,14 +76,15 @@ VLLM_MOE = ("expert_parallel", "all2all_backend")
 
 LLAMACPP_SPACE = ExperimentSpace(
     dimensions=(
-        Dimension("kv_cache_dtype", Default()),
         Dimension("max_model_len", Interval(1024, 8192)),
         Dimension("max_num_seqs", Fixed(4)),
         Dimension("max_num_batched_tokens", Interval(2048, 8192)),
+        Dimension("ubatch_size", Interval(256, 2048)),
+        Dimension("kv_cache_dtype", Default()),
         Dimension("attention_backend", Fixed(AttentionBackend.FLASH_ATTENTION)),
-        Dimension("prefix_caching", Fixed(True)),
         Dimension("n_gpu_layers", Fixed(GpuLayersMode.AUTO)),
         Dimension("n_cpu_moe", Categorical((0, 8, CpuMoeMode.ALL))),
+        Dimension("prefix_caching", Fixed(True)),
     )
 )
 """A canonical-order llama.cpp space, including the CPU expert offload."""
@@ -97,12 +98,12 @@ _STRING = 8
 _UINT32 = 4
 
 
-def _experiment() -> ExperimentConfig:
-    """Build the run's fixed configuration, which no MoE rule depends on."""
+def _experiment(llm: LLMConfig | None = None) -> ExperimentConfig:
+    """Build the run's fixed configuration, which no pruning rule depends on."""
     return ExperimentConfig(
         container=ContainerRuntimeConfig(),
         benchmark=BenchmarkConfig(model=MODEL),
-        llm=LLMConfig(),
+        llm=llm if llm is not None else LLMConfig(),
     )
 
 
@@ -144,13 +145,14 @@ def _assess_llamacpp(
     model: Path,
     *,
     hardware: DetectedHardware = _CUDA,
+    llm: LLMConfig | None = None,
 ) -> SpaceAssessment:
     """Assess ``definition`` against the checkpoint at ``model`` for llama.cpp.
 
     The default target is a GPU host so a test about the checkpoint's own
     facts does not also exercise the CPU-target rules.
     """
-    return LlamaCppBackend().assess_space(definition, _experiment(), hardware, model)
+    return LlamaCppBackend().assess_space(definition, _experiment(llm), hardware, model)
 
 
 def _retained(definition: ExperimentSpace, dropped: tuple[str, ...]) -> tuple[Dimension, ...]:
@@ -253,6 +255,78 @@ def test_a_non_gguf_checkpoint_is_unknown_rather_than_dense(tmp_path: Path) -> N
     assert _assess_llamacpp(LLAMACPP_SPACE, model) == SpaceAssessment(space=LLAMACPP_SPACE)
 
 
+def _swa_space() -> ExperimentSpace:
+    """A resolvable llama.cpp space that isolates the full-size SWA cache."""
+    return ExperimentSpace(
+        dimensions=(
+            Dimension("prefix_caching", Fixed(True)),
+            Dimension("swa_full", Categorical((True, False))),
+            Dimension("cache_ram", Fixed(0)),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"general.architecture": "llama"},
+        {"general.architecture": "gemma2", "gemma2.attention.sliding_window": 0},
+    ],
+    ids=["absent-window", "zero-window"],
+)
+def test_a_full_attention_checkpoint_drops_the_full_size_swa_cache(
+    payload: Mapping[str, object], tmp_path: Path
+) -> None:
+    model = _write_gguf(tmp_path / "model.gguf", payload)
+
+    assessment = _assess_llamacpp(_swa_space(), model)
+
+    assert assessment.space.dimensions == _retained(_swa_space(), ("swa_full",))
+    assert assessment.problems == ()
+    assert len(assessment.notes) == 1
+    assert "space.swa_full" in assessment.notes[0]
+    assert "sliding-window" in assessment.notes[0]
+
+
+def test_a_sliding_window_checkpoint_keeps_the_full_size_swa_cache(tmp_path: Path) -> None:
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {"general.architecture": "gemma2", "gemma2.attention.sliding_window": 4096},
+    )
+
+    assert _assess_llamacpp(_swa_space(), model) == SpaceAssessment(space=_swa_space())
+
+
+def test_a_window_for_another_architecture_does_not_keep_the_swa_cache(tmp_path: Path) -> None:
+    """The window is read under the checkpoint's own architecture, not any other."""
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {
+            "general.architecture": "llama",
+            "gemma2.attention.sliding_window": 4096,
+        },
+    )
+
+    assessment = _assess_llamacpp(_swa_space(), model)
+
+    assert assessment.space.dimensions == _retained(_swa_space(), ("swa_full",))
+
+
+def test_an_unparseable_header_keeps_the_full_size_swa_cache(tmp_path: Path) -> None:
+    """Unreadable sliding-window metadata fails open, so the dimension is kept."""
+    model = tmp_path / "model.gguf"
+    model.write_bytes(_GGUF_MAGIC)
+
+    assert _assess_llamacpp(_swa_space(), model) == SpaceAssessment(space=_swa_space())
+
+
+def test_a_non_gguf_checkpoint_keeps_the_full_size_swa_cache(tmp_path: Path) -> None:
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"not a GGUF file")
+
+    assert _assess_llamacpp(_swa_space(), model) == SpaceAssessment(space=_swa_space())
+
+
 def test_an_empty_effective_space_is_representable(tmp_path: Path) -> None:
     """Pruning every dimension is not an error here; the caller decides what it means."""
     definition = ExperimentSpace(
@@ -288,6 +362,29 @@ def _moe_space() -> ExperimentSpace:
 def _layers_space(spec: Spec) -> ExperimentSpace:
     """A llama.cpp space declaring only ``n_gpu_layers`` with ``spec``."""
     return ExperimentSpace(dimensions=(Dimension("n_gpu_layers", spec),))
+
+
+_CPU_PLACEMENT_PARAMETERS = (
+    "n_cpu_ffn",
+    "kv_offload",
+    "op_offload",
+    "n_cpu_moe_draft",
+    "n_gpu_layers_draft",
+)
+"""The device-placement dimensions a CPU target cannot make use of."""
+
+
+def _placement_space() -> ExperimentSpace:
+    """A resolvable llama.cpp space that isolates the device-placement dimensions."""
+    return ExperimentSpace(
+        dimensions=(
+            Dimension("n_cpu_ffn", Interval(0, 8)),
+            Dimension("kv_offload", Categorical((True, False))),
+            Dimension("op_offload", Categorical((True, False))),
+            Dimension("n_cpu_moe_draft", Categorical((0, CpuMoeMode.ALL))),
+            Dimension("n_gpu_layers_draft", Categorical((GpuLayersMode.AUTO, 4))),
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -683,6 +780,27 @@ def test_a_cpu_target_keeps_a_deferred_gpu_layer_dimension(tmp_path: Path) -> No
     assert _assess_llamacpp(definition, model, hardware=_CPU) == SpaceAssessment(space=definition)
 
 
+def test_a_cpu_target_drops_the_device_placement_dimensions(tmp_path: Path) -> None:
+    """A CPU target has no device, so every placement knob is meaningless there."""
+    model = _write_gguf(tmp_path / "model.gguf", MOE_CHECKPOINT)
+
+    assessment = _assess_llamacpp(_placement_space(), model, hardware=_CPU)
+
+    assert assessment.space.dimensions == ()
+    assert assessment.problems == ()
+    for name in _CPU_PLACEMENT_PARAMETERS:
+        notes = [note for note in assessment.notes if f"space.{name}:" in note]
+        assert len(notes) == 1
+        assert "CPU" in notes[0]
+    assert len(assessment.notes) == len(_CPU_PLACEMENT_PARAMETERS)
+
+
+def test_a_gpu_target_keeps_the_device_placement_dimensions(tmp_path: Path) -> None:
+    model = _write_gguf(tmp_path / "model.gguf", MOE_CHECKPOINT)
+
+    assert _assess_llamacpp(_placement_space(), model) == SpaceAssessment(space=_placement_space())
+
+
 def test_an_exact_cpu_expert_count_above_the_block_count_is_a_problem(tmp_path: Path) -> None:
     model = _write_gguf(tmp_path / "model.gguf", MOE_CHECKPOINT)
     definition = ExperimentSpace(
@@ -710,7 +828,7 @@ def test_an_exact_gpu_layer_count_above_the_block_count_is_a_problem(tmp_path: P
     assert "n_gpu_layers=all" in assessment.problems[0]
 
 
-@pytest.mark.parametrize("name", ["n_gpu_layers", "n_cpu_moe"])
+@pytest.mark.parametrize("name", ["n_gpu_layers", "n_cpu_moe", "n_cpu_ffn"])
 def test_an_interval_above_the_block_count_is_a_problem(name: str, tmp_path: Path) -> None:
     model = _write_gguf(tmp_path / "model.gguf", MOE_CHECKPOINT)
     definition = ExperimentSpace(dimensions=(Dimension(name, Interval(0, 64)),))
@@ -753,6 +871,20 @@ def test_a_checkpoint_without_a_block_count_is_not_bounded(tmp_path: Path) -> No
     assert _assess_llamacpp(definition, model).problems == ()
 
 
+def test_an_exact_dense_ffn_count_above_the_block_count_is_a_problem(tmp_path: Path) -> None:
+    model = _write_gguf(tmp_path / "model.gguf", MOE_CHECKPOINT)
+    definition = ExperimentSpace(dimensions=(Dimension("n_cpu_ffn", Fixed(64)),))
+
+    assessment = _assess_llamacpp(definition, model)
+
+    assert assessment.space == definition
+    assert len(assessment.problems) == 1
+    assert "space.n_cpu_ffn.fixed" in assessment.problems[0]
+    assert "64" in assessment.problems[0]
+    assert "32" in assessment.problems[0]
+    assert "reduce n_cpu_ffn" in assessment.problems[0]
+
+
 def test_an_unparseable_header_is_not_bounded(tmp_path: Path) -> None:
     """Unreadable block-count metadata fails open, so no count is rejected."""
     model = tmp_path / "model.gguf"
@@ -760,5 +892,118 @@ def test_an_unparseable_header_is_not_bounded(tmp_path: Path) -> None:
     definition = _layers_space(Fixed(64))
 
     assessment = _assess_llamacpp(definition, model)
+
+    assert assessment == SpaceAssessment(space=definition)
+
+
+DRAFT_CHECKPOINT: dict[str, object] = {
+    "general.architecture": "llama",
+    "llama.expert_count": 8,
+    "llama.block_count": 4,
+}
+"""A draft checkpoint whose block count differs from the target checkpoint's."""
+
+
+def _draft_llm(draft: Path | None = None) -> LLMConfig:
+    """A fixed configuration naming a draft model, optionally resolved to ``draft``."""
+    return LLMConfig(draft_model="Qwen/Qwen3.5-0.6B", resolved_draft_path=draft)
+
+
+@pytest.mark.parametrize("name", ["n_gpu_layers_draft", "n_cpu_moe_draft"])
+def test_an_exact_draft_layer_count_above_the_draft_block_count_is_a_problem(
+    name: str, tmp_path: Path
+) -> None:
+    model = _write_gguf(tmp_path / "model.gguf", MOE_CHECKPOINT)
+    draft = _write_gguf(tmp_path / "draft.gguf", DRAFT_CHECKPOINT)
+    definition = ExperimentSpace(dimensions=(Dimension(name, Fixed(8)),))
+
+    assessment = _assess_llamacpp(definition, model, llm=_draft_llm(draft))
+
+    assert assessment.space == definition
+    assert len(assessment.problems) == 1
+    assert f"space.{name}.fixed" in assessment.problems[0]
+    assert str(draft) in assessment.problems[0]
+    assert f"{name}=all" in assessment.problems[0]
+
+
+@pytest.mark.parametrize("name", ["n_gpu_layers_draft", "n_cpu_moe_draft"])
+def test_a_draft_interval_above_the_draft_block_count_is_a_problem(
+    name: str, tmp_path: Path
+) -> None:
+    model = _write_gguf(tmp_path / "model.gguf", MOE_CHECKPOINT)
+    draft = _write_gguf(tmp_path / "draft.gguf", DRAFT_CHECKPOINT)
+    definition = ExperimentSpace(dimensions=(Dimension(name, Interval(0, 64)),))
+
+    assessment = _assess_llamacpp(definition, model, llm=_draft_llm(draft))
+
+    assert len(assessment.problems) == 1
+    assert f"space.{name}.interval" in assessment.problems[0]
+    assert "64" in assessment.problems[0]
+
+
+def test_the_draft_counts_are_bounded_by_the_draft_block_count(tmp_path: Path) -> None:
+    """The same count is fine for the target and a problem for a smaller draft."""
+    model = _write_gguf(tmp_path / "model.gguf", MOE_CHECKPOINT)
+    draft = _write_gguf(tmp_path / "draft.gguf", DRAFT_CHECKPOINT)
+    definition = ExperimentSpace(
+        dimensions=(
+            Dimension("n_gpu_layers", Fixed(8)),
+            Dimension("n_gpu_layers_draft", Fixed(8)),
+        )
+    )
+
+    assessment = _assess_llamacpp(definition, model, llm=_draft_llm(draft))
+
+    assert len(assessment.problems) == 1
+    assert "space.n_gpu_layers_draft.fixed" in assessment.problems[0]
+    assert str(draft) in assessment.problems[0]
+
+
+@pytest.mark.parametrize(
+    ("name", "spec"),
+    [
+        ("n_gpu_layers_draft", Fixed(GpuLayersMode.ALL)),
+        ("n_gpu_layers_draft", Fixed(GpuLayersMode.AUTO)),
+        ("n_cpu_moe_draft", Fixed(CpuMoeMode.ALL)),
+        ("n_cpu_moe_draft", Default()),
+    ],
+    ids=["draft-all", "draft-auto", "draft-cpu-moe-all", "draft-deferred"],
+)
+def test_a_draft_mode_is_never_bounded(name: str, spec: Spec, tmp_path: Path) -> None:
+    model = _write_gguf(tmp_path / "model.gguf", MOE_CHECKPOINT)
+    draft = _write_gguf(tmp_path / "draft.gguf", DRAFT_CHECKPOINT)
+    definition = ExperimentSpace(dimensions=(Dimension(name, spec),))
+
+    assessment = _assess_llamacpp(definition, model, llm=_draft_llm(draft))
+
+    assert assessment == SpaceAssessment(space=definition)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"general.architecture": "llama"}, None],
+    ids=["no-block-count", "unreadable"],
+)
+def test_unknown_draft_metadata_is_not_bounded(payload: object, tmp_path: Path) -> None:
+    """A draft header without a block count, or an unreadable one, fails open."""
+    model = _write_gguf(tmp_path / "model.gguf", MOE_CHECKPOINT)
+    draft = tmp_path / "draft.gguf"
+    if payload is None:
+        draft.write_bytes(_GGUF_MAGIC)
+    else:
+        _write_gguf(draft, payload)
+    definition = ExperimentSpace(dimensions=(Dimension("n_gpu_layers_draft", Fixed(64)),))
+
+    assessment = _assess_llamacpp(definition, model, llm=_draft_llm(draft))
+
+    assert assessment == SpaceAssessment(space=definition)
+
+
+def test_a_draft_count_is_not_bounded_without_a_resolved_draft(tmp_path: Path) -> None:
+    """A configured but unresolved draft has no checkpoint to bound against."""
+    model = _write_gguf(tmp_path / "model.gguf", MOE_CHECKPOINT)
+    definition = ExperimentSpace(dimensions=(Dimension("n_gpu_layers_draft", Fixed(64)),))
+
+    assessment = _assess_llamacpp(definition, model, llm=_draft_llm())
 
     assert assessment == SpaceAssessment(space=definition)

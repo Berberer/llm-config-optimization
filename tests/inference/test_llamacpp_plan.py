@@ -377,6 +377,7 @@ def test_every_mapped_tunable_reaches_the_server_command(model_file: Path) -> No
         max_model_len=2048,
         max_num_seqs=4,
         max_num_batched_tokens=4096,
+        ubatch_size=2048,
         attention_backend=AttentionBackend.FLASH_ATTENTION,
     )
 
@@ -395,7 +396,7 @@ def test_every_mapped_tunable_reaches_the_server_command(model_file: Path) -> No
         "--batch-size",
         "4096",
         "--ubatch-size",
-        "4096",
+        "2048",
         "--flash-attn",
         "on",
     ]

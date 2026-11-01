@@ -19,22 +19,60 @@
 # CPU-only host the assessment drops `n_cpu_moe`, because no weight ever leaves
 # system RAM there.
 #
-# Only the eight parameters llama-server forwards are declared; `dtype` and
-# `tensor_parallel_size` are not applicable to a GGUF checkpoint.
+# Only the parameters llama-server forwards are declared, in canonical registry
+# order. `dtype` and `tensor_parallel_size` are not applicable to a GGUF
+# checkpoint, and the draft-only dimensions stay out because no `--draft-model`
+# is configured.
 space:
-  kv_cache_dtype:
-    fixed: float16
   max_model_len:
     fixed: 4096
   max_num_seqs:
     fixed: 64
   max_num_batched_tokens:
     fixed: 4096
+  ubatch_size:
+    default: true
+  kv_cache_dtype:
+    fixed: float16
   attention_backend:
     default: true
-  prefix_caching:
-    fixed: true
   n_gpu_layers:
     fixed: all
   n_cpu_moe:
     categorical: [0, 8, 16, all]
+  n_cpu_ffn:
+    default: true
+  kv_offload:
+    default: true
+  op_offload:
+    default: true
+  host_buffer:
+    default: true
+  repack:
+    default: true
+  swa_full:
+    default: true
+  load_mode:
+    default: true
+  prefix_caching:
+    fixed: true
+  cache_ram:
+    default: true
+  ctx_checkpoints:
+    default: true
+  checkpoint_min_step:
+    default: true
+  kv_unified:
+    default: true
+  continuous_batching:
+    default: true
+  cache_idle_slots:
+    default: true
+  threads:
+    default: true
+  threads_batch:
+    default: true
+  poll:
+    default: true
+  prio:
+    default: true

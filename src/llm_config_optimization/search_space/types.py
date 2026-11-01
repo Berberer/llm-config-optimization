@@ -49,14 +49,15 @@ type ParameterValue = (
     | CpuMoeMode
     | All2AllBackend
     | int
+    | float
     | bool
 )
 """A value a tunable parameter may take.
 
 Categorical parameters hold an engine-neutral enum member, numeric parameters
-hold an integer, and boolean parameters hold :class:`bool`. Whatever spec kind
-supplies the value, the validator rejects a value of the wrong kind for its
-parameter; booleans stay distinct from integers in both directions.
+hold an integer or a float, and boolean parameters hold :class:`bool`. Whatever
+spec kind supplies the value, the validator rejects a value of the wrong kind for
+its parameter; booleans stay distinct from numbers in both directions.
 """
 
 

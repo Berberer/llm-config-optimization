@@ -53,6 +53,22 @@ def test_a_toggle_emits_the_disabling_flag_for_false() -> None:
     assert toggle_arguments(False, target) == ["--disable"]
 
 
+def test_a_one_sided_enabling_flag_emits_nothing_for_false() -> None:
+    """A toggle with only an enabling flag keeps the engine's default off."""
+    target = Toggle(enabled="--swa-full")
+
+    assert toggle_arguments(True, target) == ["--swa-full"]
+    assert toggle_arguments(False, target) == []
+
+
+def test_a_one_sided_disabling_flag_emits_nothing_for_true() -> None:
+    """A toggle with only a disabling flag keeps the engine's default on."""
+    target = Toggle(disabled="--no-host")
+
+    assert toggle_arguments(True, target) == []
+    assert toggle_arguments(False, target) == ["--no-host"]
+
+
 def test_a_field_without_a_map_passes_its_value_through() -> None:
     assert translate_value("max_model_len", 4096, _DTYPE_MAP, engine="engine") == 4096
 

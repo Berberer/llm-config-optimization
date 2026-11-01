@@ -99,6 +99,7 @@ SPACE = ExperimentSpace(
         Dimension("max_model_len", Fixed(_MAX_MODEL_LEN)),
         Dimension("max_num_seqs", Categorical(_MAX_NUM_SEQS)),
         Dimension("max_num_batched_tokens", Fixed(_MAX_NUM_BATCHED_TOKENS)),
+        Dimension("ubatch_size", Fixed(1024)),
         Dimension("attention_backend", Default()),
         Dimension("prefix_caching", Fixed(True)),
         Dimension("n_gpu_layers", Fixed(0)),

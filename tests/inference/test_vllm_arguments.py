@@ -36,13 +36,54 @@ from llm_config_optimization.inference._vllm import (
     serve_arguments,
 )
 
-_INAPPLICABLE_FIELDS = frozenset({"resolved_draft_path", "n_gpu_layers", "n_cpu_moe"})
+_INAPPLICABLE_FIELDS = frozenset(
+    {
+        "resolved_draft_path",
+        "n_gpu_layers",
+        "n_cpu_moe",
+        "n_cpu_ffn",
+        "kv_offload",
+        "op_offload",
+        "host_buffer",
+        "repack",
+        "swa_full",
+        "load_mode",
+        "ubatch_size",
+        "cache_ram",
+        "ctx_checkpoints",
+        "checkpoint_min_step",
+        "kv_unified",
+        "continuous_batching",
+        "cache_idle_slots",
+        "threads",
+        "threads_batch",
+        "poll",
+        "prio",
+        "fit",
+        "fit_target",
+        "fit_ctx",
+        "spec_draft_n_min",
+        "spec_draft_p_split",
+        "spec_draft_sampling",
+        "n_gpu_layers_draft",
+        "n_cpu_moe_draft",
+        "draft_kv_cache_dtype",
+    }
+)
 """The :class:`LLMConfig` fields vLLM has no target for.
 
 ``resolved_draft_path`` is a host-side resolution artifact that an engine never
 receives; the speculative settings reach the engine through their group.
-``n_gpu_layers`` and ``n_cpu_moe`` are llama.cpp's GPU-offload and
-CPU-resident expert-layer knobs and have no vLLM equivalent.
+``n_gpu_layers``, ``n_cpu_moe``, ``n_cpu_ffn``, ``kv_offload``, ``op_offload``,
+``host_buffer``, ``repack``, ``swa_full``, and ``load_mode`` are llama.cpp's
+placement and memory knobs and have no vLLM equivalent, ``ubatch_size`` is
+llama.cpp's physical micro-batch, and ``cache_ram``, ``ctx_checkpoints``,
+``checkpoint_min_step``, ``kv_unified``, ``continuous_batching``, and
+``cache_idle_slots`` are its cache and scheduling knobs, ``threads``,
+``threads_batch``, ``poll``, and ``prio`` are its CPU and process knobs,
+``fit``, ``fit_target``, and ``fit_ctx`` are its memory-fit correctness pin, and
+the ``spec_draft_*``/``n_*_draft``/``draft_kv_cache_dtype`` fields shape a
+separate draft model, none of which vLLM exposes.
 """
 
 

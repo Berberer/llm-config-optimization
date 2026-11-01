@@ -46,7 +46,10 @@ the package's own `__init__.py` — such as `_sweep_budget` — from the package
   `_DEFAULT_IMAGES`, `_METRICS_PATH`, `_PREFILL_RATE_SERIES`,
   `_DECODE_RATE_SERIES`), and llama.cpp's in `inference/_llamacpp.py`
   (`PARAMETER_TARGETS`, `VALUE_MAPS`, `_CPU_MOE_ALL_FLAG`,
-  `_GGUF_EXPERT_COUNT_SUFFIX`, `_GGUF_FILE_TYPE_LABELS`, `_DEFAULT_IMAGES`,
+  `_CPU_MOE_DRAFT_ALL_FLAG`, `_FIT_RANGE_FIELDS`, `_NUMERIC_RANGES`,
+  `_QUANTIZED_CACHE_DTYPES`, `_GGUF_EXPERT_COUNT_SUFFIX`,
+  `_GGUF_SLIDING_WINDOW_SUFFIX`, `_GGUF_FILE_TYPE_LABELS`, `_SWA_PARAMETER`,
+  `_MAIN_BLOCK_COUNT_HINTS`, `_DRAFT_BLOCK_COUNT_HINTS`, `_DEFAULT_IMAGES`,
   `_TIMINGS_KEY`, `_PREFILL_TIMING_KEYS`, `_DECODE_TIMING_KEYS`); the search
   space uses engine-neutral enum values.
 - The metrics seam is engine-neutral: the host client knows only the standard
@@ -91,8 +94,15 @@ the package's own `__init__.py` — such as `_sweep_budget` — from the package
 - llama.cpp's `validate` rejects a space that can sample a quantized
   `kv_cache_dtype` together with `attention_backend: off`: llama.cpp refuses
   to create a quantized V cache unless flash attention is enabled, so keeping
-  those points out of the sweep avoids server-startup failures. The quantized
-  set is `_QUANTIZED_CACHE_DTYPES` in `inference/_llamacpp.py`.
+  those points out of the sweep avoids server-startup failures. The same rule
+  covers `draft_kv_cache_dtype` when the run names a draft model — and only
+  then, because without one the dimension is not forwarded. The quantized set
+  is `_QUANTIZED_CACHE_DTYPES` in `inference/_llamacpp.py`.
+- llama.cpp's `validate` rejects a declared value outside the engine's own
+  limit, naming the value and the permitted range from `_NUMERIC_RANGES`:
+  `poll` `0…100`, `prio` `-1…3`, `spec_draft_p_split` `0.0…1.0`, and
+  `cache_ram` `>= -1`. The loader's floors apply on top of those ranges for a
+  parameter that has one; a parameter with no intrinsic floor is bounded here.
 - A backend owns its model-argument rules through `model_request`: vLLM
   resolves a Hub snapshot directory or a local directory, while llama.cpp
   accepts a local `.gguf` file or a Hub repository with an optional `:QUANT`
@@ -130,10 +140,20 @@ the package's own `__init__.py` — such as `_sweep_budget` — from the package
   when expert parallelism can never be enabled (a deferred `expert_parallel`
   forwards no flag, so it never enables it). llama.cpp treats a readable GGUF
   header without a positive `<arch>.expert_count` as dense, drops `n_cpu_moe`
-  on a dense checkpoint and on a CPU target, drops `n_gpu_layers` on a CPU
-  target when every value it can select is already CPU-valid, and bounds the
-  retained exact `n_cpu_moe`/`n_gpu_layers` counts and interval maxima by the
-  architecture's block count.
+  on a dense checkpoint, and reads `<arch>.attention.sliding_window` so a
+  confidently full-attention checkpoint drops `swa_full`. The GGUF fact reader
+  honours a declared `general.architecture` strictly: it resolves only that
+  architecture's `<arch>.*` key, so a value stored under another architecture
+  is not borrowed; without a declared architecture, a single
+  architecture-prefixed key is unambiguous and is reported. On a CPU target it
+  drops `n_cpu_moe`, `n_cpu_ffn`, `kv_offload`, `op_offload`, and the draft
+  model's `n_cpu_moe_draft` and `n_gpu_layers_draft`, plus `n_gpu_layers` when
+  every value it can select already disables offload. Retained layer counts
+  are bounded by the relevant checkpoint's block count, including interval
+  maxima: `n_cpu_moe`, `n_gpu_layers`, and `n_cpu_ffn` by the target
+  checkpoint, and `n_cpu_moe_draft`/`n_gpu_layers_draft` by the draft
+  checkpoint. `n_cpu_ffn`'s hint asks for a smaller count because it has no
+  `all` mode, while the others point at `all`.
 - vLLM's assessment also owns its checkpoint dtype rules: `CheckpointFacts` in
   `inference/_vllm.py` reports the preferred `model_dtype` — `dtype` or
   `torch_dtype`, with a nested `text_config` value winning — and whether a
@@ -154,20 +174,33 @@ the package's own `__init__.py` — such as `_sweep_budget` — from the package
   be declared, so a value never silently falls back to an engine default. The
   registry itself stays engine-neutral; a backend that lacks a parameter (for
   example llama.cpp has no `tensor_parallel_size`) simply omits it. `llm` is the
-  run's fixed configuration, because applicability can depend on it: the two
-  speculative tunables `speculative_mode` and `num_speculative_tokens` are in
-  the set exactly when `speculative_method` or `draft_model` is configured, and
-  a definition declaring them without that setup is rejected as unsupported.
+  run's fixed configuration, because applicability can depend on it, and the
+  registry declares two gates. The two speculative tunables `speculative_mode`
+  and `num_speculative_tokens` are in the set exactly when
+  `speculative_method` or `draft_model` is configured. The six draft-only
+  tunables — `spec_draft_n_min`, `spec_draft_p_split`, `spec_draft_sampling`,
+  `n_gpu_layers_draft`, `n_cpu_moe_draft`, and `draft_kv_cache_dtype` — are in
+  the set exactly when `draft_model` is configured, because methods such as
+  n-gram and the target's own MTP heads use no separate checkpoint. Both
+  backends subtract both gated sets from their base set and add back only the
+  gated parameters they forward, intersected with their own forwarded-parameter
+  table, so gating cannot drift between engines and vLLM never requires a
+  llama.cpp-only field. A definition declaring a gated parameter without its
+  setup is rejected as unsupported.
 - The registry derives each tunable's kind from its `LLMConfig` field
   annotation (`expected_kind`), so kinds are never duplicated: an optional
-  enum, integer, or boolean resolves to that one kind, while an int-or-enum
-  union such as `n_gpu_layers` (`int | GpuLayersMode | None`) resolves to a
-  `UnionKind` whose branches are validated independently. An `interval` spec
-  constrains only an integer branch, so a mode name can never masquerade as a
-  numeric bound; booleans are strict and are never coerced from integers or
-  strings; and numeric floors come from the loader (`_POSITIVE_PARAMETERS`,
-  plus `_NON_NEGATIVE_PARAMETERS` for `n_gpu_layers` and `n_cpu_moe`, whose
-  `0` disables offload).
+  enum, integer, float, or boolean resolves to that one kind, while an
+  int-or-enum union such as `n_gpu_layers` (`int | GpuLayersMode | None`)
+  resolves to a `UnionKind` whose branches are validated independently. An
+  `interval` spec constrains only a numeric branch, so a mode name can never
+  masquerade as a numeric bound; a float branch accepts integer and fractional
+  bounds and stores them as floats, while an integer branch rejects a float
+  bound; booleans are strict and are never coerced from integers or strings.
+  Numeric floors come from the loader (`_POSITIVE_PARAMETERS` for sizes, token
+  budgets, and thread counts, plus `_NON_NEGATIVE_PARAMETERS` for offload
+  counts and knobs whose `0` has meaning). A parameter with no intrinsic floor
+  (`cache_ram`, `prio`, `spec_draft_p_split`, the fit family) is range-checked
+  by its backend instead.
 - `n_gpu_layers` is llama.cpp-only: `GpuLayersMode` (`auto`, `all`) and exact
   integer counts are engine-neutral in `inference/types.py`, and
   `inference/_llamacpp.py` maps the modes and passes integers through as
@@ -187,6 +220,33 @@ the package's own `__init__.py` — such as `_sweep_budget` — from the package
   `0`, which disables the offload. Each backend omits the settings only the
   other forwards, so a cross-engine dimension is rejected by the per-dimension
   support check.
+- The remaining llama.cpp-only categorical settings are engine-neutral in the
+  same way: `LoadMode` (`auto`, `none`, `mmap`, `mlock`, `mmap_mlock`, `dio`)
+  and `SpecDraftSampling` (`greedy`, `probabilistic`) live in
+  `inference/types.py`, and llama.cpp's spellings — including `mmap+mlock` —
+  stay in its `VALUE_MAPS`; vLLM rejects both. `FitMode` (`on`, `off`) names
+  the correctness pin below, and the draft offload fields reuse
+  `GpuLayersMode`/`CpuMoeMode`: an exact count is a plain integer, `all` emits
+  the value-less `--cpu-moe-draft`, and vLLM forwards none of them.
+- Boolean tunables are forwarded through the shared `Toggle` in
+  `inference/_tunables.py`, whose two sides may be set independently. A
+  two-sided field emits the enabling or the disabling flag explicitly, while a
+  one-sided flag emits nothing for its absent side: llama.cpp's `host_buffer`
+  exposes only `--no-host` and its `swa_full` only `--swa-full`. The
+  positive-semantics fields `kv_offload`, `op_offload`, `host_buffer`, `repack`,
+  `swa_full`, `kv_unified`, `continuous_batching`, and `cache_idle_slots` all
+  map this way.
+- The fit family pins correctness rather than tuning it: `fit` (`FitMode`),
+  `fit_target`, and `fit_ctx` are fixed for a run, absent from
+  `TUNABLE_PARAMETERS`, and set from the command line, whose effective
+  `--fit` default is `off` because llama.cpp's own default lets the engine
+  rewrite the declared arguments. The parser leaves `--fit` unset and the
+  composition root maps unset to `off`, so an engine that does not serve the
+  family rejects an explicitly passed flag; vLLM registers `--fit`,
+  `--fit-target`, and `--fit-ctx` as rejected options. `--fit-target` and
+  `--fit-ctx` are rejected as a usage error unless `--fit on` is given, and a
+  hand-built configuration that leaves fit unset or off suppresses them
+  (`_FIT_RANGE_FIELDS`) rather than forwarding flags the engine would ignore.
 - A trial is host-driven: the backend plans an engine-neutral `ServerSpec` and
   the orchestrator starts the server container, drives it with the host
   benchmark client, stops it, and hands the measured outcome to
@@ -268,19 +328,25 @@ declares the new parameter, and the loader will report it as a missing tunable.
 Code:
 
 - [ ] `inference/types.py` — add a typed, optional (`| None`) field to
-  `LLMConfig`. For a categorical parameter, also add an engine-neutral
-  `StrEnum` in the same module; never use an engine's own spelling here. A
-  field that accepts both a mode and an exact count (like `n_gpu_layers`) is a
-  union of the enum and `int`.
+  `LLMConfig`. `int`, `float`, and `bool` fields need no extra type; for a
+  categorical parameter, also add an engine-neutral `StrEnum` in the same
+  module and never use an engine's own spelling here. A field that accepts both
+  a mode and an exact count (like `n_gpu_layers`) is a union of the enum and
+  `int`. A field that must stay fixed for a run (the fit correctness pin) is
+  not a tunable: leave it out of the registry and expose it through the CLI
+  instead.
 - [ ] `search_space/registry.py` — add an entry to `TUNABLE_PARAMETERS` mapping
   the YAML name to the field name. The loader reads the expected kind from the
-  field annotation, so there is no second kind to keep in sync. Insertion order
-  is canonical (the parser emits dimensions in it), so append at the end unless
-  the canonical order is deliberately being changed. If the parameter should be
-  applicable only under a configured setup, add it to the gated set
-  (`SPECULATIVE_PARAMETERS`, whose members are `speculative_mode` and
-  `num_speculative_tokens`) so both backends include it from
-  `applicable_parameters(llm)` exactly then, and `validate` rejects it otherwise.
+  field annotation, so there is no second kind to keep in sync and `float` is
+  already a first-class kind. Insertion order is canonical (the parser emits
+  dimensions in it), so place the entry in its domain group (context and
+  workload, precision and attention, placement and memory, cache and
+  scheduling, parallelism, speculative, CPU and process) rather than appending
+  arbitrarily. If the parameter is applicable only under a configured setup,
+  add it to `SPECULATIVE_PARAMETERS` (when a speculative method or draft model
+  is enough) or `DRAFT_MODEL_PARAMETERS` (when only a separate draft model
+  qualifies) so both backends include it from `applicable_parameters(llm)`
+  exactly then, and `validate` rejects it otherwise.
 - [ ] `inference/_vllm.py` — forward the field via `PARAMETER_TARGETS`
   (`FlatFlag()` for a `--flag value`, `JsonGroup(flag=..., key=...)` for a JSON
   group). For a categorical field, add a vLLM spelling for **every** enum member
@@ -291,22 +357,32 @@ Code:
   device count (like `tensor_parallel_size`) needs the equivalent check against
   `DetectedHardware.device_count`.
 - [ ] `inference/_llamacpp.py` — forward the field too when llama.cpp exposes
-  it, and add a spelling for every enum member llama.cpp serves to its
-  `VALUE_MAPS`. A parameter llama.cpp lacks (like `dtype` or
+  it: a plain value gets a `FlatFlag`, a boolean a `Toggle` (with a `None` side
+  omitted for a one-sided flag), and an enum a spelling for every member
+  llama.cpp serves in `VALUE_MAPS`. A value that maps to two engine flags is
+  forwarded from one entry. A parameter llama.cpp lacks (like `dtype` or
   `tensor_parallel_size`) stays out of `PARAMETER_TARGETS`, which is what keeps
   it out of the backend's applicable set.
 - [ ] `search_space/loader.py` — if the parameter is an integer bounded below,
   add it to `_POSITIVE_PARAMETERS` for a `>= 1` floor or
-  `_NON_NEGATIVE_PARAMETERS` for a `>= 0` floor such as an offload count.
+  `_NON_NEGATIVE_PARAMETERS` for a `>= 0` floor such as an offload count or a
+  knob where `0` has meaning. `float` parameters get no floor here; the
+  backend validates their range. A parameter with no intrinsic floor (like
+  `cache_ram`, whose `-1` means "no limit") stays out of both sets.
 - [ ] `inference/_vllm.py`/`inference/_llamacpp.py` — if the engine imposes a
-  cross-parameter rule, add it to `_ENGINE_BOUNDS` (or the equivalent
-  engine-specific validation). If the parameter cannot affect some checkpoints,
-  targets, or fixed configurations, extend the backend's `assess_space` with
-  the rule that drops it, and report a model-aware problem when a declared
-  value is unusable rather than letting the trial fail at server startup.
+  cross-parameter rule, add it to `_ENGINE_BOUNDS` (or llama.cpp's equivalent
+  validation alongside `_NUMERIC_RANGES` and `_QUANTIZED_CACHE_DTYPES`). If the
+  parameter cannot affect some checkpoints, targets, or fixed configurations,
+  extend the backend's `assess_space` with the rule that drops it, fed by a
+  fact from the backend's checkpoint reader when one is needed, and report a
+  model-aware problem when a declared value is unusable rather than letting the
+  trial fail at server startup.
 - [ ] `cli/arguments.py` + `cli/config.py` — only if the parameter should also
   be settable outside a sweep (like `seed` / `gpu_memory_utilization`, which are
-  CLI flags and non-tunables). A pure tuning dimension needs no CLI change.
+  CLI flags and non-tunables) or must be fixed for a run (like the fit family).
+  Build the field on the base configuration and reject a dependent option
+  without its gate through the usage-error path. A pure tuning dimension needs
+  no CLI change.
 
 Docs and examples:
 
@@ -316,33 +392,52 @@ Docs and examples:
   ...") and the counts repeated in `docs/usage.md`'s engine table, and add the
   new dimension to the example YAML snippets so they stay complete. A gated
   dimension is documented in `docs/speculative-decoding.md` as well, and its
-  applicability rule is noted in `docs/architecture.md`. A model-dependent
+  applicability rule is noted in `docs/architecture.md`. A llama.cpp-only
+  dimension also belongs in `docs/llamacpp-tuning.md`. A model-dependent
   dimension needs its pruning rule in the *Model-aware assessment* section and
   the invariant above.
 - [ ] Every example space whose backend forwards the parameter — vLLM's
   `examples/vllm/space-full.yaml`, `space-all-fixed.yaml`, `space-moe.yaml`,
   `space-speculative-defaults.yaml`, and `space-speculative-full.yaml`, and
-  llama.cpp's corresponding five under `examples/llamacpp/` — declares it, over
-  its full range or pinned to one value respectively.
-- [ ] `AGENTS.md` — update this checklist only if the parameter introduces a new
-  invariant (for example a new engine-neutral enum, or a new non-tunable field).
+  llama.cpp's corresponding six under `examples/llamacpp/` (the same five plus
+  `space-gpu-offload.yaml`) — declares it: over its full range in the complete
+  example, pinned to one value in the all-fixed example, and `default: true`
+  for unrelated knobs in a focused example. A gated dimension is declared only
+  in the examples that configure its setup.
+- [ ] `AGENTS.md` — update this checklist and its invariants only if the
+  parameter introduces a new mechanic (for example a new engine-neutral enum, a
+  new non-tunable field, a new gated set, or a new model-aware rule).
 
 Tests:
 
 - [ ] `tests/search_space/test_registry.py` — extend `TUNABLES` and the
   `expected_kind` parametrization so the canonical order and resolved kind are
-  pinned.
+  pinned, including the float kind and both gated sets.
 - [ ] `tests/search_space/test_loader.py` — extend the complete-space helper and
   its expected dimensions; the missing-tunable check makes every loader test fail
-  until the new parameter is declared.
+  until the new parameter is declared. Cover the new floor and float parsing.
+- [ ] `tests/optimization/test_mapping.py` — cover the float suggestion (a float
+  interval and float choices) and reconstruction from a fresh and a resumed
+  study, so a float value is not truncated.
 - [ ] `tests/inference/test_vllm_arguments.py` — assert the new field is
   forwarded (flat flag or JSON group) and, for a categorical, that each member
   translates and unsupported values are rejected. Add the same coverage to
   `tests/inference/test_llamacpp_arguments.py` for a parameter llama.cpp
-  forwards.
+  forwards, including both sides of every toggle and suppression of a
+  fit-family field unless fit is on.
+- [ ] `tests/inference/test_llamacpp_validate.py` and
+  `tests/inference/test_space_assessment.py` — cover the new numeric ranges,
+  gated declarations, the gated draft-cache conflict, and each model-aware
+  pruning or bound with a readable and an unreadable checkpoint.
+- [ ] `tests/cli/test_arguments.py` + `tests/cli/test_config.py` — cover a new
+  CLI flag's default, its explicit value, and the usage error for a dependent
+  option.
+- [ ] `tests/search_space/test_examples.py` — load every shipped space against
+  its backend so a missing declaration fails the suite.
 - [ ] Any other test that constructs a full `LLMConfig`, a complete
   `ExperimentSpace`, or asserts the canonical dimension order.
-- [ ] Run `uv run ruff format .`, `uv run ruff check .`, `uv run ty check`, and `uv run pytest`.
+- [ ] Run `uv run ruff format .`, `uv run ruff check .`, `uv run ty check`, and
+  `uv run pytest`.
 
 ### Data flow
 

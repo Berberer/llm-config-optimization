@@ -112,6 +112,35 @@ class CpuMoeMode(StrEnum):
     ALL = "all"
 
 
+class LoadMode(StrEnum):
+    """How an engine loads a checkpoint's weights into memory.
+
+    The members name the loading strategy, not any one engine's spelling: a
+    backend maps them to its own names, so :attr:`MMAP_MLOCK` may become an
+    engine's ``mmap+mlock``. :attr:`AUTO` leaves the choice to the engine, and
+    the remaining members select a specific strategy.
+    """
+
+    AUTO = "auto"
+    NONE = "none"
+    MMAP = "mmap"
+    MLOCK = "mlock"
+    MMAP_MLOCK = "mmap_mlock"
+    DIO = "dio"
+
+
+class FitMode(StrEnum):
+    """Whether an engine may rewrite arguments to fit the available memory.
+
+    This is a correctness pin rather than a tuning knob: enabling it lets the
+    engine adjust the declared configuration to fit the device, while disabling
+    it makes a run measure the arguments the search space declared.
+    """
+
+    ON = "on"
+    OFF = "off"
+
+
 class AttentionBackend(StrEnum):
     """Attention implementation to use, named engine-neutrally.
 
@@ -174,6 +203,18 @@ class SpeculativeMode(StrEnum):
 
     ENABLED = "enabled"
     DISABLED = "disabled"
+
+
+class SpecDraftSampling(StrEnum):
+    """How a speculative draft model samples the tokens it proposes.
+
+    :attr:`GREEDY` drafts the most likely token at each step, while
+    :attr:`PROBABILISTIC` samples from the draft distribution. The choice trades
+    the acceptance rate against the diversity of the proposals.
+    """
+
+    GREEDY = "greedy"
+    PROBABILISTIC = "probabilistic"
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,6 +461,15 @@ class LLMConfig:
     disabled mode starts the engine with no speculative flags at all, so the
     draft model's memory is genuinely freed.
 
+    The draft-only fields shape a separate draft model and apply exactly when
+    one is configured: :attr:`spec_draft_n_min` and :attr:`spec_draft_p_split`
+    control the depth and split probability of drafting,
+    :attr:`spec_draft_sampling` selects greedy or probabilistic drafting, and
+    :attr:`n_gpu_layers_draft`, :attr:`n_cpu_moe_draft`, and
+    :attr:`draft_kv_cache_dtype` place the draft's layers and cache. They are
+    llama.cpp-only, and like the main offload counts the two draft offload
+    fields are int-or-enum unions.
+
     :attr:`prefix_caching` is a boolean toggle, forwarded as the enabling flag
     or its disabling counterpart so both sides of the switch are explicit.
     :attr:`n_gpu_layers` is an int-or-enum union: an exact offloaded-layer count
@@ -437,6 +487,41 @@ class LLMConfig:
     keep every one of them there. It is an int-or-enum union like
     :attr:`n_gpu_layers`, and it is llama.cpp-only, so vLLM rejects it.
 
+    :attr:`n_cpu_ffn` keeps the dense feed-forward weights of an exact number of
+    layers in system RAM, :attr:`kv_offload` offloads the KV cache to the device,
+    and :attr:`op_offload` lets the engine run tensor operations there.
+    :attr:`host_buffer` and :attr:`repack` toggle the host buffer and weight
+    repacking, :attr:`swa_full` selects a full-size sliding-window cache, and
+    :attr:`load_mode` chooses how the checkpoint's weights are loaded. All of
+    them are llama.cpp-only and use positive semantics, so the backend maps a
+    ``True`` to the enabling flag and a ``False`` to the disabling one.
+
+    The cache and scheduling fields are llama.cpp-only as well.
+    :attr:`cache_ram` bounds the host prompt cache in MiB, where ``-1`` means no
+    limit and ``0`` disables it; :attr:`ctx_checkpoints` sizes the per-slot
+    context-checkpoint cache and :attr:`checkpoint_min_step` the minimum token
+    spacing between checkpoints, with ``0`` meaning no minimum. The booleans
+    :attr:`kv_unified`, :attr:`continuous_batching`, and :attr:`cache_idle_slots`
+    toggle a unified KV buffer, continuous batching, and idle-slot caching, again
+    with positive semantics.
+
+    :attr:`max_num_batched_tokens` and :attr:`ubatch_size` split llama.cpp's
+    logical and physical batches: the first is the logical batch size and the
+    second the micro-batch the engine processes at once, so prefill batching can
+    be tuned without changing the logical batch. vLLM forwards only its own
+    batching cap and omits :attr:`ubatch_size`.
+
+    The CPU and process fields are llama.cpp-only as well. :attr:`threads` and
+    :attr:`threads_batch` size the generation and prompt-processing thread
+    pools, while :attr:`poll` selects the engine's busy-wait polling level and
+    :attr:`prio` the process priority.
+
+    The fit family is a correctness pin rather than a tuning knob, so it stays
+    out of the search space: :attr:`fit` chooses whether llama.cpp may rewrite
+    arguments to fit memory, and :attr:`fit_target` and :attr:`fit_ctx` give
+    its optional target margin and minimum context. They are llama.cpp-only,
+    fixed for a run, and suppressed unless :attr:`fit` is enabled.
+
     :attr:`resolved_draft_path` is a resolution artifact like
     :class:`BenchmarkConfig`'s ``resolved_path``: it holds the local path the
     composition root fetched the draft to, and a backend never forwards it to
@@ -444,27 +529,54 @@ class LLMConfig:
     and planning.
     """
 
-    dtype: DType | None = None
-    quantization: QuantizationMethod | None = None
-    kv_cache_dtype: KVCacheDType | None = None
     max_model_len: int | None = None
     max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
     max_num_active_seqs: int | None = None
     max_num_scheduled_tokens: int | None = None
-    gpu_memory_utilization: float | None = None
-    tensor_parallel_size: int | None = None
-    seed: int | None = None
+    ubatch_size: int | None = None
+    dtype: DType | None = None
+    quantization: QuantizationMethod | None = None
+    kv_cache_dtype: KVCacheDType | None = None
     attention_backend: AttentionBackend | None = None
+    n_gpu_layers: int | GpuLayersMode | None = None
+    n_cpu_moe: int | CpuMoeMode | None = None
+    n_cpu_ffn: int | None = None
+    kv_offload: bool | None = None
+    op_offload: bool | None = None
+    host_buffer: bool | None = None
+    repack: bool | None = None
+    swa_full: bool | None = None
+    load_mode: LoadMode | None = None
+    prefix_caching: bool | None = None
+    cache_ram: int | None = None
+    ctx_checkpoints: int | None = None
+    checkpoint_min_step: int | None = None
+    kv_unified: bool | None = None
+    continuous_batching: bool | None = None
+    cache_idle_slots: bool | None = None
+    tensor_parallel_size: int | None = None
+    expert_parallel: bool | None = None
+    all2all_backend: All2AllBackend | None = None
     speculative_method: SpeculativeMethod | None = None
     draft_model: str | None = None
     speculative_mode: SpeculativeMode | None = None
     num_speculative_tokens: int | None = None
-    prefix_caching: bool | None = None
-    n_gpu_layers: int | GpuLayersMode | None = None
-    expert_parallel: bool | None = None
-    all2all_backend: All2AllBackend | None = None
-    n_cpu_moe: int | CpuMoeMode | None = None
+    spec_draft_n_min: int | None = None
+    spec_draft_p_split: float | None = None
+    spec_draft_sampling: SpecDraftSampling | None = None
+    n_gpu_layers_draft: int | GpuLayersMode | None = None
+    n_cpu_moe_draft: int | CpuMoeMode | None = None
+    draft_kv_cache_dtype: KVCacheDType | None = None
+    threads: int | None = None
+    threads_batch: int | None = None
+    poll: int | None = None
+    prio: int | None = None
+    fit: FitMode | None = None
+    fit_target: int | None = None
+    fit_ctx: int | None = None
+    seed: int | None = None
+    gpu_memory_utilization: float | None = None
     resolved_draft_path: Path | None = None
 
 

@@ -210,6 +210,86 @@ def test_a_checkpoint_without_an_expert_count_reports_none(tmp_path: Path) -> No
     assert read_gguf_metadata(model) == GgufMetadata(quantization=None, expert_count=None)
 
 
+@pytest.mark.parametrize("architecture", ["gemma2", "qwen2", "gpt-oss"])
+def test_the_architecture_sliding_window_is_reported(architecture: str, tmp_path: Path) -> None:
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {
+            "general.architecture": architecture,
+            f"{architecture}.attention.sliding_window": 4096,
+        },
+    )
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, sliding_window=4096)
+
+
+def test_a_sliding_window_is_reported_without_a_declared_architecture(tmp_path: Path) -> None:
+    model = _write_gguf(tmp_path / "model.gguf", {"gemma2.attention.sliding_window": 4096})
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, sliding_window=4096)
+
+
+def test_only_the_declared_architecture_sliding_window_is_reported(tmp_path: Path) -> None:
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {
+            "general.architecture": "llama",
+            "llama.attention.sliding_window": 2048,
+            "gemma2.attention.sliding_window": 4096,
+        },
+    )
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, sliding_window=2048)
+
+
+def test_an_ambiguous_sliding_window_is_not_reported(tmp_path: Path) -> None:
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {"llama.attention.sliding_window": 2048, "gemma2.attention.sliding_window": 4096},
+    )
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None)
+
+
+def test_a_zero_sliding_window_is_reported(tmp_path: Path) -> None:
+    """A readable checkpoint that declares no window is confidently full-attention."""
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {"general.architecture": "llama", "llama.attention.sliding_window": 0},
+    )
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, sliding_window=0)
+
+
+def test_a_boolean_sliding_window_is_not_reported(tmp_path: Path) -> None:
+    """A boolean is an ``int`` subclass, so it must not count as a window size."""
+    model = _write_gguf(tmp_path / "model.gguf", {"llama.attention.sliding_window": True})
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None)
+
+
+def test_a_checkpoint_without_a_sliding_window_reports_none(tmp_path: Path) -> None:
+    model = _write_gguf(tmp_path / "model.gguf", {"general.architecture": "llama"})
+
+    assert read_gguf_metadata(model) == GgufMetadata(quantization=None, sliding_window=None)
+
+
+def test_the_structure_and_sliding_window_facts_are_reported_together(tmp_path: Path) -> None:
+    model = _write_gguf(
+        tmp_path / "model.gguf",
+        {
+            "general.architecture": "gemma2",
+            "gemma2.block_count": 42,
+            "gemma2.expert_count": 8,
+            "gemma2.attention.sliding_window": 4096,
+        },
+    )
+
+    assert read_gguf_metadata(model) == GgufMetadata(
+        quantization=None, block_count=42, expert_count=8, sliding_window=4096
+    )
+
+
 def test_block_and_expert_counts_are_reported_together(tmp_path: Path) -> None:
     model = _write_gguf(
         tmp_path / "model.gguf",

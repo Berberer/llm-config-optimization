@@ -13,23 +13,61 @@
 # the counts you want to compare, for example `categorical: [auto, 0, 8, 16, all]`;
 # a count above the block count is rejected by the model-aware validation.
 #
-# Only the eight parameters llama-server forwards are declared. `dtype` and
-# `tensor_parallel_size` are not applicable to a GGUF checkpoint. `n_cpu_moe`
-# defers to the engine so it stays out of this GPU-offload comparison.
+# Only the parameters llama-server forwards are declared, in canonical registry
+# order. `dtype` and `tensor_parallel_size` are not applicable to a GGUF
+# checkpoint. `n_cpu_moe` defers to the engine so it stays out of this
+# GPU-offload comparison, and the draft-only dimensions stay out because no
+# `--draft-model` is configured.
 space:
-  kv_cache_dtype:
-    fixed: float16
   max_model_len:
     fixed: 4096
   max_num_seqs:
     fixed: 64
   max_num_batched_tokens:
     fixed: 4096
+  ubatch_size:
+    default: true
+  kv_cache_dtype:
+    fixed: float16
   attention_backend:
     default: true
-  prefix_caching:
-    fixed: true
   n_gpu_layers:
     categorical: [auto, 0, all]
   n_cpu_moe:
+    default: true
+  n_cpu_ffn:
+    default: true
+  kv_offload:
+    default: true
+  op_offload:
+    default: true
+  host_buffer:
+    default: true
+  repack:
+    default: true
+  swa_full:
+    default: true
+  load_mode:
+    default: true
+  prefix_caching:
+    fixed: true
+  cache_ram:
+    default: true
+  ctx_checkpoints:
+    default: true
+  checkpoint_min_step:
+    default: true
+  kv_unified:
+    default: true
+  continuous_batching:
+    default: true
+  cache_idle_slots:
+    default: true
+  threads:
+    default: true
+  threads_batch:
+    default: true
+  poll:
+    default: true
+  prio:
     default: true

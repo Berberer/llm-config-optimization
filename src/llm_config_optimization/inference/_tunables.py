@@ -24,14 +24,17 @@ from .types import ExperimentError
 class Toggle:
     """A boolean tunable forwarded as one of two opposite flags.
 
-    The engine is told both sides of the switch explicitly, so ``False`` is a
-    real configuration rather than an omitted default. ``enabled`` is emitted
-    for ``True`` and ``disabled`` for ``False``; an unset value emits neither.
-    The flag spellings stay in the backend that owns the engine.
+    The engine is told both sides of the switch explicitly when it offers both,
+    so ``False`` is a real configuration rather than an omitted default.
+    ``enabled`` is emitted for ``True`` and ``disabled`` for ``False``; an unset
+    value emits neither. A side may be absent when the engine exposes only one
+    of the two flags: the absent side then emits nothing rather than inventing
+    a flag the engine does not know. The flag spellings stay in the backend
+    that owns the engine.
     """
 
-    enabled: str
-    disabled: str
+    enabled: str | None = None
+    disabled: str | None = None
 
 
 def toggle_arguments(value: object, target: Toggle) -> list[str]:
@@ -42,8 +45,11 @@ def toggle_arguments(value: object, target: Toggle) -> list[str]:
     ``value`` is typed as ``object`` because it arrives from an untyped
     parameter mapping; the toggle is only used for a boolean field, and
     ``True`` is matched by identity so no other value can masquerade as on.
+    A one-sided toggle emits nothing for its absent side, leaving the engine's
+    own default in place.
     """
-    return [target.enabled] if value is True else [target.disabled]
+    flag = target.enabled if value is True else target.disabled
+    return [flag] if flag is not None else []
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,9 +2,12 @@
 # with nothing for the optimizer to search. A sweep over this space runs exactly
 # one configuration, which is useful as a reference point before widening it.
 #
-# Only the eight parameters llama-server forwards are declared. `dtype` and
-# `tensor_parallel_size` are absent by design: a GGUF file carries its own
-# numerical format and llama.cpp has no tensor parallelism.
+# Only the parameters llama-server forwards are declared, in canonical registry
+# order. `dtype` and `tensor_parallel_size` are absent by design: a GGUF file
+# carries its own numerical format and llama.cpp has no tensor parallelism. The
+# draft-only dimensions are absent too; they become applicable only with a
+# configured `--draft-model`, which this GPU-only non-speculative baseline does
+# not set.
 #
 # Quantization is not part of the space either: the GGUF file's metadata is the
 # checkpoint's quantization, so there is no `--quantization` flag to set.
@@ -12,23 +15,59 @@
 # This baseline is GPU-only: `n_gpu_layers` offloads every layer, which a
 # CPU-only host cannot serve. Use `fixed: auto` there instead.
 space:
-  kv_cache_dtype:
-    fixed: float16
   max_model_len:
     fixed: 4096
   max_num_seqs:
     fixed: 64
   max_num_batched_tokens:
     fixed: 4096
+  ubatch_size:
+    fixed: 2048
+  kv_cache_dtype:
+    fixed: float16
   # `flash_attention` maps to `--flash-attn on`; use `default: true` instead on
   # a host whose build has no flash-attention support.
   attention_backend:
     fixed: flash_attention
-  prefix_caching:
-    fixed: true
   n_gpu_layers:
     fixed: all
   # A dense checkpoint has no experts to keep on the CPU, and the baseline
   # pins the offload off rather than leaving it to the engine.
   n_cpu_moe:
+    fixed: 0
+  n_cpu_ffn:
+    fixed: 0
+  kv_offload:
+    fixed: true
+  op_offload:
+    fixed: true
+  host_buffer:
+    fixed: false
+  repack:
+    fixed: true
+  swa_full:
+    fixed: false
+  load_mode:
+    fixed: mmap
+  prefix_caching:
+    fixed: true
+  cache_ram:
+    fixed: 1024
+  ctx_checkpoints:
+    fixed: 4
+  checkpoint_min_step:
+    fixed: 0
+  kv_unified:
+    fixed: true
+  continuous_batching:
+    fixed: true
+  cache_idle_slots:
+    fixed: false
+  threads:
+    fixed: 8
+  threads_batch:
+    fixed: 8
+  poll:
+    fixed: 50
+  prio:
     fixed: 0
