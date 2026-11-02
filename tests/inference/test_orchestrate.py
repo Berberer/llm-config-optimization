@@ -13,9 +13,19 @@ tail.
 These tests inject a fake hardware detector, a fake backend, a fake benchmark
 client, and the shared fake Podman client, so no daemon, inference engine, or
 specific hardware is required.
+
+Memory sampling is wired into the same lifecycle: the idle device baseline is
+read before the container exists, sampling begins once it is up, the sampler is
+handed to the benchmark client so each measured run can be bracketed, and it is
+stopped on every exit path — success, failure, and interrupt — before the
+result is returned. The host sampler itself is replaced here, so no test runs
+``nvidia-smi`` or ``rocm-smi``, and a test that cares about the numbers injects
+its own sampler.
 """
 
+from collections.abc import Callable
 from dataclasses import replace
+from typing import Self
 
 import pytest
 from podman.errors import APIError
@@ -29,12 +39,20 @@ from llm_config_optimization.inference import (
     ExperimentConfig,
     ExperimentError,
     ExperimentResult,
+    GpuMemory,
     HardwareTarget,
     InferenceBackend,
     LLMConfig,
+    MemoryProbe,
+    ResourceMarker,
+    ResourceSample,
+    ResourceSampler,
+    ResourceUsage,
     RunMetrics,
+    SamplerFactory,
     ServerSpec,
     measure_dataset_request_tokens,
+    memory_probe_for,
     run_experiment,
 )
 from llm_config_optimization.runtime import ContainerConfig, ContainerResult, ContainerRunError
@@ -52,6 +70,9 @@ _SPEC = ServerSpec(
 )
 
 _ROOT_CAUSE = "AssertionError: ChunkGatedDeltaRuleFunction does not support float32"
+
+_GIB = 1024**3
+"""One gibibyte, so a memory assertion reads at the unit a user would quote."""
 
 
 def _engine_output(root_cause: str, *, frames: int) -> bytes:
@@ -156,6 +177,124 @@ def _detector(
     return detector
 
 
+class FakeSampler:
+    """A canned resource sampler that records its lifecycle and construction.
+
+    It stands in for the host sampler the orchestrator would otherwise build, so
+    a test never runs a vendor tool. ``events`` timestamps the start and stop
+    calls when a test pins the lifecycle order, ``lifetime`` is the peak the
+    sampler answers with, and the arguments the orchestrator's host sampler was
+    built from are kept so a test can pin what it was handed.
+    """
+
+    def __init__(
+        self,
+        *,
+        ram_reader: Callable[[], int | None] | None = None,
+        container_id: str = "",
+        baseline_vram_bytes: int | None = None,
+        probe: MemoryProbe | None = None,
+        lifetime: ResourceUsage | None = None,
+        events: list[str] | None = None,
+    ) -> None:
+        self.ram_reader = ram_reader
+        self.container_id = container_id
+        self.baseline_vram_bytes = baseline_vram_bytes
+        self.probe = probe
+        self.events = events if events is not None else []
+        self._lifetime = lifetime if lifetime is not None else ResourceUsage()
+        self.starts = 0
+        self.stops = 0
+
+    def start(self) -> None:
+        self.starts += 1
+        self.events.append("sampler_start")
+
+    def stop(self) -> None:
+        self.stops += 1
+        self.events.append("sampler_stop")
+
+    def mark(self) -> ResourceMarker:
+        return 0
+
+    def samples(self, since: ResourceMarker) -> tuple[ResourceSample, ...]:
+        return ()
+
+    def peak(self, since: ResourceMarker) -> ResourceUsage:
+        return ResourceUsage()
+
+    def lifetime_peak(self) -> ResourceUsage:
+        return self._lifetime
+
+
+class RecordingProbe:
+    """A vendor memory probe that records its selection and its reads.
+
+    ``targets`` keeps the target the probe was selected for, and ``events``
+    timestamps each idle-device reading, so a test can pin that the baseline is
+    taken from the detected target's probe before the container exists.
+    """
+
+    def __init__(self, memory: GpuMemory, events: list[str]) -> None:
+        self.memory = memory
+        self.events = events
+        self.targets: list[HardwareTarget] = []
+        self.reads = 0
+
+    def selected_for(self, target: HardwareTarget) -> Self:
+        self.targets.append(target)
+        return self
+
+    def __call__(self) -> GpuMemory:
+        self.reads += 1
+        self.events.append("probe")
+        return self.memory
+
+
+@pytest.fixture(autouse=True)
+def host_samplers(monkeypatch: pytest.MonkeyPatch) -> list[FakeSampler]:
+    """Replace the host sampler so no test shells out to a vendor tool.
+
+    ``run_experiment`` builds its sampler from the detected target's vendor
+    probe; a unit test must not run ``nvidia-smi`` or ``rocm-smi``, so the probe
+    selection reports nothing and the sampler is a recording stand-in that
+    answers no measurement. The returned list holds every sampler the default
+    factory built. A test that scripted numbers supplies its own
+    ``sampler_factory`` instead.
+    """
+    monkeypatch.setattr(
+        "llm_config_optimization.inference._orchestrate.memory_probe_for",
+        lambda target: None,
+    )
+    samplers: list[FakeSampler] = []
+
+    def build(**kwargs: object) -> FakeSampler:
+        sampler = FakeSampler(**kwargs)  # type: ignore[arg-type]
+        samplers.append(sampler)
+        return sampler
+
+    monkeypatch.setattr(
+        "llm_config_optimization.inference._orchestrate.ThreadedResourceSampler", build
+    )
+    return samplers
+
+
+def _sampler_factory(sampler: FakeSampler) -> SamplerFactory:
+    """Return an orchestrator sampler factory that always builds ``sampler``."""
+    return lambda handle, baseline, probe: sampler
+
+
+def _memory_probe(
+    monkeypatch: pytest.MonkeyPatch, events: list[str], used_bytes: int
+) -> RecordingProbe:
+    """Install a recording vendor probe as the memory probe for any target."""
+    probe = RecordingProbe(GpuMemory(used_bytes=used_bytes), events)
+    monkeypatch.setattr(
+        "llm_config_optimization.inference._orchestrate.memory_probe_for", probe.selected_for
+    )
+    return probe
+
+
 def test_detect_plan_start_measure_stop_and_parse_happen_in_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -170,7 +309,8 @@ def test_detect_plan_start_measure_stop_and_parse_happen_in_order(
 
     assert events == ["detect", "plan", "create", "parse_result"]
     assert detector.overrides == [None]
-    assert result is backend.result
+    assert result == backend.result
+    assert result.lifetime_resources == ResourceUsage()
     assert len(benchmark.calls) == 1
     assert client.container is not None
     assert client.container.stopped is True
@@ -224,6 +364,203 @@ def test_the_started_containers_liveness_is_passed_to_the_benchmark_client(
     assert is_alive() is False
 
 
+def test_sampling_starts_with_the_container_and_stops_before_the_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sampler brackets the container's whole life, not just the sweep's end."""
+    events: list[str] = []
+    client = RecordingPodmanClient(events)
+    backend = FakeBackend(_SPEC, _result(), events)
+    sampler = FakeSampler(events=events)
+    _detector(monkeypatch, events)
+
+    run_experiment(
+        _experiment(),
+        backend,
+        client=client,
+        benchmark_client=FakeBenchmarkClient(_outcome()),
+        sampler_factory=_sampler_factory(sampler),
+    )
+
+    assert events == [
+        "detect",
+        "plan",
+        "create",
+        "sampler_start",
+        "sampler_stop",
+        "parse_result",
+    ]
+    assert (sampler.starts, sampler.stops) == (1, 1)
+    assert client.container is not None
+    assert client.container.stopped is True
+
+
+def test_the_measured_runs_are_bracketed_by_the_sampler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The client receives the sampler so each measured run records its window."""
+    events: list[str] = []
+    sampler = FakeSampler()
+    benchmark = FakeBenchmarkClient(_outcome())
+    _detector(monkeypatch, events)
+
+    run_experiment(
+        _experiment(),
+        FakeBackend(_SPEC, _result(), events),
+        client=RecordingPodmanClient(events),
+        benchmark_client=benchmark,
+        sampler_factory=_sampler_factory(sampler),
+    )
+
+    assert benchmark.samplers == [sampler]
+
+
+def test_the_lifetime_peak_is_attached_to_the_parsed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole-container peak rides on the result the backend parsed."""
+    events: list[str] = []
+    lifetime = ResourceUsage(peak_vram_bytes=20 * _GIB, peak_ram_bytes=6 * _GIB)
+    sampler = FakeSampler(lifetime=lifetime)
+    backend = FakeBackend(_SPEC, _result(), events)
+    _detector(monkeypatch, events)
+
+    result = run_experiment(
+        _experiment(),
+        backend,
+        client=RecordingPodmanClient(events),
+        benchmark_client=FakeBenchmarkClient(_outcome()),
+        sampler_factory=_sampler_factory(sampler),
+    )
+
+    assert result.lifetime_resources == lifetime
+    assert result.runs == backend.result.runs
+    assert result.target == backend.result.target
+    assert result.raw_result == backend.result.raw_result
+
+
+def test_the_idle_vram_baseline_is_read_before_the_container_starts(
+    monkeypatch: pytest.MonkeyPatch, host_samplers: list[FakeSampler]
+) -> None:
+    """A device-level VRAM figure needs the device's state before the trial ran."""
+    events: list[str] = []
+    _detector(monkeypatch, events, DetectedHardware(HardwareTarget.CUDA, 1))
+    probe = _memory_probe(monkeypatch, events, used_bytes=512)
+
+    run_experiment(
+        _experiment(),
+        FakeBackend(_SPEC, _result(), events),
+        client=RecordingPodmanClient(events),
+        benchmark_client=FakeBenchmarkClient(_outcome()),
+    )
+
+    assert events[:4] == ["detect", "plan", "probe", "create"]
+    assert probe.reads == 1
+    assert probe.targets == [HardwareTarget.CUDA]
+    (sampler,) = host_samplers
+    assert sampler.baseline_vram_bytes == 512
+    assert sampler.probe is probe
+
+
+def test_the_host_sampler_reads_ram_through_the_running_containers_handle(
+    monkeypatch: pytest.MonkeyPatch, host_samplers: list[FakeSampler]
+) -> None:
+    """Container memory stays the runtime's business; the sampler only asks it."""
+    events: list[str] = []
+    client = RecordingPodmanClient(events, stats_payload={"Stats": [{"MemUsage": 4096}]})
+    _detector(monkeypatch, events, DetectedHardware(HardwareTarget.CUDA, 1))
+    _memory_probe(monkeypatch, events, used_bytes=512)
+
+    run_experiment(
+        _experiment(),
+        FakeBackend(_SPEC, _result(), events),
+        client=client,
+        benchmark_client=FakeBenchmarkClient(_outcome()),
+    )
+
+    (sampler,) = host_samplers
+    assert sampler.ram_reader is not None
+    assert sampler.ram_reader() == 4096
+    assert sampler.container_id == client.container_id
+
+
+def test_a_cpu_target_is_sampled_without_a_vendor_probe(
+    monkeypatch: pytest.MonkeyPatch, host_samplers: list[FakeSampler]
+) -> None:
+    """A CPU sweep still reports RAM, and never fabricates a VRAM number."""
+    events: list[str] = []
+    monkeypatch.setattr(
+        "llm_config_optimization.inference._orchestrate.memory_probe_for", memory_probe_for
+    )
+    _detector(monkeypatch, events, DetectedHardware(HardwareTarget.CPU, 1))
+
+    run_experiment(
+        _experiment(),
+        FakeBackend(_SPEC, _result(), events),
+        client=RecordingPodmanClient(events),
+        benchmark_client=FakeBenchmarkClient(_outcome()),
+    )
+
+    (sampler,) = host_samplers
+    assert sampler.probe is None
+    assert sampler.baseline_vram_bytes is None
+
+
+def test_a_sampler_that_cannot_measure_leaves_the_result_unmeasured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken sampler is a diagnostic gap, never a failed trial."""
+    events: list[str] = []
+
+    class BrokenSampler(FakeSampler):
+        def start(self) -> None:
+            raise RuntimeError("no probe")
+
+        def stop(self) -> None:
+            raise RuntimeError("no probe")
+
+        def lifetime_peak(self) -> ResourceUsage:
+            raise RuntimeError("no probe")
+
+    _detector(monkeypatch, events)
+
+    result = run_experiment(
+        _experiment(),
+        FakeBackend(_SPEC, _result(), events),
+        client=RecordingPodmanClient(events),
+        benchmark_client=FakeBenchmarkClient(_outcome()),
+        sampler_factory=_sampler_factory(BrokenSampler()),
+    )
+
+    assert result.lifetime_resources == ResourceUsage()
+
+
+def test_a_failing_sampler_factory_still_tears_the_container_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Building the sampler is part of the guarded lifecycle, not before it."""
+    events: list[str] = []
+    client = RecordingPodmanClient(events)
+    _detector(monkeypatch, events)
+
+    def failing_factory(
+        handle: object, baseline_vram_bytes: int | None, probe: object
+    ) -> ResourceSampler:
+        raise RuntimeError("cannot build a sampler")
+
+    with pytest.raises(RuntimeError, match="cannot build a sampler"):
+        run_experiment(
+            _experiment(),
+            FakeBackend(_SPEC, _result(), events),
+            client=client,
+            benchmark_client=FakeBenchmarkClient(_outcome()),
+            sampler_factory=failing_factory,
+        )
+
+    assert client.container is not None
+    assert client.container.remove_calls == [True]
+
+
 def test_container_target_override_reaches_detection(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     client = RecordingPodmanClient(events)
@@ -263,9 +600,13 @@ def test_a_server_without_a_published_port_cannot_be_measured(
 
 
 def test_dataset_preflight_tokenizes_once_and_stops_the_server(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, host_samplers: list[FakeSampler]
 ) -> None:
-    """The preflight starts a one-slot server, tokenizes, and tears it down."""
+    """The preflight starts a one-slot server, tokenizes, and tears it down.
+
+    Only the sweep's trials are measured; tokenizing a dataset takes no memory
+    sample, so the preflight builds no sampler and brackets no run.
+    """
     events: list[str] = []
     client = RecordingPodmanClient(events)
     spec = ServerSpec(
@@ -304,6 +645,8 @@ def test_dataset_preflight_tokenizes_once_and_stops_the_server(
     assert measured_spec is spec
     assert measured_benchmark is experiment.benchmark
     assert benchmark.liveness[0] is not None
+    assert benchmark.samplers == []
+    assert host_samplers == []
     assert client.container is not None
     assert client.container.stopped is True
 
@@ -483,6 +826,89 @@ def test_stop_failure_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
     assert client.container.remove_calls == [True]
 
 
+def test_a_failed_measurement_still_stops_the_sampler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A trial that never became usable must not leave an observer behind."""
+    events: list[str] = []
+    sampler = FakeSampler(events=events)
+    client = RecordingPodmanClient(events)
+    benchmark = FakeBenchmarkClient(
+        measure_error=ExperimentError("the server never became healthy")
+    )
+    _detector(monkeypatch, events)
+
+    with pytest.raises(ExperimentError, match="never became healthy"):
+        run_experiment(
+            _experiment(),
+            FakeBackend(_SPEC, _result(), events),
+            client=client,
+            benchmark_client=benchmark,
+            sampler_factory=_sampler_factory(sampler),
+        )
+
+    assert events == ["detect", "plan", "create", "sampler_start", "sampler_stop"]
+    assert client.container is not None
+    assert client.container.remove_calls == [True]
+
+
+def test_an_interrupted_trial_still_stops_the_sampler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt leaves neither a container nor a sampler polling the host."""
+    events: list[str] = []
+    sampler = FakeSampler()
+    client = RecordingPodmanClient(events)
+    _detector(monkeypatch, events)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_experiment(
+            _experiment(),
+            FakeBackend(_SPEC, _result(), events),
+            client=client,
+            benchmark_client=FakeBenchmarkClient(measure_error=KeyboardInterrupt()),
+            sampler_factory=_sampler_factory(sampler),
+        )
+
+    assert (sampler.starts, sampler.stops) == (1, 1)
+    assert client.container is not None
+    assert client.container.remove_calls == [True]
+
+
+def test_a_failed_container_stop_still_stops_the_sampler(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+    sampler = FakeSampler(events=events)
+    client = RecordingPodmanClient(events, stop_error=APIError("stop failed"))
+    _detector(monkeypatch, events)
+
+    with pytest.raises(ExperimentError, match="failed to stop the benchmark server"):
+        run_experiment(
+            _experiment(),
+            FakeBackend(_SPEC, _result(), events),
+            client=client,
+            benchmark_client=FakeBenchmarkClient(_outcome()),
+            sampler_factory=_sampler_factory(sampler),
+        )
+
+    assert sampler.stops == 1
+    assert events == ["detect", "plan", "create", "sampler_start", "sampler_stop"]
+
+
+def test_a_failed_container_start_builds_no_sampler(
+    monkeypatch: pytest.MonkeyPatch, host_samplers: list[FakeSampler]
+) -> None:
+    """Nothing was started, so there is nothing to observe."""
+    events: list[str] = []
+    client = RecordingPodmanClient(events, start_error=APIError("failed to start container"))
+    _detector(monkeypatch, events)
+
+    with pytest.raises(ExperimentError):
+        run_experiment(
+            _experiment(),
+            FakeBackend(_SPEC, _result(), events),
+            client=client,
+            benchmark_client=FakeBenchmarkClient(_outcome()),
+        )
+
+    assert host_samplers == []
+
+
 def test_parse_failure_propagates_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     client = RecordingPodmanClient(events)
@@ -515,7 +941,7 @@ def test_backend_defaults_to_vllm(monkeypatch: pytest.MonkeyPatch) -> None:
         _experiment(), client=client, benchmark_client=FakeBenchmarkClient(_outcome())
     )
 
-    assert result is backend.result
+    assert result == backend.result
     assert events == ["detect", "plan", "create", "parse_result"]
 
 
@@ -527,3 +953,8 @@ def test_backend_doubles_conform_to_the_inference_protocol() -> None:
     otherwise surface only when a test happened to call it.
     """
     assert isinstance(FakeBackend(_SPEC, _result(), []), InferenceBackend)
+
+
+def test_sampler_doubles_conform_to_the_resource_sampler_protocol() -> None:
+    """The sampler stand-in tracks ``ResourceSampler`` as the protocol grows."""
+    assert isinstance(FakeSampler(), ResourceSampler)

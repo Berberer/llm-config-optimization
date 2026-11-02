@@ -11,9 +11,10 @@ know the module layout.
 
 from ._benchmark import BenchmarkClient, validate_dataset
 from ._llamacpp import LlamaCppBackend
-from ._orchestrate import measure_dataset_request_tokens, run_experiment
+from ._orchestrate import SamplerFactory, measure_dataset_request_tokens, run_experiment
+from ._resources import ThreadedResourceSampler
 from ._vllm import VLLMBackend
-from .hardware import detect_hardware
+from .hardware import GpuMemory, MemoryProbe, detect_hardware, memory_probe_for
 from .types import (
     All2AllBackend,
     AttentionBackend,
@@ -37,11 +38,16 @@ from .types import (
     LocalCheckpoint,
     ModelRequest,
     QuantizationMethod,
+    ResourceMarker,
+    ResourceSample,
+    ResourceSampler,
+    ResourceUsage,
     RunMetrics,
     ServerSpec,
     SpecDraftSampling,
     SpeculativeMethod,
     SpeculativeMode,
+    VramSource,
 )
 
 __all__ = [
@@ -59,6 +65,7 @@ __all__ = [
     "ExperimentResult",
     "FitMode",
     "GpuLayersMode",
+    "GpuMemory",
     "HardwareTarget",
     "HubCheckpoint",
     "InferenceBackend",
@@ -67,16 +74,25 @@ __all__ = [
     "LlamaCppBackend",
     "LoadMode",
     "LocalCheckpoint",
+    "MemoryProbe",
     "ModelRequest",
     "QuantizationMethod",
+    "ResourceMarker",
+    "ResourceSample",
+    "ResourceSampler",
+    "ResourceUsage",
     "RunMetrics",
+    "SamplerFactory",
     "ServerSpec",
     "SpecDraftSampling",
     "SpeculativeMethod",
     "SpeculativeMode",
+    "ThreadedResourceSampler",
     "VLLMBackend",
+    "VramSource",
     "detect_hardware",
     "measure_dataset_request_tokens",
+    "memory_probe_for",
     "run_experiment",
     "validate_dataset",
 ]

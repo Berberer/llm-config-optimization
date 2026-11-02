@@ -615,6 +615,127 @@ def _hashable(value: object) -> object:
     return value
 
 
+class VramSource(StrEnum):
+    """How a VRAM measurement attributed memory to a trial.
+
+    :attr:`PROCESS` sums the GPU processes whose cgroup names the trial's
+    container, so another workload sharing the device does not inflate the
+    number. :attr:`DEVICE` is the device-level used-memory delta against the
+    idle baseline, used when no process can be attributed. It is a measurement
+    provenance, not a vendor spelling, so the experiment surface can carry it.
+    """
+
+    PROCESS = "process"
+    DEVICE = "device"
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceUsage:
+    """One peak memory observation for a trial or a measured run.
+
+    Both fields are *peaks*, not averages, because a memory requirement is a
+    ceiling: a consumer that averaged them would understate what the
+    configuration needs. Each is ``None`` when nothing was measured — never
+    ``0`` — so "unmeasured" and "used nothing" stay distinguishable.
+
+    ``peak_vram_bytes`` is the peak accelerator memory attributed to the
+    observation; it is ``None`` on a CPU target, when no vendor memory probe was
+    available, or when the sample source failed. ``peak_ram_bytes`` is the peak
+    system memory the server container held, which deliberately includes page
+    cache so an mmap-based engine's weights count as memory the configuration
+    occupies.
+
+    How a VRAM number was obtained — per-process attribution or a device-level
+    delta against a baseline — is recorded beside the run's raw samples rather
+    than here, so this value stays a plain measurement and the engine-neutral
+    experiment surface carries no vendor vocabulary.
+    """
+
+    peak_vram_bytes: int | None = None
+    peak_ram_bytes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceSample:
+    """One timestamped memory observation behind a :class:`ResourceUsage`.
+
+    The raw samples are kept for audit: a peak alone cannot say how it was
+    obtained or whether the series was stable. ``timestamp`` is the sampler
+    clock's reading when the sample was taken, and ``vram_source`` records
+    whether the VRAM figure came from the container's own processes or from a
+    device-level delta against the idle baseline. Each value is ``None`` when
+    that half of the observation was unavailable, so an unmeasured field stays
+    distinguishable from a measured zero.
+    """
+
+    timestamp: float
+    vram_bytes: int | None = None
+    vram_source: VramSource | None = None
+    ram_bytes: int | None = None
+
+
+type ResourceMarker = int
+"""An opaque marker for a point in a sampler's observation series.
+
+A consumer gets one from :meth:`ResourceSampler.mark` and hands it back to
+:meth:`ResourceSampler.peak` or :meth:`ResourceSampler.samples`. The value
+means nothing outside the sampler that produced it, so no consumer interprets
+it as a time or an index.
+"""
+
+
+@runtime_checkable
+class ResourceSampler(Protocol):
+    """Best-effort memory measurement of a running server container.
+
+    A sampler observes a container's memory on a fixed cadence while the
+    container runs and answers peak queries over that series. A consumer
+    brackets a measured window with :meth:`mark` and :meth:`peak`, or reads
+    :meth:`lifetime_peak` for the whole-container figure. The marker
+    :meth:`mark` returns is opaque, so the consumer learns nothing about how the
+    sampler obtains its numbers.
+
+    Sampling is a diagnostic and is always best-effort: an absent vendor probe,
+    an unreadable container stat, or a failed sample leaves a field ``None``
+    rather than raising, and every query is safe to call whether or not the
+    sampler ever ran. The engine-neutral experiment surface therefore carries
+    no vendor, engine, or container vocabulary.
+    """
+
+    @property
+    def baseline_vram_bytes(self) -> int | None:
+        """The idle device memory the device-level fallback subtracts."""
+        ...
+
+    def start(self) -> None:
+        """Begin sampling; a sampler that is already running is left alone."""
+        ...
+
+    def stop(self) -> None:
+        """Stop sampling and wait for the observation to finish."""
+        ...
+
+    def mark(self) -> ResourceMarker:
+        """Record a point in the observation series and return its marker."""
+        ...
+
+    def samples(self, since: ResourceMarker) -> Sequence[ResourceSample]:
+        """The raw observations recorded at or after ``since``, oldest first."""
+        ...
+
+    def peak(self, since: ResourceMarker) -> ResourceUsage:
+        """The peak of the samples recorded at or after ``since``.
+
+        A field no sample measured stays ``None``, including when the window
+        saw no sample at all.
+        """
+        ...
+
+    def lifetime_peak(self) -> ResourceUsage:
+        """The peak over every sample the sampler recorded."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class RunMetrics:
     """The typed metrics of one measured benchmark run.
@@ -639,6 +760,11 @@ class RunMetrics:
     attribute work to one. Either is ``None`` when the run's engine did not
     report what the rate needs, so a consumer that requires a phase must check
     rather than fall back to the combined number.
+
+    ``resources`` is the peak memory observed during this run's measured window,
+    or ``None`` when the run was not bracketed by a resource sampler or nothing
+    could be measured. It describes the window only; the whole-container peak is
+    kept on :attr:`ExperimentResult.lifetime_resources`.
     """
 
     tokens_per_second: float
@@ -648,6 +774,7 @@ class RunMetrics:
     raw_json: Mapping[str, object]
     prefill_tokens_per_second: float | None = None
     decode_tokens_per_second: float | None = None
+    resources: ResourceUsage | None = None
 
     def __post_init__(self) -> None:
         """Store ``raw_json`` as a read-only view so the run is immutable."""
@@ -663,6 +790,7 @@ class RunMetrics:
                 self.num_prompts,
                 self.prefill_tokens_per_second,
                 self.decode_tokens_per_second,
+                self.resources,
                 _hashable(self.raw_json),
             )
         )
@@ -690,6 +818,22 @@ class BenchmarkOutcome:
     def raw_payloads(self) -> tuple[Mapping[str, object], ...]:
         """The raw client payload of each successful run, in run order."""
         return tuple(run.raw_json for run in self.runs)
+
+
+def _max_present(values: Iterable[int | None]) -> int | None:
+    """Largest of the values that are present, or ``None`` when none is.
+
+    A peak aggregate takes a maximum rather than a mean, and it ignores absent
+    measurements instead of treating them as zero, so a run that measured one
+    field cannot drag another run's number down.
+    """
+    present: list[int] = []
+    for value in values:
+        if value is not None:
+            present.append(value)
+    if not present:
+        return None
+    return max(present)
 
 
 def _mean_present(values: Iterable[float | None]) -> float | None:
@@ -729,6 +873,12 @@ class ExperimentResult:
     record what actually ran rather than what was requested, so a result is
     reproducible even when the image or device mapping was resolved by default.
 
+    ``lifetime_resources`` is the peak memory observed over the server
+    container's whole life — model load, health wait, warmup, and the measured
+    runs — so it is the headline hardware requirement of the configuration. It
+    defaults to an all-``None`` :class:`ResourceUsage`, which keeps results
+    built before measurements existed valid.
+
     A result must carry at least one successful run: an empty ``runs`` tuple
     cannot describe a trial, so the constructor rejects it.
     """
@@ -739,6 +889,7 @@ class ExperimentResult:
     image: str
     devices: tuple[str, ...]
     raw_result: ContainerResult
+    lifetime_resources: ResourceUsage = field(default_factory=ResourceUsage)
 
     def __post_init__(self) -> None:
         """Reject a result that carries no successful run."""
@@ -771,6 +922,21 @@ class ExperimentResult:
         return _mean_present(run.decode_tokens_per_second for run in self.runs)
 
     @property
+    def measured_peak_resources(self) -> ResourceUsage:
+        """Element-wise maximum of the runs' measured-window peaks.
+
+        The measured windows are adjacent but not contiguous, so this is the
+        maximum of the per-run peaks rather than a peak over their union; every
+        run is the single source of truth for its own window. A field no run
+        measured stays ``None`` rather than becoming zero.
+        """
+        usages = [run.resources for run in self.runs if run.resources is not None]
+        return ResourceUsage(
+            peak_vram_bytes=_max_present(usage.peak_vram_bytes for usage in usages),
+            peak_ram_bytes=_max_present(usage.peak_ram_bytes for usage in usages),
+        )
+
+    @property
     def num_prompts(self) -> int:
         """Total measured prompt count across the successful runs."""
         return sum(run.num_prompts for run in self.runs)
@@ -790,6 +956,7 @@ class ExperimentResult:
                 self.image,
                 self.devices,
                 self.raw_result,
+                self.lifetime_resources,
             )
         )
 

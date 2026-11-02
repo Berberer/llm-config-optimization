@@ -48,6 +48,7 @@ from llm_config_optimization.inference import (
     ExperimentResult,
     HardwareTarget,
     LLMConfig,
+    ResourceUsage,
     RunMetrics,
     ServerSpec,
 )
@@ -59,7 +60,7 @@ from llm_config_optimization.optimization import (
     OptimizationResult,
     optimize,
 )
-from llm_config_optimization.optimization._optuna import make_objective
+from llm_config_optimization.optimization._optuna import _project_result, make_objective
 from llm_config_optimization.runtime import ContainerConfig, ContainerResult
 from llm_config_optimization.search_space import Categorical, Dimension, ExperimentSpace, Interval
 
@@ -107,6 +108,34 @@ PHASED_RESULT = ExperimentResult(
     raw_result=RESULT.raw_result,
 )
 """The canned result with both phase rates, for the phase-aware objective modes."""
+
+MEASURED_RESULT = ExperimentResult(
+    runs=(
+        RunMetrics(
+            tokens_per_second=40.0,
+            requests_per_second=3.5,
+            elapsed_time=2.0,
+            num_prompts=8,
+            raw_json={},
+            resources=ResourceUsage(peak_vram_bytes=21_000_000_000, peak_ram_bytes=6_000),
+        ),
+        RunMetrics(
+            tokens_per_second=50.0,
+            requests_per_second=4.5,
+            elapsed_time=3.0,
+            num_prompts=8,
+            raw_json={},
+            resources=ResourceUsage(peak_vram_bytes=20_000_000_000),
+        ),
+    ),
+    failed_runs=0,
+    target=HardwareTarget.CPU,
+    image=PLAN.container.image,
+    devices=(),
+    raw_result=RESULT.raw_result,
+    lifetime_resources=ResourceUsage(peak_vram_bytes=24_000_000_000, peak_ram_bytes=7_000),
+)
+"""The canned result with a lifetime and per-run memory peak, partly measured."""
 
 WEIGHTS = ObjectiveWeights(prefill=1024, decode=128)
 """A workload token mix of 1024 prompt and 128 generated tokens per request."""
@@ -267,12 +296,16 @@ def test_a_successful_trial_records_a_serializable_result_projection() -> None:
         "image": PLAN.container.image,
         "devices": [],
         "failed_runs": 0,
+        "lifetime_peak_vram_bytes": None,
+        "lifetime_peak_ram_bytes": None,
         "runs": [
             {
                 "tokens_per_second": 42.0,
                 "requests_per_second": 4.0,
                 "prefill_tokens_per_second": None,
                 "decode_tokens_per_second": None,
+                "peak_vram_bytes": None,
+                "peak_ram_bytes": None,
             }
         ],
     }
@@ -326,12 +359,16 @@ def test_a_trial_projection_keeps_the_per_run_spread_and_failure_count() -> None
             "requests_per_second": 3.5,
             "prefill_tokens_per_second": None,
             "decode_tokens_per_second": None,
+            "peak_vram_bytes": None,
+            "peak_ram_bytes": None,
         },
         {
             "tokens_per_second": 50.0,
             "requests_per_second": 4.5,
             "prefill_tokens_per_second": None,
             "decode_tokens_per_second": None,
+            "peak_vram_bytes": None,
+            "peak_ram_bytes": None,
         },
     ]
     assert recorded["tokens_per_second"] == 45.0
@@ -388,16 +425,33 @@ def test_a_trial_projection_records_phase_rates_per_run_and_aggregated() -> None
             "requests_per_second": 3.5,
             "prefill_tokens_per_second": 1000.0,
             "decode_tokens_per_second": 50.0,
+            "peak_vram_bytes": None,
+            "peak_ram_bytes": None,
         },
         {
             "tokens_per_second": 60.0,
             "requests_per_second": 4.5,
             "prefill_tokens_per_second": 2000.0,
             "decode_tokens_per_second": None,
+            "peak_vram_bytes": None,
+            "peak_ram_bytes": None,
         },
     ]
     assert recorded["prefill_tokens_per_second"] == 1500.0
     assert recorded["decode_tokens_per_second"] == 50.0
+    assert json.loads(json.dumps(recorded)) == recorded
+
+
+def test_a_trial_projection_records_the_memory_peaks_as_plain_integers() -> None:
+    """A persisted study keeps each configuration's footprint without scoring it."""
+    recorded = _project_result(MEASURED_RESULT)
+
+    assert recorded["lifetime_peak_vram_bytes"] == 24_000_000_000
+    assert recorded["lifetime_peak_ram_bytes"] == 7_000
+    assert recorded["runs"][0]["peak_vram_bytes"] == 21_000_000_000
+    assert recorded["runs"][0]["peak_ram_bytes"] == 6_000
+    assert recorded["runs"][1]["peak_vram_bytes"] == 20_000_000_000
+    assert recorded["runs"][1]["peak_ram_bytes"] is None
     assert json.loads(json.dumps(recorded)) == recorded
 
 

@@ -22,8 +22,11 @@ from llm_config_optimization.inference import (
     ExperimentResult,
     HardwareTarget,
     LLMConfig,
+    ResourceSample,
+    ResourceUsage,
     RunMetrics,
     ServerSpec,
+    VramSource,
 )
 from llm_config_optimization.runtime import ContainerConfig, ContainerResult
 
@@ -84,12 +87,24 @@ def _server_spec() -> ServerSpec:
         (ContainerRuntimeConfig(), "shm_size", "1g"),
         (BenchmarkConfig(model=HUB_MODEL), "model", "other/model"),
         (LLMConfig(), "dtype", DType.FLOAT16),
+        (ResourceUsage(peak_vram_bytes=1), "peak_vram_bytes", 2),
+        (ResourceSample(timestamp=1.0, vram_bytes=1), "vram_bytes", 2),
         (_experiment(), "llm", LLMConfig(dtype=DType.FLOAT16)),
         (_result(), "image", "other/image"),
         (_run(), "tokens_per_second", 1.0),
         (_server_spec(), "health_path", "/ready"),
     ],
-    ids=["container", "benchmark", "llm", "experiment", "result", "run", "server"],
+    ids=[
+        "container",
+        "benchmark",
+        "llm",
+        "resources",
+        "sample",
+        "experiment",
+        "result",
+        "run",
+        "server",
+    ],
 )
 def test_config_types_are_frozen_and_hashable(
     config: object, attribute: str, value: object
@@ -190,6 +205,122 @@ def test_result_phase_rates_are_none_without_a_reporting_run() -> None:
 
     assert result.prefill_tokens_per_second is None
     assert result.decode_tokens_per_second is None
+
+
+def test_resource_usage_defaults_to_unmeasured_rather_than_zero() -> None:
+    usage = ResourceUsage()
+
+    assert usage.peak_vram_bytes is None
+    assert usage.peak_ram_bytes is None
+
+
+def test_resource_usage_hashes_equal_values_equally() -> None:
+    first = ResourceUsage(peak_vram_bytes=2048, peak_ram_bytes=1024)
+    same = ResourceUsage(peak_vram_bytes=2048, peak_ram_bytes=1024)
+    absent = ResourceUsage()
+
+    assert first == same
+    assert hash(first) == hash(same)
+    assert first != absent
+
+
+def test_resource_sample_defaults_to_unmeasured_fields() -> None:
+    sample = ResourceSample(timestamp=1.5)
+
+    assert sample.vram_bytes is None
+    assert sample.vram_source is None
+    assert sample.ram_bytes is None
+
+
+def test_resource_sample_hashes_equal_values_equally() -> None:
+    first = ResourceSample(
+        timestamp=1.0,
+        vram_bytes=2048,
+        vram_source=VramSource.PROCESS,
+        ram_bytes=1024,
+    )
+    same = ResourceSample(
+        timestamp=1.0,
+        vram_bytes=2048,
+        vram_source=VramSource.PROCESS,
+        ram_bytes=1024,
+    )
+    other_source = ResourceSample(
+        timestamp=1.0,
+        vram_bytes=2048,
+        vram_source=VramSource.DEVICE,
+        ram_bytes=1024,
+    )
+
+    assert first == same
+    assert hash(first) == hash(same)
+    assert first != other_source
+
+
+def test_run_carries_the_window_peak_it_measured() -> None:
+    usage = ResourceUsage(peak_vram_bytes=4096, peak_ram_bytes=2048)
+
+    assert _run(resources=usage).resources == usage
+    assert _run().resources is None
+
+
+def test_run_hashes_resources_and_distinguishes_them() -> None:
+    first = _run(resources=ResourceUsage(peak_vram_bytes=4096))
+    same = _run(resources=ResourceUsage(peak_vram_bytes=4096))
+    absent = _run()
+
+    assert first == same
+    assert hash(first) == hash(same)
+    assert first != absent
+    assert hash(first) != hash(absent)
+
+
+def test_result_defaults_lifetime_resources_to_unmeasured() -> None:
+    result = _result()
+
+    assert result.lifetime_resources == ResourceUsage()
+    assert result.lifetime_resources.peak_vram_bytes is None
+    assert result.lifetime_resources.peak_ram_bytes is None
+    assert result == replace(result, lifetime_resources=ResourceUsage())
+
+
+def test_result_hashes_lifetime_resources_and_distinguishes_them() -> None:
+    baseline = _result()
+    measured = replace(baseline, lifetime_resources=ResourceUsage(peak_vram_bytes=8192))
+
+    assert baseline != measured
+    assert hash(baseline) != hash(measured)
+
+
+def test_result_measured_peak_is_the_element_wise_maximum_over_runs() -> None:
+    runs = (
+        _run(resources=ResourceUsage(peak_vram_bytes=100, peak_ram_bytes=10)),
+        _run(resources=ResourceUsage(peak_vram_bytes=50, peak_ram_bytes=80)),
+        _run(),
+    )
+
+    peak = replace(_result(), runs=runs).measured_peak_resources
+
+    assert peak == ResourceUsage(peak_vram_bytes=100, peak_ram_bytes=80)
+
+
+def test_result_measured_peak_takes_each_field_from_the_run_that_reported_it() -> None:
+    runs = (
+        _run(resources=ResourceUsage(peak_vram_bytes=100)),
+        _run(resources=ResourceUsage(peak_ram_bytes=80)),
+    )
+
+    peak = replace(_result(), runs=runs).measured_peak_resources
+
+    assert peak == ResourceUsage(peak_vram_bytes=100, peak_ram_bytes=80)
+
+
+def test_result_measured_peak_is_unmeasured_without_a_reporting_run() -> None:
+    result = replace(_result(), runs=(_run(), _run()))
+
+    assert result.measured_peak_resources == ResourceUsage()
+    assert result.measured_peak_resources.peak_vram_bytes is None
+    assert result.measured_peak_resources.peak_ram_bytes is None
 
 
 def test_result_rejects_an_empty_run_set() -> None:

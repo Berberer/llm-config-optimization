@@ -6,30 +6,53 @@ server container, drives it with the host benchmark client, stops it, and hands
 the measured outcome back to the backend for parsing. It knows nothing about
 any inference engine — every engine-specific decision lives behind the injected
 backend and the engine-neutral :class:`ServerSpec` it returns.
+
+A trial's memory footprint is measured alongside its throughput. The host
+sampler is built for the started container, samples from the moment it is up —
+so the engine's model-load allocation is observed — and stops just before the
+container is torn down, so nothing polls the host after a trial ends. The whole
+container's peak rides on the parsed result. Sampling is always best-effort:
+an absent vendor probe, an unreadable container stat, or a sampler that raises
+leaves the numbers absent rather than failing the trial.
 """
 
 import re
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ..runtime import start_container
 from ..runtime.types import ContainerResult, ContainerRunError, RunningContainer
 from ._benchmark import BenchmarkClient
+from ._resources import ThreadedResourceSampler
 from ._vllm import VLLMBackend
-from .hardware import detect_hardware
+from .hardware import MemoryProbe, detect_hardware, memory_probe_for
 from .types import (
     DetectedHardware,
     ExperimentConfig,
     ExperimentError,
     ExperimentResult,
     InferenceBackend,
+    ResourceSampler,
+    ResourceUsage,
     ServerSpec,
 )
 
 if TYPE_CHECKING:
     from podman import PodmanClient
 
-__all__ = ["measure_dataset_request_tokens", "run_experiment"]
+__all__ = ["SamplerFactory", "measure_dataset_request_tokens", "run_experiment"]
+
+type SamplerFactory = Callable[[RunningContainer, int | None, MemoryProbe | None], ResourceSampler]
+"""Builds the memory sampler for a container the orchestrator just started.
+
+It receives the running container — the only place a container's RAM can be
+read — the idle VRAM baseline taken before that container started, and the
+vendor memory probe selected for the detected target (``None`` on a CPU
+target). It is injectable so a caller can substitute a sampler, and so a test
+never shells out to a vendor tool or touches a real host.
+"""
 
 
 def measure_dataset_request_tokens(
@@ -113,6 +136,7 @@ def run_experiment(
     *,
     client: PodmanClient | None = None,
     benchmark_client: BenchmarkClient | None = None,
+    sampler_factory: SamplerFactory | None = None,
 ) -> ExperimentResult:
     """Run one host-driven benchmark experiment and return its typed result.
 
@@ -132,6 +156,14 @@ def run_experiment(
     measurement client, injectable so a test needs neither a daemon nor a GPU;
     ``None`` uses the default client.
 
+    Memory is measured for every trial, silently and never as an objective: the
+    container's RAM comes through its runtime handle and VRAM from the detected
+    target's vendor probe, the idle device baseline is read before the container
+    starts, and the container's lifetime peak is attached to the parsed result.
+    ``sampler_factory`` builds that sampler for the started container;
+    ``None`` uses the host sampler. Nothing about the measurement can fail a
+    trial.
+
     Raises:
         ExperimentError: If the server container cannot be started or stopped,
             if the client fails to measure the server, or if the backend cannot
@@ -140,8 +172,9 @@ def run_experiment(
     """
     resolved_backend = backend if backend is not None else VLLMBackend()
     resolved_client = benchmark_client if benchmark_client is not None else BenchmarkClient()
+    resolved_factory = sampler_factory if sampler_factory is not None else _default_sampler
     hardware = detect_hardware(config.container.target)
-    return _run(config, resolved_backend, hardware, client, resolved_client)
+    return _run(config, resolved_backend, hardware, client, resolved_client, resolved_factory)
 
 
 def _base_url(spec: ServerSpec, handle: RunningContainer) -> str:
@@ -179,9 +212,12 @@ def _run(
     hardware: DetectedHardware,
     client: PodmanClient | None,
     benchmark_client: BenchmarkClient,
+    sampler_factory: SamplerFactory,
 ) -> ExperimentResult:
     """Plan, start, measure, stop, and parse one run."""
     spec = backend.plan(config, hardware)
+    probe = memory_probe_for(hardware.target)
+    baseline_vram_bytes = _idle_vram_bytes(probe)
     try:
         handle = start_container(spec.container, client=client)
     except ContainerRunError as exc:
@@ -190,7 +226,10 @@ def _run(
         if detail:
             message = f"{message}\n{detail}"
         raise ExperimentError(message, raw_result=exc.result) from exc
+    sampler: ResourceSampler | None = None
     try:
+        sampler = sampler_factory(handle, baseline_vram_bytes, probe)
+        _start_sampler(sampler)
         base_url = _base_url(spec, handle)
         outcome = benchmark_client.measure_sync(
             base_url,
@@ -198,21 +237,86 @@ def _run(
             spec,
             config.benchmark,
             is_alive=handle.is_running,
+            sampler=sampler,
         )
     except ExperimentError as exc:
+        _stop_sampler(sampler)
         result = _stop_with_logs(handle)
         detail = _failure_output(result)
         message = str(exc) if not detail else f"{exc}\n{detail}"
         raise ExperimentError(message, raw_result=result) from exc
     except BaseException:
+        _stop_sampler(sampler)
         handle.remove()
         raise
+    _stop_sampler(sampler)
     try:
         result = handle.stop()
     except ContainerRunError as exc:
         message = f"failed to stop the benchmark server for {config.benchmark.model!r}: {exc}"
         raise ExperimentError(message, raw_result=exc.result) from exc
-    return backend.parse_result(outcome, spec, result)
+    parsed = backend.parse_result(outcome, spec, result)
+    return replace(parsed, lifetime_resources=_lifetime_peak(sampler))
+
+
+def _default_sampler(
+    handle: RunningContainer,
+    baseline_vram_bytes: int | None,
+    probe: MemoryProbe | None,
+) -> ResourceSampler:
+    """Build the host sampler for a container the orchestrator started.
+
+    Container RAM is read through the runtime handle, so the runtime layer keeps
+    owning how a container's memory is obtained, and VRAM comes from the probe
+    selected for the detected target — absent on a CPU target. The baseline was
+    captured before the container started, so a device-level VRAM figure is the
+    trial's own growth over an idle device.
+    """
+    return ThreadedResourceSampler(
+        ram_reader=handle.memory_usage,
+        container_id=handle.container_id,
+        baseline_vram_bytes=baseline_vram_bytes,
+        probe=probe,
+    )
+
+
+def _idle_vram_bytes(probe: MemoryProbe | None) -> int | None:
+    """Read the device's used memory before a trial's container starts.
+
+    The device-level VRAM fallback subtracts this baseline, so it must be
+    observed while nothing of this trial is running. A CPU target has no probe
+    and a failed query yields no baseline; neither fails the trial.
+    """
+    if probe is None:
+        return None
+    try:
+        return probe().used_bytes
+    except Exception:
+        return None
+
+
+def _start_sampler(sampler: ResourceSampler) -> None:
+    """Begin sampling, treating a sampler failure as "nothing measured"."""
+    with suppress(Exception):
+        sampler.start()
+
+
+def _stop_sampler(sampler: ResourceSampler | None) -> None:
+    """End sampling, treating an absent or failing sampler as "nothing measured"."""
+    if sampler is None:
+        return
+    with suppress(Exception):
+        sampler.stop()
+
+
+def _lifetime_peak(sampler: ResourceSampler | None) -> ResourceUsage:
+    """Return the whole-container peak, or an unmeasured usage when unreadable."""
+    if sampler is None:
+        return ResourceUsage()
+    try:
+        return sampler.lifetime_peak()
+    except Exception:
+        return ResourceUsage()
 
 
 _FAILURE_OUTPUT_LIMIT = 2000

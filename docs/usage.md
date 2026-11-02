@@ -1,9 +1,9 @@
 # Usage reference
 
 This guide covers engine selection, the benchmark workload, objectives and phase
-metrics, every command-line option, study persistence, exit codes, and complete
-example calls. For installation and the command synopsis see the
-[README](../README.md#quick-start).
+metrics, the measured memory footprint, every command-line option, study
+persistence, exit codes, and complete example calls. For installation and the
+command synopsis see the [README](../README.md#quick-start).
 
 ## Engines
 
@@ -131,6 +131,98 @@ error.
 > are **not comparable** to the combined throughput — and because a study
 > records the phase-metric schema version its scores were measured under,
 > numbers from different versions are not comparable either.
+
+## Memory footprint
+
+Every trial also reports how much memory its configuration holds, so a
+throughput gain can be weighed against the hardware it needs. Measurement is
+always on and needs no flag: there is no option to enable, disable, or tune it,
+and it never changes a score, a pruner, or the recommended point.
+
+Two peaks are recorded per trial, both ceilings rather than averages:
+
+- the **lifetime peak**, over the server container's whole life — model load,
+  the health wait, warmup, and the measured runs — which is the memory a
+  configuration needs just to start; and
+- the **measured peak**, the maximum over the measured runs' own windows, which
+  describes what the configuration holds while actually serving requests.
+
+Keeping both separates a one-off startup allocation from a serving footprint.
+Each run's own peak stays on the run, together with the raw samples behind it
+and the idle baseline, so a repetition that varied remains inspectable; the
+trial reports the lifetime peak and the maximum over its runs.
+
+VRAM is read from `nvidia-smi` on a `cuda` target and from `rocm-smi` on a `rocm`
+target. A sample sums the memory of the GPU processes whose cgroup names the
+trial's container, so another workload on a shared card does not inflate the
+number. When no process can be attributed, the figure falls back to the device's
+used memory minus a baseline taken before the container started, clamped at
+zero; the run's raw samples record which of the two sources produced it. A
+device-level number includes whatever else uses the card, and the recorded
+baseline is what makes it interpretable.
+
+RAM is the container's cgroup memory usage, sampled on the same cadence. It
+deliberately includes page cache, so an mmap-based llama.cpp server's weights
+count as memory the configuration occupies — conservative in the direction a
+hardware requirement should err.
+
+Memory is a **best-effort diagnostic**. Sampling runs once a second while the
+container is up, so a spike shorter than the cadence can be missed, and each
+vendor query is bounded by a ten-second timeout, so a wedged tool can delay a
+sample but never block the trial. A host without the vendor tooling, a runtime
+that cannot report stats, or an unreadable cgroup leaves the field unmeasured
+rather than failing, retrying, or warning; a failed trial records no memory at
+all. Sampling stops with the container, including on failure and interrupt, so
+nothing is polled after a trial ends, and the tokenizer preflight a JSONL
+dataset needs is not sampled. A `cpu` target has no VRAM to report but still
+reports RAM.
+
+The final summary reports memory in two places, in both the scalar and
+Pareto-front modes. Directly after the failed-trial count, a hardware line gives
+the largest footprint **any** evaluated trial recorded — the sweep's worst case —
+and the winning-configuration section opens with a `memory` subsection giving the
+footprint of the recommended configuration itself:
+
+```
+best trial: 7
+best throughput: 51.37 tps
+trials run: 24
+failed trials: 1/24 (4%)
+hardware (all trials): 23.8 GiB vram peak (measured 21.2 GiB), 10.4 GiB ram peak (measured 9.7 GiB)
+
+winning configuration:
+memory:
+  vram: 20.4 GiB lifetime peak (17.1 GiB while serving)
+  ram:  6.2 GiB lifetime peak (5.9 GiB while serving)
+container:
+  …
+```
+
+The memory subsection follows the document's own layout — one key per domain at
+the left margin, its fields indented once — rather than introducing a second
+style inside the block.
+
+The line's figures are the maximums of each field over every successful trial's
+recorded result, so its VRAM and RAM may come from different trials; the
+subsection reports one point, the configuration printed directly below it, so the
+number a user takes away for deployment is never the sweep's worst case. It is
+omitted entirely when the recommended trial recorded no measurement at all — a
+study persisted before memory was measured — leaving just the configuration.
+Both read the recorded projections in the study — the same record the front
+table's combined column uses — so neither can contradict the study, and a
+resumed study reports the footprint of the trials it already evaluated. A field
+that was not measured renders `n/a`, never `0`, so "unmeasured" and "used
+nothing" stay distinguishable. Byte sizes use binary units (`GiB`, `MiB`, `KiB`,
+then plain bytes) with one decimal place.
+
+Memory is informational metadata, not part of the objective: a configuration
+that does not fit is still evaluated and still scored on throughput, and there is
+no rejection, warning, or headroom calculation against the available memory. The
+live per-trial line, the TUI, the Pareto front table, and the written
+configuration artifacts are unchanged. Nor does the addition touch the
+phase-metric schema version a study records, so a study persisted before memory
+was measured still loads and resumes and simply shows `n/a` until new trials are
+measured.
 
 ## Options
 
@@ -467,7 +559,11 @@ how many of the study's trials failed, as `failed trials: n/m (pct)` directly
 after `trials run`: the denominator `m` is the same whole-study count, so a
 resumed sweep's summary covers every trial the study holds rather than only
 this invocation's, unlike the live failure segment. The percentage uses the
-same whole-percent format, including its `<1%` floor. In multi mode the summary
+same whole-percent format, including its `<1%` floor. A study-wide
+`hardware (all trials):` line then follows, giving the largest footprint any
+evaluated trial recorded, and the winning-configuration section opens with a
+`memory:` subsection giving the recommended configuration's own peak; both are
+described under [Memory footprint](#memory-footprint). In multi mode the summary
 also prints the Pareto front as a table — trial number, both phase rates, the
 trial's recorded combined throughput, and the recommended row marked — so the
 whole trade-off can be compared at a glance.

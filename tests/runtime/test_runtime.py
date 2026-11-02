@@ -482,6 +482,59 @@ def test_detached_liveness_fails_open_when_the_runtime_cannot_be_queried() -> No
     assert handle.is_running() is True
 
 
+def test_detached_memory_usage_reports_the_cgroup_byte_count() -> None:
+    # libpod's single-shot stats shape, as podman-py decodes it: one entry per
+    # queried container, whose ``MemUsage`` is the cgroup's charge in bytes.
+    client = FakePodmanClient(stats_payload={"Stats": [{"MemUsage": 3_145_728}]})
+    handle = start_container(ContainerConfig(image="img"), client=client)
+
+    assert handle.memory_usage() == 3_145_728
+    assert client.container is not None
+    # A single shot: the handle must not open a stream it never closes.
+    assert client.container.stats_calls == [{"stream": False, "decode": True}]
+
+
+def test_detached_memory_usage_reports_unknown_when_the_runtime_fails() -> None:
+    client = FakePodmanClient(stats_error=APIError("stats unavailable"))
+    handle = start_container(ContainerConfig(image="img"), client=client)
+
+    assert handle.memory_usage() is None
+
+
+def test_detached_memory_usage_reports_unknown_for_an_undecodable_body() -> None:
+    # ``decode=True`` parses the body, so a malformed body surfaces as a
+    # ``ValueError`` rather than a payload the parser can inspect.
+    client = FakePodmanClient(stats_error=ValueError("invalid JSON"))
+    handle = start_container(ContainerConfig(image="img"), client=client)
+
+    assert handle.memory_usage() is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"name": "img"},
+        {"Stats": []},
+        {"Stats": [{"MemUsage": 1}, {"MemUsage": 2}]},
+        {"Stats": "not-a-list"},
+        {"Stats": ["not-a-mapping"]},
+        {"Stats": [{}]},
+        {"Stats": [{"MemUsage": None}]},
+        {"Stats": [{"MemUsage": "4096"}]},
+        {"Stats": [{"MemUsage": True}]},
+        {"Stats": [{"MemUsage": -1}]},
+        ["not-a-mapping"],
+    ],
+)
+def test_detached_memory_usage_reports_unknown_for_an_unreadable_payload(
+    payload: object,
+) -> None:
+    client = FakePodmanClient(stats_payload=payload)
+    handle = start_container(ContainerConfig(image="img"), client=client)
+
+    assert handle.memory_usage() is None
+
+
 def test_detached_stop_captures_result_and_removes_container() -> None:
     client = FakePodmanClient(exit_code=143, logs=_frame(1, b"served") + _frame(2, b"warn"))
 
@@ -494,9 +547,22 @@ def test_detached_stop_captures_result_and_removes_container() -> None:
     assert result.stderr == b"warn"
     assert result.container_id == "fake-container-id"
     assert client.container is not None
-    assert client.container.stop_calls == [{"timeout": 10.0, "ignore": True}]
+    assert client.container.stop_calls == [{"timeout": 10, "ignore": True}]
     assert client.container.wait_calls == [None]
     assert client.container.remove_calls == [True]
+
+
+def test_detached_stop_rounds_a_fractional_timeout_up_to_whole_seconds() -> None:
+    # libpod's stop request takes an integral second count and rejects a
+    # fractional one, so a caller's grace period is rounded up rather than
+    # sent verbatim.
+    client = FakePodmanClient()
+
+    handle = start_container(ContainerConfig(image="img"), client=client)
+    handle.stop(timeout=2.5)
+
+    assert client.container is not None
+    assert client.container.stop_calls == [{"timeout": 3, "ignore": True}]
 
 
 def test_detached_stop_without_a_timeout_passes_none() -> None:

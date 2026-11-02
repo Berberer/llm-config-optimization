@@ -10,9 +10,13 @@ columns, so its two-unit, half-up nearest-second, and no-zero-padding rules are
 pinned here too: zero, sub-minute rounding, the exact half, minutes with
 seconds, an exact hour, hours with minutes, days, a value that rounds to zero, a
 negative value, and the dropped third unit.
+
+The byte-size format renders the summary's memory peaks, so its binary units,
+one-decimal rule, half-up rounding, plain-byte floor, and ``n/a`` for an
+unmeasured figure are pinned here as well.
 """
 
-from llm_config_optimization.cli._formatting import duration_text, failure_text
+from llm_config_optimization.cli._formatting import byte_size_text, duration_text, failure_text
 
 
 def test_no_failures_render_zero_percent() -> None:
@@ -82,3 +86,47 @@ def test_a_third_unit_is_dropped_rather_than_padded() -> None:
 
 def test_single_digit_units_are_not_zero_padded() -> None:
     assert duration_text(65) == "1m 5s"
+
+
+def test_an_unmeasured_size_renders_not_available() -> None:
+    """Absence must never read as an observed zero."""
+    assert byte_size_text(None) == "n/a"
+
+
+def test_a_size_below_one_kibibyte_renders_whole_bytes() -> None:
+    assert byte_size_text(512) == "512 B"
+
+
+def test_zero_bytes_render_a_measured_zero() -> None:
+    assert byte_size_text(0) == "0 B"
+
+
+def test_a_negative_size_is_clamped_to_zero() -> None:
+    assert byte_size_text(-1) == "0 B"
+
+
+def test_a_kibibyte_is_the_smallest_decimal_unit() -> None:
+    assert byte_size_text(1536) == "1.5 KiB"
+
+
+def test_a_mibibyte_uses_the_next_unit() -> None:
+    assert byte_size_text(1024 * 1024) == "1.0 MiB"
+
+
+def test_a_gibibyte_sized_peak_renders_one_decimal() -> None:
+    assert byte_size_text(round(20.4 * 1024**3)) == "20.4 GiB"
+
+
+def test_the_tenths_digit_rounds_half_up_rather_than_to_even() -> None:
+    """Half-up keeps a one-byte change monotonic, unlike banker's rounding."""
+    assert byte_size_text(1024**3 + 1024**3 // 4) == "1.3 GiB"
+    assert byte_size_text(2 * 1024**3 + 1024**3 // 4) == "2.3 GiB"
+
+
+def test_a_size_rounding_up_to_a_whole_unit_keeps_the_decimal() -> None:
+    assert byte_size_text(10 * 1024**3) == "10.0 GiB"
+
+
+def test_the_units_are_binary_rather_than_decimal() -> None:
+    """A ``GiB`` is 1024 ``MiB``, so 1000 MiB stays in ``MiB``."""
+    assert byte_size_text(1000 * 1024**2) == "1000.0 MiB"

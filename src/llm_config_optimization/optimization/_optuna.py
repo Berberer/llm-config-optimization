@@ -566,6 +566,13 @@ def _project_result(result: ExperimentResult) -> dict[str, object]:
     persisted study says which phase of inference a configuration helped. A
     phase rate is optional on a run, so the recorded value is ``None`` where
     the engine did not report what the rate needs.
+
+    Memory is informational metadata, never a score, so it is recorded as the
+    two peaks the result carries: the lifetime peaks at the top level and each
+    run's measured-window peaks beside its throughputs. A peak is a plain
+    integer or ``None`` — never ``0`` for an unmeasured field — so a persisted
+    study distinguishes a real measurement from an absent one, and a study
+    recorded before memory was measured simply lacks the keys.
     """
     return {
         "tokens_per_second": result.tokens_per_second,
@@ -577,12 +584,20 @@ def _project_result(result: ExperimentResult) -> dict[str, object]:
         "image": result.image,
         "devices": list(result.devices),
         "failed_runs": result.failed_runs,
+        "lifetime_peak_vram_bytes": result.lifetime_resources.peak_vram_bytes,
+        "lifetime_peak_ram_bytes": result.lifetime_resources.peak_ram_bytes,
         "runs": [
             {
                 "tokens_per_second": run.tokens_per_second,
                 "requests_per_second": run.requests_per_second,
                 "prefill_tokens_per_second": run.prefill_tokens_per_second,
                 "decode_tokens_per_second": run.decode_tokens_per_second,
+                "peak_vram_bytes": (
+                    run.resources.peak_vram_bytes if run.resources is not None else None
+                ),
+                "peak_ram_bytes": (
+                    run.resources.peak_ram_bytes if run.resources is not None else None
+                ),
             }
             for run in result.runs
         ],

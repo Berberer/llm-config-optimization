@@ -27,6 +27,26 @@ pytestmark = pytest.mark.integration
 
 ALPINE_IMAGE = "docker.io/library/alpine:latest"
 
+_SHM_SIZE = "128m"
+"""The container's ``/dev/shm`` size, sized well above the allocation below."""
+
+_ALLOCATED_MIB = 64
+"""Anonymous shared memory the measured container holds, in MiB.
+
+A tmpfs file is shmem, so the cgroup is charged for it and the kernel cannot
+reclaim it while the file exists: the figure the probe must report is a floor
+rather than a hint. Anonymous rather than page-cache-backed memory is what makes
+the assertion hold whether or not the host pages anything out.
+"""
+
+_HOST_WIDE_MIB = 1024
+"""An upper bound a per-container figure stays under.
+
+A host-wide memory reading is the realistic wrong answer for this seam, and on
+any machine that runs this suite it sits far above one container's charge. The
+bound is deliberately loose so only a category error trips it.
+"""
+
 
 @pytest.fixture(scope="module")
 def podman_client():
@@ -111,3 +131,57 @@ def test_detached_liveness_sees_a_short_lived_container_exit(
         assert handle.is_running() is False
     finally:
         handle.remove()
+
+
+def test_detached_memory_usage_reports_the_live_cgroup_charge(
+    podman_client: PodmanClient, alpine_image: str
+) -> None:
+    """A real container's stats payload parses to its own cgroup figure.
+
+    The container allocates a known amount of anonymous shared memory and then
+    sleeps, so the charge is held for as long as the measurement takes. Polling
+    tolerates the runtime settling; the assertion is the reported figure, not
+    the time it took to appear.
+    """
+    handle = start_container(
+        ContainerConfig(
+            image=alpine_image,
+            command=(
+                "/bin/sh",
+                "-c",
+                f"dd if=/dev/zero of=/dev/shm/blob bs=1M count={_ALLOCATED_MIB} "
+                "2>/dev/null && sleep 60",
+            ),
+            shm_size=_SHM_SIZE,
+        ),
+        client=podman_client,
+    )
+    try:
+        floor = _ALLOCATED_MIB * 1024 * 1024
+        deadline = time.monotonic() + 30.0
+        usage = handle.memory_usage()
+        while (usage is None or usage < floor) and time.monotonic() < deadline:
+            time.sleep(0.2)
+            usage = handle.memory_usage()
+
+        assert usage is not None
+        assert floor <= usage < _HOST_WIDE_MIB * 1024 * 1024
+    finally:
+        handle.remove()
+
+
+def test_detached_memory_usage_is_unknown_once_the_container_is_gone(
+    podman_client: PodmanClient, alpine_image: str
+) -> None:
+    """A stats read for a removed container reports unknown instead of raising.
+
+    This is the last read a sampler makes if it is stopped after the container:
+    it must not turn a finished trial into a failed one.
+    """
+    handle = start_container(
+        ContainerConfig(image=alpine_image, command=("/bin/sh", "-c", "exit 0")),
+        client=podman_client,
+    )
+    handle.stop(timeout=10.0)
+
+    assert handle.memory_usage() is None

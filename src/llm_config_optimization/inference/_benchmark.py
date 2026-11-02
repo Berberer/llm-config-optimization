@@ -27,6 +27,16 @@ before and after each measured run and stores the parsed samples in the run's
 Prometheus exposition format — no engine series names — and a scrape that
 fails or parses to nothing leaves the key absent rather than failing the run,
 so the snapshots are a best-effort diagnostic.
+
+A caller may also supply a
+:class:`~llm_config_optimization.inference.types.ResourceSampler`. Each
+measured run is then bracketed by a marker and a peak query, so the run
+records the memory its own window held, and the bracketing samples and the
+idle VRAM baseline are kept in the run's ``raw_json`` so the number can be
+audited afterwards. Warmup runs are deliberately not bracketed: they are
+unmeasured, and the container's lifetime peak already covers them. An absent
+sampler, or one that could measure nothing, leaves the run without a memory
+number rather than failing it.
 """
 
 import asyncio
@@ -45,6 +55,10 @@ from .types import (
     BenchmarkConfig,
     BenchmarkOutcome,
     ExperimentError,
+    ResourceMarker,
+    ResourceSample,
+    ResourceSampler,
+    ResourceUsage,
     RunMetrics,
     ServerSpec,
 )
@@ -74,6 +88,24 @@ phase rates stay in the backend that owns the engine.
 
 _METRICS_BEFORE_KEY = "before"
 _METRICS_AFTER_KEY = "after"
+
+_RESOURCES_KEY = "resources"
+"""The ``raw_json`` key under which a run's memory bracketing is stored.
+
+The value keeps the samples taken during the measured window — each with its
+timestamp, VRAM and RAM values, and the VRAM figure's provenance — together
+with the idle VRAM baseline the device-level fallback subtracts, so a peak can
+be audited after the run. The typed peak itself lives on the run's
+``resources`` field; this is the evidence behind it. The key is present exactly
+when the run was bracketed by a resource sampler.
+"""
+
+_RESOURCES_BASELINE_KEY = "baseline_vram_bytes"
+_RESOURCES_SAMPLES_KEY = "samples"
+_RESOURCES_TIMESTAMP_KEY = "timestamp"
+_RESOURCES_VRAM_KEY = "vram_bytes"
+_RESOURCES_VRAM_SOURCE_KEY = "vram_source"
+_RESOURCES_RAM_KEY = "ram_bytes"
 
 _RESPONSES_KEY = "responses"
 """The ``raw_json`` key under which a run's completion payloads are stored.
@@ -277,6 +309,85 @@ def _with_metrics(
     )
 
 
+def _sample_payload(sample: ResourceSample) -> dict[str, object]:
+    """Return one raw observation as a plain JSON-compatible mapping.
+
+    The VRAM source is written as its string value, so the record stays
+    serializable without the experiment surface's enum leaking into it, and
+    every absent field stays ``None`` rather than becoming a measured zero.
+    """
+    return {
+        _RESOURCES_TIMESTAMP_KEY: sample.timestamp,
+        _RESOURCES_VRAM_KEY: sample.vram_bytes,
+        _RESOURCES_VRAM_SOURCE_KEY: (
+            sample.vram_source.value if sample.vram_source is not None else None
+        ),
+        _RESOURCES_RAM_KEY: sample.ram_bytes,
+    }
+
+
+def _with_resources(
+    run: RunMetrics, sampler: ResourceSampler, marker: ResourceMarker
+) -> RunMetrics:
+    """Return ``run`` with its measured window's memory peak and raw samples.
+
+    The peak comes from the sampler's window query and is stored on the typed
+    field, while the samples behind it and the idle baseline go into the run's
+    raw JSON so the number can be audited later. A window in which nothing
+    could be measured leaves ``resources`` unset rather than reporting an
+    all-``None`` usage as if it were the window's peak; the raw record is
+    still kept, because it shows the window was observed and what it saw.
+
+    The queries are guarded because a caller-supplied sampler is a diagnostic
+    seam: one that raises leaves the run's memory unmeasured, exactly like one
+    that answers nothing, and never fails a run that otherwise succeeded.
+    """
+    usage = _sampler_peak(sampler, marker)
+    samples = _sampler_samples(sampler, marker)
+    record = {
+        _RESOURCES_BASELINE_KEY: sampler.baseline_vram_bytes,
+        _RESOURCES_SAMPLES_KEY: [_sample_payload(sample) for sample in samples],
+    }
+    measured = (
+        usage if usage.peak_vram_bytes is not None or usage.peak_ram_bytes is not None else None
+    )
+    return replace(
+        run,
+        resources=measured,
+        raw_json={**run.raw_json, _RESOURCES_KEY: record},
+    )
+
+
+def _sampler_mark(sampler: ResourceSampler) -> ResourceMarker | None:
+    """Take a window marker, or ``None`` when the sampler cannot answer.
+
+    A marker that could not be taken means the run is simply not bracketed, so
+    a broken sampler costs the measurement rather than the trial.
+    """
+    try:
+        return sampler.mark()
+    except Exception:
+        return None
+
+
+def _sampler_peak(sampler: ResourceSampler, marker: ResourceMarker) -> ResourceUsage:
+    """Return a window's peak, or an unmeasured usage when the sampler fails."""
+    try:
+        return sampler.peak(marker)
+    except Exception:
+        return ResourceUsage()
+
+
+def _sampler_samples(
+    sampler: ResourceSampler, marker: ResourceMarker
+) -> tuple[ResourceSample, ...]:
+    """Return a window's raw samples, or nothing when the sampler fails."""
+    try:
+        return tuple(sampler.samples(marker))
+    except Exception:
+        return ()
+
+
 def _usage_tokens(payload: Mapping[str, object]) -> tuple[int, int] | None:
     """Return ``(prompt_tokens, completion_tokens)`` from a completion payload.
 
@@ -325,6 +436,7 @@ class BenchmarkClient:
         *,
         concurrency: int | None = None,
         is_alive: Callable[[], bool] | None = None,
+        sampler: ResourceSampler | None = None,
     ) -> BenchmarkOutcome:
         """Measure ``spec``'s server at ``base_url`` and return its runs.
 
@@ -337,6 +449,11 @@ class BenchmarkClient:
         measured run is bracketed by a best-effort scrape of it, and both
         parsed snapshots are stored in the run's raw JSON; warmup runs are not
         scraped.
+
+        ``sampler``, when given, is bracketed around each measured run instead:
+        the run's window peak becomes its ``resources`` field and the raw
+        samples and idle baseline are stored in its raw JSON. Warmup runs are
+        not sampled because the sampler's lifetime peak already covers them.
 
         ``is_alive``, when given, is polled during the health wait so a server
         container that has already exited — a model-load crash, an out-of-memory
@@ -355,7 +472,14 @@ class BenchmarkClient:
             try:
                 async with asyncio.timeout(benchmark.timeout):
                     return await self._measure(
-                        base_url, model, spec, benchmark, workload, concurrency, is_alive
+                        base_url,
+                        model,
+                        spec,
+                        benchmark,
+                        workload,
+                        concurrency,
+                        is_alive,
+                        sampler,
                     )
             except TimeoutError as exc:
                 raise ExperimentError(
@@ -363,7 +487,14 @@ class BenchmarkClient:
                     f"{benchmark.timeout}s overall timeout"
                 ) from exc
         return await self._measure(
-            base_url, model, spec, benchmark, workload, concurrency, is_alive
+            base_url,
+            model,
+            spec,
+            benchmark,
+            workload,
+            concurrency,
+            is_alive,
+            sampler,
         )
 
     def measure_sync(
@@ -375,16 +506,24 @@ class BenchmarkClient:
         *,
         concurrency: int | None = None,
         is_alive: Callable[[], bool] | None = None,
+        sampler: ResourceSampler | None = None,
     ) -> BenchmarkOutcome:
         """Synchronous entry point for a caller that is not already in a loop.
 
         The orchestrator is synchronous, so it drives the asynchronous
         :meth:`measure` through :func:`asyncio.run` rather than owning an event
-        loop of its own.
+        loop of its own. ``sampler`` is forwarded unchanged, so the caller owns
+        the sampler's lifetime and this entry point never starts or stops it.
         """
         return asyncio.run(
             self.measure(
-                base_url, model, spec, benchmark, concurrency=concurrency, is_alive=is_alive
+                base_url,
+                model,
+                spec,
+                benchmark,
+                concurrency=concurrency,
+                is_alive=is_alive,
+                sampler=sampler,
             )
         )
 
@@ -478,6 +617,7 @@ class BenchmarkClient:
         workload: Callable[[int], list[_Request]],
         concurrency: int | None,
         is_alive: Callable[[], bool] | None,
+        sampler: ResourceSampler | None,
     ) -> BenchmarkOutcome:
         """Run the health wait, warmup, and measured runs against one server."""
         limits = httpx2.Limits(
@@ -506,7 +646,10 @@ class BenchmarkClient:
             for run_index in range(benchmark.repetitions):
                 await self._reset_caches(client, spec)
                 before = await self._snapshot_metrics(client, spec)
+                marker = _sampler_mark(sampler) if sampler is not None else None
                 run = await self._take_run(client, model, workload(run_index), concurrency)
+                if run is not None and sampler is not None and marker is not None:
+                    run = _with_resources(run, sampler, marker)
                 after = await self._snapshot_metrics(client, spec)
                 if run is None:
                     failed_runs += 1

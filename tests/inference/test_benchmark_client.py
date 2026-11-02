@@ -13,7 +13,7 @@ GPU is required and every elapsed time is deterministic.
 import asyncio
 import json
 import random
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import httpx2
@@ -23,7 +23,11 @@ from llm_config_optimization.inference import (
     BenchmarkClient,
     BenchmarkConfig,
     ExperimentError,
+    ResourceMarker,
+    ResourceSample,
+    ResourceUsage,
     ServerSpec,
+    VramSource,
     validate_dataset,
 )
 from llm_config_optimization.runtime import ContainerConfig
@@ -47,6 +51,54 @@ class FakeClock:
         now = self._now
         self._now += self._step
         return now
+
+
+class FakeSampler:
+    """A resource sampler whose windows are scripted by marker order.
+
+    The client's nth measured window sees the nth entry of ``peaks`` and
+    ``records``, so a test can give each run a distinct footprint. A window
+    past the scripted lists answers unknown, and the markers the client asked
+    for are recorded so a test can tell which runs were bracketed.
+    """
+
+    def __init__(
+        self,
+        *,
+        peaks: Sequence[ResourceUsage] = (),
+        records: Sequence[Sequence[ResourceSample]] = (),
+        baseline_vram_bytes: int | None = None,
+    ) -> None:
+        self._baseline = baseline_vram_bytes
+        self._peaks = list(peaks)
+        self._records = [tuple(record) for record in records]
+        self.markers: list[ResourceMarker] = []
+
+    @property
+    def baseline_vram_bytes(self) -> int | None:
+        return self._baseline
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def mark(self) -> ResourceMarker:
+        marker = len(self.markers) + 1
+        self.markers.append(marker)
+        return marker
+
+    def samples(self, since: ResourceMarker) -> tuple[ResourceSample, ...]:
+        index = since - 1
+        return self._records[index] if index < len(self._records) else ()
+
+    def peak(self, since: ResourceMarker) -> ResourceUsage:
+        index = since - 1
+        return self._peaks[index] if index < len(self._peaks) else ResourceUsage()
+
+    def lifetime_peak(self) -> ResourceUsage:
+        return ResourceUsage()
 
 
 class FakeEngine:
@@ -500,6 +552,139 @@ def test_a_failed_half_of_the_snapshot_pair_leaves_no_metrics_key() -> None:
 
     assert engine.metrics_attempts == 2
     assert "metrics" not in outcome.runs[0].raw_json
+
+
+def test_a_measured_run_carries_its_window_peak_and_raw_samples() -> None:
+    sample = ResourceSample(
+        timestamp=1.5,
+        vram_bytes=2048,
+        vram_source=VramSource.PROCESS,
+        ram_bytes=1024,
+    )
+    sampler = FakeSampler(
+        peaks=[ResourceUsage(peak_vram_bytes=4096, peak_ram_bytes=2048)],
+        records=[[sample]],
+        baseline_vram_bytes=512,
+    )
+    engine = FakeEngine()
+    client = _client(engine)
+
+    outcome = client.measure_sync(
+        "http://engine", MODEL, _spec(), _random_benchmark(), sampler=sampler
+    )
+
+    run = outcome.runs[0]
+    assert run.resources == ResourceUsage(peak_vram_bytes=4096, peak_ram_bytes=2048)
+    assert run.raw_json["resources"] == {
+        "baseline_vram_bytes": 512,
+        "samples": [
+            {
+                "timestamp": 1.5,
+                "vram_bytes": 2048,
+                "vram_source": "process",
+                "ram_bytes": 1024,
+            }
+        ],
+    }
+
+
+def test_every_measured_run_is_bracketed_and_warmup_is_not() -> None:
+    sampler = FakeSampler(
+        peaks=[ResourceUsage(peak_vram_bytes=100), ResourceUsage(peak_vram_bytes=200)],
+    )
+    engine = FakeEngine()
+    client = _client(engine)
+    benchmark = _random_benchmark(repetitions=2, warmup=1)
+
+    outcome = client.measure_sync("http://engine", MODEL, _spec(), benchmark, sampler=sampler)
+
+    assert len(sampler.markers) == 2
+    assert [run.resources for run in outcome.runs] == [
+        ResourceUsage(peak_vram_bytes=100),
+        ResourceUsage(peak_vram_bytes=200),
+    ]
+
+
+def test_a_sampler_less_client_records_no_memory() -> None:
+    engine = FakeEngine()
+    client = _client(engine)
+
+    outcome = client.measure_sync("http://engine", MODEL, _spec(), _random_benchmark())
+
+    assert outcome.runs[0].resources is None
+    assert "resources" not in outcome.runs[0].raw_json
+
+
+def test_a_window_that_measured_nothing_still_produces_a_valid_run() -> None:
+    sample = ResourceSample(timestamp=2.0)
+    sampler = FakeSampler(peaks=[ResourceUsage()], records=[[sample]])
+    engine = FakeEngine()
+    client = _client(engine)
+
+    outcome = client.measure_sync(
+        "http://engine", MODEL, _spec(), _random_benchmark(), sampler=sampler
+    )
+
+    run = outcome.runs[0]
+    assert run.resources is None
+    assert run.raw_json["resources"] == {
+        "baseline_vram_bytes": None,
+        "samples": [{"timestamp": 2.0, "vram_bytes": None, "vram_source": None, "ram_bytes": None}],
+    }
+
+
+def test_the_async_entry_point_brackets_a_measured_run() -> None:
+    sampler = FakeSampler(peaks=[ResourceUsage(peak_ram_bytes=4096)])
+    engine = FakeEngine()
+    client = _client(engine)
+
+    outcome = asyncio.run(
+        client.measure("http://engine", MODEL, _spec(), _random_benchmark(), sampler=sampler)
+    )
+
+    assert outcome.runs[0].resources == ResourceUsage(peak_ram_bytes=4096)
+    assert len(sampler.markers) == 1
+
+
+def test_a_sampler_that_cannot_mark_leaves_the_run_unmeasured() -> None:
+    """A failing marker must not turn a measured run into a failed one."""
+
+    class BrokenSampler(FakeSampler):
+        def mark(self) -> ResourceMarker:
+            raise RuntimeError("sampler unavailable")
+
+    engine = FakeEngine()
+    client = _client(engine)
+
+    outcome = client.measure_sync(
+        "http://engine", MODEL, _spec(), _random_benchmark(), sampler=BrokenSampler()
+    )
+
+    run = outcome.runs[0]
+    assert run.resources is None
+    assert "resources" not in run.raw_json
+
+
+def test_a_sampler_that_cannot_answer_a_window_leaves_the_run_unmeasured() -> None:
+    """A failed peak or samples query is a gap, not a reason to fail the run."""
+
+    class BrokenSampler(FakeSampler):
+        def samples(self, since: ResourceMarker) -> tuple[ResourceSample, ...]:
+            raise RuntimeError("sampler unavailable")
+
+        def peak(self, since: ResourceMarker) -> ResourceUsage:
+            raise RuntimeError("sampler unavailable")
+
+    engine = FakeEngine()
+    client = _client(engine)
+
+    outcome = client.measure_sync(
+        "http://engine", MODEL, _spec(), _random_benchmark(), sampler=BrokenSampler()
+    )
+
+    run = outcome.runs[0]
+    assert run.resources is None
+    assert run.raw_json["resources"] == {"baseline_vram_bytes": None, "samples": []}
 
 
 def test_a_server_that_never_becomes_healthy_fails() -> None:

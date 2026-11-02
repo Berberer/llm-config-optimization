@@ -4,6 +4,7 @@ This module is the only place that imports the ``podman`` bindings.
 """
 
 import contextlib
+import math
 from collections.abc import Mapping
 from types import MappingProxyType
 
@@ -154,6 +155,47 @@ def _force_remove(container: Container) -> None:
     """Remove ``container``, ignoring failures so cleanup never masks an outcome."""
     with contextlib.suppress(APIError):
         container.remove(force=True)
+
+
+def _memory_bytes(stats: object) -> int | None:
+    """Extract the cgroup memory usage from a libpod stats payload.
+
+    The bindings' single-shot ``stats`` read answers with libpod's shape — a
+    ``Stats`` list holding one entry for the queried container, whose
+    ``MemUsage`` field is the cgroup's current memory charge in bytes. That
+    figure includes page cache, which is what makes an mmap-backed engine's
+    weights count as memory the container holds.
+
+    Anything else — no entry, several entries, a missing or oddly typed field, a
+    payload that is not a mapping — is unreadable and reports ``None`` so the
+    caller never mistakes an unknown for zero bytes.
+    """
+    if not isinstance(stats, Mapping):
+        return None
+    entries = stats.get("Stats")
+    if not isinstance(entries, list) or len(entries) != 1:
+        return None
+    entry = entries[0]
+    if not isinstance(entry, Mapping):
+        return None
+    usage = entry.get("MemUsage")
+    if isinstance(usage, bool) or not isinstance(usage, int) or usage < 0:
+        return None
+    return usage
+
+
+def _whole_seconds(timeout: float | None) -> int | None:
+    """Round a stop grace period up to the whole seconds the runtime accepts.
+
+    libpod's ``stop`` endpoint takes an integral second count and rejects a
+    fractional one, so a caller's ``10.0`` would fail the request instead of
+    shortening the wait. Rounding up never stops a container earlier than the
+    caller asked for, and ``None`` stays ``None`` so the runtime's own default
+    applies.
+    """
+    if timeout is None:
+        return None
+    return math.ceil(timeout)
 
 
 def _pull(image: str, policy: PullPolicy, client: PodmanClient) -> None:
@@ -341,9 +383,24 @@ class _PodmanRunningContainer:
             return True
         return self._container.status not in ("exited", "stopped")
 
+    def memory_usage(self) -> int | None:
+        """Report the container's cgroup memory usage in bytes, or ``None``.
+
+        A single-shot stats read, so the caller waits for one sample rather
+        than opening a stream it would have to close. Every failure — an
+        unreachable daemon, a rejected request, a malformed body — is
+        swallowed because the read is a diagnostic that must never fail the
+        run.
+        """
+        try:
+            stats = self._container.stats(stream=False, decode=True)
+        except APIError, ValueError, TypeError, OSError:
+            return None
+        return _memory_bytes(stats)
+
     def stop(self, timeout: float | None = None) -> ContainerResult:
         try:
-            self._container.stop(timeout=timeout, ignore=True)
+            self._container.stop(timeout=_whole_seconds(timeout), ignore=True)
         except APIError as exc:
             _force_remove(self._container)
             self._release()

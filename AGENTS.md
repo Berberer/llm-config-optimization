@@ -18,8 +18,8 @@ the package's own `__init__.py` — such as `_sweep_budget` — from the package
 | Package         | Owns                                                                                                 | Key files |
 | --------------- | ---------------------------------------------------------------------------------------------------- | --------- |
 | `search_space/` | Engine-neutral definition types including the model-aware `SpaceAssessment` result, the tunable registry, the YAML loader, engine-agnostic and backend-support validation | `types.py`, `registry.py`, `loader.py`, `validation.py` |
-| `inference/`    | Engine-neutral experiment surface (the `InferenceBackend` protocol, `ServerSpec`, the optional phase-rate metrics, and the space assessment) plus the vLLM and llama.cpp backends, the host benchmark client with its Prometheus snapshots, and hardware detection | `types.py`, `_orchestrate.py`, `_benchmark.py`, `_tunables.py`, `_vllm.py`, `_llamacpp.py`, `hardware.py` |
-| `runtime/`      | Backend-agnostic container types, the detached start/stop lifecycle, the Podman client, and the SELinux probe | `types.py`, `_podman.py`, `_selinux.py` |
+| `inference/`    | Engine-neutral experiment surface (the `InferenceBackend` protocol, `ServerSpec`, the optional phase-rate metrics, the `ResourceSampler` seam and its `ResourceUsage` values, and the space assessment) plus the vLLM and llama.cpp backends, the host benchmark client with its Prometheus snapshots, the best-effort resource sampler, and hardware detection with its vendor memory probes | `types.py`, `_orchestrate.py`, `_benchmark.py`, `_resources.py`, `_tunables.py`, `_vllm.py`, `_llamacpp.py`, `hardware.py` |
+| `runtime/`      | Backend-agnostic container types, the detached start/stop lifecycle including the container's best-effort memory read, the Podman client, and the SELinux probe | `types.py`, `_podman.py`, `_selinux.py` |
 | `optimization/` | The engine-neutral objective model plus the Optuna adapter: maps spec kinds to suggestions, scores trials, drives a study, and guards study provenance | `types.py`, `_optuna.py` |
 | `output/`       | Engine-neutral winning-configuration writers: the historical YAML experiment document, the Podman quadlet, and the Docker/Podman Compose file, plus the pure-renderer contract and the format registry | `types.py`, `_yaml.py`, `_quadlet.py`, `_compose.py`, `_registry.py` |
 | `cli/`          | Composition root: argument parsing, the engine registry, base-config construction, model download progress, the sweep budget and its remaining-time estimate, log/TUI reporters, summary and output-writer selection, exit codes | `arguments.py`, `config.py`, `download.py`, `_formatting.py`, `_budget.py`, `log.py`, `tui.py`, `summary.py`, `__init__.py` |
@@ -62,6 +62,25 @@ the package's own `__init__.py` — such as `_sweep_budget` — from the package
   `parse_result`; the engine-neutral types carry only the optional
   `RunMetrics.prefill_tokens_per_second` / `decode_tokens_per_second` fields
   and their `ExperimentResult` means.
+- Memory measurement is best-effort, engine-neutral, and informative: the host
+  client brackets only measured runs through the injectable `ResourceSampler`
+  seam (`inference/types.py`), stores each window peak on
+  `RunMetrics.resources`, and keeps the raw samples and the idle VRAM baseline
+  under `raw_json["resources"]`; the orchestrator reads the baseline before
+  starting the container, samples its whole lifetime, stops the sampler on
+  every exit path including failure and interrupt, and attaches the peak as
+  `ExperimentResult.lifetime_resources` (whose `measured_peak_resources` is the
+  maximum over the runs). The host implementation is the engine-neutral
+  `ThreadedResourceSampler` in `inference/_resources.py`; RAM comes from the
+  runtime handle's best-effort `memory_usage()` and VRAM from the resolved
+  target's `MemoryProbe` in `inference/hardware.py`, which owns the vendor
+  parsing and the cgroup attribution (`VramSource.PROCESS` over the container's
+  own processes, else `VramSource.DEVICE` over the baseline-clamped device
+  delta). The measurement adds no CLI flag, takes no part in scoring, pruning,
+  or objective selection, leaves absent values `None` rather than `0`, and is
+  outside the metric schema: the trial projection carries the peaks as plain
+  integers or `null` and `_METRIC_SCHEMA_VERSION` stays untouched, so an older
+  study resumes and reports `n/a`.
 - A persisted study records the objective mode that produced its scores and the
   phase-metric schema version they were measured under — `_MODE_ATTRIBUTE`,
   `_METRIC_SCHEMA_ATTRIBUTE`, and `_METRIC_SCHEMA_VERSION` in

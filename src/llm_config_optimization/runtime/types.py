@@ -142,8 +142,25 @@ class RunningContainer(Protocol):
         """
         ...
 
+    def memory_usage(self) -> int | None:
+        """Report the container's current cgroup memory usage in bytes.
+
+        The figure includes page cache, so file-backed pages such as an
+        mmap'd model count as memory the container holds. The read is a
+        best-effort diagnostic: a runtime that cannot report stats, a
+        rejected request, or an unreadable payload reports ``None`` rather
+        than raising or failing the run.
+        """
+        ...
+
     def stop(self, timeout: float | None = None) -> ContainerResult:
-        """Stop the container, capture its result, and remove it."""
+        """Stop the container, capture its result, and remove it.
+
+        ``timeout`` is the grace period before the runtime kills the container.
+        A runtime whose stop request takes whole seconds rounds it up, so the
+        container is never stopped earlier than the caller asked for; ``None``
+        leaves the runtime's own default in place.
+        """
         ...
 
     def remove(self) -> None:

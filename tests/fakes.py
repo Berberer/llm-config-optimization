@@ -27,6 +27,7 @@ from llm_config_optimization.inference import (
     LLMConfig,
     LocalCheckpoint,
     ModelRequest,
+    ResourceSampler,
     ServerSpec,
 )
 from llm_config_optimization.runtime import ContainerResult
@@ -77,6 +78,7 @@ class FakeContainer:
         self.wait_calls: list[float | None] = []
         self.remove_calls: list[bool] = []
         self.stop_calls: list[dict[str, object]] = []
+        self.stats_calls: list[dict[str, object]] = []
         self.reload_calls = 0
 
     def start(self) -> None:
@@ -102,6 +104,12 @@ class FakeContainer:
         if self._wait_error is not None:
             raise self._wait_error
         return self._exit_code
+
+    def stats(self, **kwargs: object) -> object:
+        self.stats_calls.append(kwargs)
+        if self.client.stats_error is not None:
+            raise self.client.stats_error
+        return self.client.stats_payload
 
     def kill(self) -> None:
         self.killed = True
@@ -159,6 +167,8 @@ class FakePodmanClient:
         get_error: APIError | None = None,
         reload_error: APIError | None = None,
         stop_error: APIError | None = None,
+        stats_payload: object = None,
+        stats_error: APIError | None = None,
         resolved_ports: dict[str, object] | None = None,
         container_status: str = "running",
     ) -> None:
@@ -172,6 +182,8 @@ class FakePodmanClient:
         self.get_error = get_error
         self.reload_error = reload_error
         self.stop_error = stop_error
+        self.stats_payload = stats_payload
+        self.stats_error = stats_error
         self.resolved_ports = (
             resolved_ports
             if resolved_ports is not None
@@ -315,7 +327,9 @@ class FakeBenchmarkClient:
     asked to measure, so the orchestrator's lifecycle can be driven without a
     server, a daemon, or a GPU. ``measure_error`` makes every measurement fail.
     The liveness callback the orchestrator passes is recorded uninvoked, so a
-    test can probe it against the fake runtime itself.
+    test can probe it against the fake runtime itself, and the resource sampler
+    it passes is recorded so a test can pin that the measured runs were
+    bracketed.
     """
 
     def __init__(
@@ -333,6 +347,7 @@ class FakeBenchmarkClient:
         self.calls: list[tuple[str, str, ServerSpec, BenchmarkConfig]] = []
         self.tokenize_calls: list[tuple[str, str, ServerSpec, BenchmarkConfig]] = []
         self.liveness: list[Callable[[], bool] | None] = []
+        self.samplers: list[ResourceSampler | None] = []
 
     def measure_sync(
         self,
@@ -343,9 +358,11 @@ class FakeBenchmarkClient:
         *,
         concurrency: int | None = None,
         is_alive: Callable[[], bool] | None = None,
+        sampler: ResourceSampler | None = None,
     ) -> BenchmarkOutcome:
         self.calls.append((base_url, model, spec, benchmark))
         self.liveness.append(is_alive)
+        self.samplers.append(sampler)
         if self.measure_error is not None:
             raise self.measure_error
         return self.outcome

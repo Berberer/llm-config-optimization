@@ -8,10 +8,12 @@ configuration through the configured inference engine, and uses
 [Optuna](https://optuna.org/) (TPE sampler) to find the best point. Each trial
 reports **prefill** and **decode** throughput separately, and by default the
 sweep maximizes both at once, producing a Pareto front rather than committing
-to a trade-off before the run. Progress is shown live as either a per-trial log
-or a terminal graph, and the recommended configuration is printed and
-optionally written as a YAML experiment document or as an executable Podman
-quadlet or Docker Compose file when the sweep ends.
+to a trade-off before the run. Each trial also records its peak **VRAM** and
+**RAM** footprint, reported in the final summary and never scored, so a
+throughput gain can be weighed against the hardware it needs. Progress is shown
+live as either a per-trial log or a terminal graph, and the recommended
+configuration is printed and optionally written as a YAML experiment document
+or as an executable Podman quadlet or Docker Compose file when the sweep ends.
 
 ![Screenshot of the optimization tool TUI in scalar mode, showing a plot with number of trials on the X-axis and tokens per second on the Y-axis; the default multi-objective view is a prefill-versus-decode scatter.](./assets/optimization_plot_example.png)
 

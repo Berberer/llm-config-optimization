@@ -43,14 +43,19 @@ The codebase is layered so engine details stay at the edges:
   plans a `ServerSpec`, and parses results; the client waits for the server's
   health — failing the run as soon as the container exits during that wait —
   takes the warmup and measured runs, snapshots the spec's declared metrics
-  path around each one, and aggregates the metrics. Categorical fields hold
-  engine-neutral `StrEnum`s declared in the same module — `DType`,
-  `QuantizationMethod`, `KVCacheDType`, `AttentionBackend`, `GpuLayersMode`,
-  `CpuMoeMode`, `All2AllBackend`, `LoadMode`, `FitMode`, `SpecDraftSampling`,
-  and the speculative method and mode — while an exact count stays a plain
-  integer in a union; each backend maps only the members it serves, so no
-  engine's spelling appears here. A second engine is another implementation of
-  the protocol.
+  path around each one, and aggregates the metrics. Alongside the client, a
+  best-effort resource sampler (`inference/_resources.py`) observes the running
+  container on a fixed cadence — VRAM through the detected target's vendor
+  probe in `hardware.py`, RAM through the runtime handle's cgroup read — and
+  answers window and lifetime peaks; the client brackets each measured run with
+  it and the orchestrator attaches the whole-container peak to the result.
+  Categorical fields hold engine-neutral `StrEnum`s declared in the same module
+  — `DType`, `QuantizationMethod`, `KVCacheDType`, `AttentionBackend`,
+  `GpuLayersMode`, `CpuMoeMode`, `All2AllBackend`, `LoadMode`, `FitMode`,
+  `SpecDraftSampling`, and the speculative method and mode — while an exact
+  count stays a plain integer in a union; each backend maps only the members it
+  serves, so no engine's spelling appears here. A second engine is another
+  implementation of the protocol.
 - `runtime/`: Backend-agnostic container types, the detached start/stop
   lifecycle a host-driven run uses, and the Podman client (plus SELinux
   auto-detection).
@@ -199,13 +204,30 @@ dimensions runs exactly one trial at engine defaults. A JSONL dataset is
 tokenized once through the backend's declared tokenizer endpoint before the
 sweep when the engine needs a request-length cap.
 `optimization.optimize` then drives the study: Optuna samples a point → the
-backend plans an engine-neutral `ServerSpec` → `runtime` starts the server
-container detached and resolves its host port → the host benchmark client waits
-for health, takes the warmup and measured runs
-(scraping the spec's metrics path around each measured run when one is declared),
-and aggregates them → `runtime` stops the container → the backend parses the
-outcome and enriches it with the phase rates its engine reported → the selected
-objective maps it to the trial value → the reporter callback runs.
+backend plans an engine-neutral `ServerSpec` → the orchestrator resolves the
+target's vendor memory probe (absent on a CPU target) and reads the idle VRAM
+baseline → `runtime` starts the server container detached and resolves its host
+port → a best-effort resource sampler starts on the container's whole lifetime →
+the host benchmark client waits for health, takes the warmup and measured runs
+(scraping the spec's metrics path around each measured run when one is declared,
+and bracketing each measured run with a sampler marker and a peak query), and
+aggregates them → `runtime` stops the container and the sampler is stopped on
+every exit path, including failure and interrupt → the backend parses the
+outcome and enriches it with the phase rates its engine reported → the
+orchestrator attaches the sampler's lifetime peak → the selected objective maps
+it to the trial value → the reporter callback runs.
+
+The sampler is engine-neutral and injectable: it takes its VRAM figures from the
+hardware module's probe for the detected target and its RAM from the running
+container handle's cgroup stat, and it distinguishes per-process attribution from
+a device-level delta against the idle baseline so a run's number can be audited.
+It runs once a second, so a shorter spike can be missed, and every failure — a
+missing probe, an unreadable stat, a failed vendor query — leaves a field absent
+instead of failing the trial. Memory is reported, never optimized: it takes no
+part in scoring or pruning, the tokenizer preflight before the sweep is not
+sampled, and only the peaks survive in the trial projection (as plain integers
+or `null`), beside the raw per-run samples. The metric schema version is
+untouched, because the addition reinterprets no rate.
 
 After the sweep, or on an interrupt, the finish path prints the summary and, when
 `--output-config` is set, selects the writer for `--output-format`. YAML is

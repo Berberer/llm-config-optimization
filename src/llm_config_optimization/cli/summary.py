@@ -9,12 +9,27 @@ directions record: a scalar study prints the best trial and its throughput,
 while a multi-objective study prints the Pareto front as a table — trial
 number, both phase rates, the recorded combined throughput, and a marker on the
 recommended row — under a headline naming the recommended point. Both modes
-report how many trials the whole study holds and how many of them failed, then
-end with the recommended configuration.
+report how many trials the whole study holds, how many of them failed, and the
+largest memory peak any evaluated trial reached, then end with the recommended
+configuration, prefaced by that configuration's own measured footprint.
 
-Both outputs describe the same document, so they cannot disagree. The document
-is rendered by the output package's YAML writer, which owns the three domains
-of an experiment:
+The memory figures are read from the study's per-trial result projections — the
+same source as the front table's combined column — so a printed number cannot
+contradict the persisted study. The hardware line carries the study-wide
+maximums: the largest lifetime peak over a server container's whole life and the
+largest peak over measured runs' windows, for VRAM and RAM alike, because a
+configuration's hardware requirement is a ceiling that a user weighs against a
+throughput gain. The subsection under the winning configuration carries the
+recommended point's own two peaks, so the number a user deploys with is never
+the sweep's worst case. Memory is informational: it is reported, never scored. A
+legacy study whose projection lacks the keys, or a host whose probes found
+nothing, renders ``n/a`` for a field it does not have rather than a fabricated
+zero, and omits the subsection entirely when the recommended trial measured
+nothing at all.
+
+Both the summary and the written file describe the same document, so they
+cannot disagree. The document is rendered by the output package's YAML writer,
+which owns the three domains of an experiment:
 
 - a curated ``container`` section holding only the host-facing settings a user
   would re-supply — ``target``, ``image``, ``shm_size``, ``mem_limit``, and
@@ -44,7 +59,7 @@ import optuna
 
 from ..inference.types import ExperimentConfig, HardwareTarget
 from ..output import OutputFormat, RenderContext, writer_for
-from ._formatting import failure_text
+from ._formatting import byte_size_text, failure_text
 
 if TYPE_CHECKING:
     from ..optimization.types import OptimizationResult
@@ -56,6 +71,21 @@ _RESULT_ATTRIBUTE = "result"
 
 _COMBINED_KEY = "tokens_per_second"
 """The result-projection key holding the aggregate combined tokens per second."""
+
+_LIFETIME_VRAM_KEY = "lifetime_peak_vram_bytes"
+"""The result-projection key holding the whole-container VRAM peak."""
+
+_LIFETIME_RAM_KEY = "lifetime_peak_ram_bytes"
+"""The result-projection key holding the whole-container RAM peak."""
+
+_RUN_VRAM_KEY = "peak_vram_bytes"
+"""The per-run projection key holding a measured window's VRAM peak."""
+
+_RUN_RAM_KEY = "peak_ram_bytes"
+"""The per-run projection key holding a measured window's RAM peak."""
+
+_RUNS_KEY = "runs"
+"""The result-projection key holding each successful run's record."""
 
 _FRONT_HEADER = ("trial", "prefill tps", "decode tps", "combined tps", "recommended")
 """The Pareto front table's columns, in render order."""
@@ -103,13 +133,13 @@ def _scalar_summary(
 ) -> str:
     """Render the historical single-winner headline and the recommended configuration."""
     recommended = result.recommended
-    body = _yaml_text(recommended.config, target=target, image=image).rstrip("\n")
     return (
         f"best trial: {recommended.trial_number}\n"
         f"best throughput: {recommended.value:.2f} tps\n"
         f"trials run: {result.trial_count}\n"
         f"{_failure_line(result)}\n"
-        f"\nwinning configuration:\n{body}"
+        f"{_hardware_line(result)}\n"
+        f"\n{_configuration_section(result, target=target, image=image)}"
     )
 
 
@@ -129,14 +159,14 @@ def _multi_summary(
     """
     recommended = result.recommended
     prefill, decode = _phase_cells(recommended.value)
-    body = _yaml_text(recommended.config, target=target, image=image).rstrip("\n")
     return (
         f"recommended trial: {recommended.trial_number}\n"
         f"recommended rates: prefill {prefill} tps  decode {decode} tps\n"
         f"trials run: {result.trial_count}\n"
         f"{_failure_line(result)}\n"
+        f"{_hardware_line(result)}\n"
         f"\npareto front:\n{_front_table(result)}\n"
-        f"\nwinning configuration:\n{body}"
+        f"\n{_configuration_section(result, target=target, image=image)}"
     )
 
 
@@ -154,6 +184,104 @@ def _failure_line(result: OptimizationResult) -> str:
     finished = len(result.study.trials)
     rate = failure_text(failed, finished) or "0%"
     return f"failed trials: {failed}/{finished} ({rate})"
+
+
+def _hardware_line(result: OptimizationResult) -> str:
+    """Render the largest measured footprint any evaluated trial reached.
+
+    The numbers are the maxima over every successful trial's recorded
+    projection, so the line answers "what did this sweep need at its heaviest"
+    rather than what the recommended point needs. The lifetime peak is the
+    largest whole-container peak a trial recorded, and the measured peak is the
+    largest over all runs of all trials — the same per-run maximum
+    :func:`_measured_bytes` derives within a trial, taken across the study.
+
+    Every field is rendered independently, so a failed trial, a legacy study
+    without the keys, or a CPU target's missing VRAM leaves that field ``n/a``
+    instead of a zero. Memory is informational, so the line always appears, and
+    the recommended configuration's own footprint follows it in
+    :func:`_winning_memory_section`.
+    """
+    return (
+        f"hardware (all trials): {byte_size_text(_study_peak(result, _LIFETIME_VRAM_KEY))} vram peak "
+        f"(measured {byte_size_text(_study_measured_peak(result, _RUN_VRAM_KEY))}), "
+        f"{byte_size_text(_study_peak(result, _LIFETIME_RAM_KEY))} ram peak "
+        f"(measured {byte_size_text(_study_measured_peak(result, _RUN_RAM_KEY))})"
+    )
+
+
+def _configuration_section(
+    result: OptimizationResult,
+    *,
+    target: HardwareTarget,
+    image: str,
+) -> str:
+    """Render the winning configuration, prefaced by its measured footprint.
+
+    Memory belongs to the configuration it describes, so it is a subsection of
+    this section rather than a section of its own: there is no way to print a
+    footprint without printing the configuration that carries it, and a run
+    that produced no winning configuration prints neither.
+    """
+    body = _yaml_text(result.recommended.config, target=target, image=image).rstrip("\n")
+    memory = _memory_subsection(result)
+    if memory is None:
+        return f"winning configuration:\n{body}"
+    return f"winning configuration:\n{memory}\n{body}"
+
+
+def _memory_subsection(result: OptimizationResult) -> str | None:
+    """Render the recommended configuration's own measured footprint, or ``None``.
+
+    The subject is the single point the summary recommends and whose
+    configuration follows it, so the number a user takes away for deployment is
+    never the sweep's worst case by accident. Both figures come from that
+    trial's recorded projection, like the study-wide maxima in the hardware
+    line, and an unmeasured half renders ``n/a``.
+
+    A trial that recorded no measurement at all — a legacy study, or a host
+    that could read neither the vendor tooling nor the container's cgroup —
+    yields ``None`` so the configuration prints without an empty subsection.
+    """
+    recorded = _recorded_result(result, result.recommended.trial_number)
+    lifetime_vram = _projected_bytes(recorded, _LIFETIME_VRAM_KEY)
+    lifetime_ram = _projected_bytes(recorded, _LIFETIME_RAM_KEY)
+    measured_vram = _measured_bytes(recorded, _RUN_VRAM_KEY)
+    measured_ram = _measured_bytes(recorded, _RUN_RAM_KEY)
+    if all(value is None for value in (lifetime_vram, lifetime_ram, measured_vram, measured_ram)):
+        return None
+    return (
+        "memory:\n"
+        f"  vram: {byte_size_text(lifetime_vram)} lifetime peak "
+        f"({byte_size_text(measured_vram)} while serving)\n"
+        f"  ram:  {byte_size_text(lifetime_ram)} lifetime peak "
+        f"({byte_size_text(measured_ram)} while serving)"
+    )
+
+
+def _recorded_projections(result: OptimizationResult) -> list[dict[str, object]]:
+    """Every successful trial's recorded result projection, in trial order.
+
+    Memory is recorded per trial, so a whole-study figure is a maximum over
+    these records. A trial that never recorded one — a failed trial, or a
+    hand-built study — contributes nothing rather than a zero.
+    """
+    records = (trial.user_attrs.get(_RESULT_ATTRIBUTE) for trial in result.study.trials)
+    return [record for record in records if isinstance(record, dict)]
+
+
+def _study_peak(result: OptimizationResult, key: str) -> int | None:
+    """The largest value a single projected byte count reaches across the study."""
+    peaks = [_projected_bytes(record, key) for record in _recorded_projections(result)]
+    measured = [peak for peak in peaks if peak is not None]
+    return max(measured) if measured else None
+
+
+def _study_measured_peak(result: OptimizationResult, key: str) -> int | None:
+    """The largest per-run byte count any trial's runs recorded."""
+    peaks = [_measured_bytes(record, key) for record in _recorded_projections(result)]
+    measured = [peak for peak in peaks if peak is not None]
+    return max(measured) if measured else None
 
 
 def _front_table(result: OptimizationResult) -> str:
@@ -199,24 +327,65 @@ def _phase_cells(value: float | tuple[float, float]) -> tuple[str, str]:
     return "n/a", "n/a"
 
 
+def _recorded_result(result: OptimizationResult, trial_number: int) -> dict[str, object] | None:
+    """Return the result projection the optimizer recorded on a trial.
+
+    An :class:`OptimizationSolution` carries only the objective point itself,
+    so every figure the summary reports beyond the objective — the combined
+    throughput and the memory peaks — is read from the ``result`` user
+    attribute the optimizer writes on every successful trial. A trial without
+    a recorded projection — a hand-built study, or one whose projection failed
+    to record it — yields ``None``.
+    """
+    for trial in result.study.trials:
+        if trial.number == trial_number:
+            recorded = trial.user_attrs.get(_RESULT_ATTRIBUTE)
+            return recorded if isinstance(recorded, dict) else None
+    return None
+
+
+def _projected_bytes(recorded: dict[str, object] | None, key: str) -> int | None:
+    """Read one recorded byte count, or ``None`` when the projection lacks it.
+
+    A study recorded before memory was measured simply has no such key, so an
+    absent or non-integer value is an unmeasured figure rather than an error.
+    """
+    if recorded is None:
+        return None
+    value = recorded.get(key)
+    return value if isinstance(value, int) else None
+
+
+def _measured_bytes(recorded: dict[str, object] | None, key: str) -> int | None:
+    """Take the maximum of a per-run byte count over a projected trial.
+
+    The measured windows are adjacent but not contiguous, so the trial's
+    measured peak is the maximum of the runs' peaks rather than a peak over
+    their union, and a run that measured nothing is skipped. ``None`` means no
+    run recorded a value, which renders as ``n/a``.
+    """
+    if recorded is None:
+        return None
+    runs = recorded.get(_RUNS_KEY)
+    if not isinstance(runs, list):
+        return None
+    peaks = [_projected_bytes(run, key) for run in runs if isinstance(run, dict)]
+    measured = [peak for peak in peaks if peak is not None]
+    return max(measured) if measured else None
+
+
 def _recorded_combined(result: OptimizationResult, trial_number: int) -> float | None:
     """Return the combined throughput the optimizer recorded on a trial.
 
-    An :class:`OptimizationSolution` carries only the objective point itself,
-    so the front table's combined column is read from the ``result`` user
-    attribute the optimizer writes on every successful trial. A trial without a
-    recorded number — a hand-built study, or one whose projection failed to
-    record it — yields ``None``.
+    The front table's combined column is read from the same projection the
+    hardware line uses; a trial without a recorded number yields ``None``.
     """
-    for trial in result.study.trials:
-        if trial.number != trial_number:
-            continue
-        recorded = trial.user_attrs.get(_RESULT_ATTRIBUTE)
-        if isinstance(recorded, dict):
-            value = recorded.get(_COMBINED_KEY)
-            if isinstance(value, int | float):
-                return float(value)
+    recorded = _recorded_result(result, trial_number)
+    if recorded is None:
         return None
+    value = recorded.get(_COMBINED_KEY)
+    if isinstance(value, int | float):
+        return float(value)
     return None
 
 
